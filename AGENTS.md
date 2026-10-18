@@ -22,7 +22,7 @@ C++ 版 `C:\dev\soft\mvm` から Rust へ全面移行している。C++ 版は**
 crate を足すときは、まず `RULES` に依存してよい crate を書く。規則の無い crate は検査を通らない。
 
 - `crates/core`、`crates/project` は純粋（OS・GPU・UI・FFmpeg に依存しない）。
-- `unsafe` を許可するのは OS / FFmpeg の FFI を担う crate（`platform`・`media`・`audio` を予定）だけ。
+- `unsafe` を許可するのは OS / FFmpeg の FFI を担う crate（`platform`・`media`・`audio`）だけ。
   - workspace の lint（`unsafe_code = "forbid"`）を使わず、自前の `[lints]` で `unsafe_code = "deny"` と `clippy::undocumented_unsafe_blocks = "deny"` を設定する。
   - `#[allow(unsafe_code)]` は FFI の module だけに付け、全ての `unsafe` block に `// SAFETY:` を書く。
   - 公開 API は安全にする。生ポインタや FFI の型を公開シグネチャに出さず、失敗は `Result` で返す。

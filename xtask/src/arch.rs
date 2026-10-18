@@ -44,8 +44,25 @@ const RULES: &[Rule] = &[
         allows_unsafe: false,
     },
     Rule {
+        name: "mvm-audio",
+        allowed_deps: &["mvm-core"],
+        allows_unsafe: true,
+    },
+    Rule {
+        name: "mvm-text",
+        allowed_deps: &[],
+        allows_unsafe: false,
+    },
+    Rule {
         name: "mvm-preview",
-        allowed_deps: &["mvm-core", "mvm-gpu", "mvm-media", "mvm-project"],
+        allowed_deps: &[
+            "mvm-audio",
+            "mvm-core",
+            "mvm-gpu",
+            "mvm-media",
+            "mvm-project",
+            "mvm-text",
+        ],
         allows_unsafe: false,
     },
     Rule {

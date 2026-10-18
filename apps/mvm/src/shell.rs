@@ -153,6 +153,8 @@ impl MvmApp {
                 Seek::By(1)
             } else if input.consume_key(Modifiers::NONE, Key::ArrowLeft) {
                 Seek::By(-1)
+            } else if input.consume_key(Modifiers::NONE, Key::Space) {
+                Seek::Play
             } else {
                 Seek::None
             }
@@ -167,6 +169,7 @@ impl MvmApp {
                 self.session
                     .seek(self.session.playhead_frame().saturating_add(delta));
             }
+            Seek::Play => self.session.toggle_playback(),
             Seek::None => {}
         }
     }
@@ -243,6 +246,7 @@ enum Seek {
     None,
     Start,
     By(i64),
+    Play,
 }
 
 enum UnsavedChoice {

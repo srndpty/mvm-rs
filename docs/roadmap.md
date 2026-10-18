@@ -7,10 +7,13 @@
 - Undo の memory 予算に使う Project の大きさの見積もり（C++ 版の `approximateProjectBytes`）を、app crate で
   snapshot を持つときに決める。
 
-## preview
+## preview の再生
 
-- 停止中の preview は UI thread で同期して decode・合成している。遠い seek の間は画面が止まる。P4 の worker と
-  event mailbox に移す。
+- ピッチ保持（`preserve_pitch`）の clip を含むと再生は失敗する。time stretch を入れるときに鳴らす。
+- 音声素材と再生デバイスは 48 kHz stereo だけを受け付け、それ以外は失敗させている。resample を入れるかは
+  実素材で必要になった時点で決める。
+- 再生中の seek は WASAPI の端点を開き直す。体感で遅ければ、端点を保ったまま buffer を捨てる形にする。
+- 数式・グラフ・Manim の clip は preview に描かない（math crate を入れる段階で描く）。
 
 ## 自動保存と復旧
 
@@ -18,4 +21,4 @@
 
 ## 字幕
 
-- C++ 版 test_subtitles.cpp の字幕 raster と書き出し計画の検査は、text crate（P4）と export crate（P6）で移植する。
+- 書き出し計画の検査は export crate（P6）で移植する。raster 自体は text crate にある。

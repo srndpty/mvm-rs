@@ -24,6 +24,11 @@ const RULES: &[Rule] = &[
         allows_unsafe: false,
     },
     Rule {
+        name: "mvm-project",
+        allowed_deps: &["mvm-core"],
+        allows_unsafe: false,
+    },
+    Rule {
         name: "mvm",
         allowed_deps: &["mvm-core"],
         allows_unsafe: false,

@@ -10,5 +10,11 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+mvm-app = { workspace = true }
 mvm-core = { workspace = true }
+mvm-project = { workspace = true }
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit"] }
+rfd = { workspace = true }
+
+[dev-dependencies]
+egui_kittest = { workspace = true }

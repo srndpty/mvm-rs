@@ -29,6 +29,11 @@ const RULES: &[Rule] = &[
         allows_unsafe: false,
     },
     Rule {
+        name: "mvm-platform",
+        allowed_deps: &[],
+        allows_unsafe: true,
+    },
+    Rule {
         name: "mvm-media",
         allowed_deps: &["mvm-core"],
         allows_unsafe: true,
@@ -39,13 +44,23 @@ const RULES: &[Rule] = &[
         allows_unsafe: false,
     },
     Rule {
+        name: "mvm-preview",
+        allowed_deps: &["mvm-core", "mvm-gpu", "mvm-media", "mvm-project"],
+        allows_unsafe: false,
+    },
+    Rule {
+        name: "mvm-app",
+        allowed_deps: &["mvm-core", "mvm-platform", "mvm-preview", "mvm-project"],
+        allows_unsafe: false,
+    },
+    Rule {
         name: "mvm-testkit",
         allowed_deps: &[],
         allows_unsafe: false,
     },
     Rule {
         name: "mvm",
-        allowed_deps: &["mvm-core"],
+        allowed_deps: &["mvm-app", "mvm-core", "mvm-project"],
         allows_unsafe: false,
     },
     Rule {

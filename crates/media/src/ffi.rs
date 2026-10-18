@@ -264,6 +264,23 @@ impl Input {
         }
         Ok(ReadStatus::Packet)
     }
+
+    /// `stream_index` の `timestamp`（stream time_base）以前の keyframe へ戻す。
+    pub fn seek(&mut self, stream_index: usize, timestamp: i64) -> Result<(), MediaError> {
+        let stream_index =
+            c_int::try_from(stream_index).map_err(|_| MediaError::new("stream 番号が不正です"))?;
+        // SAFETY: self.ptr は open 済みの context。AVSEEK_FLAG_BACKWARD は指定時刻以前の keyframe へ戻す。
+        let code = unsafe {
+            ff::av_seek_frame(self.ptr, stream_index, timestamp, ff::AVSEEK_FLAG_BACKWARD)
+        };
+        if code < 0 {
+            return Err(MediaError::new(format!(
+                "素材の途中へ移動できません: {}",
+                ff_error(code)
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Input {
@@ -671,6 +688,46 @@ impl Decoder {
             return Err(MediaError::new("PTS を frame 番号へ換算できません"));
         }
         Ok(index)
+    }
+
+    /// [`Self::frame_index`] の逆。frame 番号を stream time_base の PTS にする。
+    pub fn timestamp_for_frame(&self, index: i64) -> Result<i64, MediaError> {
+        if index < 0 {
+            return Err(MediaError::new("frame 番号が不正です"));
+        }
+        // SAFETY: self.codec は open が成功した context で、Drop まで null にならない。
+        let fps = unsafe { (*self.codec).framerate };
+        if fps.num <= 0 || fps.den <= 0 {
+            return Err(MediaError::new("映像の frame rate が不正です"));
+        }
+        // SAFETY: av_rescale_q は整数だけを受け取る純粋な計算。
+        let delta = unsafe {
+            ff::av_rescale_q(
+                index,
+                ff::AVRational {
+                    num: fps.den,
+                    den: fps.num,
+                },
+                self.time_base,
+            )
+        };
+        if delta == i64::MIN {
+            return Err(MediaError::new("frame 番号を PTS へ換算できません"));
+        }
+        let start = if self.start_time == ff::AV_NOPTS_VALUE {
+            0
+        } else {
+            self.start_time
+        };
+        start
+            .checked_add(delta)
+            .ok_or_else(|| MediaError::new("PTS が overflow しました"))
+    }
+
+    /// 溜まっている frame を捨て、次の packet から decode し直せるようにする。context は解放しない。
+    pub fn flush_buffers(&mut self) {
+        // SAFETY: self.codec は open が成功した context で、Drop まで null にならない。
+        unsafe { ff::avcodec_flush_buffers(self.codec) }
     }
 
     pub fn yuv_color(&self, frame: &Frame) -> Result<crate::color::VideoColor, MediaError> {

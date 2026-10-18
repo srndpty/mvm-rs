@@ -1541,6 +1541,13 @@ name = "mvm-core"
 version = "0.1.0"
 
 [[package]]
+name = "mvm-project"
+version = "0.1.0"
+dependencies = [
+ "mvm-core",
+]
+
+[[package]]
 name = "naga"
 version = "30.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

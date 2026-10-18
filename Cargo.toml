@@ -11,6 +11,7 @@ publish = false
 [workspace.dependencies]
 # internal
 mvm-core = { path = "crates/core" }
+mvm-project = { path = "crates/project" }
 
 # ui
 eframe = { version = "0.36", default-features = false }

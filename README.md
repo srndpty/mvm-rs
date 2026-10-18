@@ -5,9 +5,10 @@ C++/Qt 版 (`C:\dev\soft\mvm`) から Rust への全面移行中。
 
 ## 現在の状態
 
-**P2 media 基盤。** 純粋ロジック（P1）に加え、FFmpeg で probe・静止画・音声・映像を読む。映像は
-D3D12VA の texture を wgpu へ渡して合成する（[docs/adr/0001-gpu-path.md](docs/adr/0001-gpu-path.md)）。
-アプリはまだ空の窓を開くだけ。移行計画は [docs/migration-plan.md](docs/migration-plan.md)。
+**P3 最小 GUI。** 純粋ロジック（P1）と、FFmpeg で probe・静止画・音声・映像を読む経路（P2）に加え、
+アプリはメニュー、プロジェクトパネル、停止中の preview、timeline を出す。映像は D3D12VA の
+texture を wgpu へ渡して合成する（[docs/adr/0001-gpu-path.md](docs/adr/0001-gpu-path.md)）。
+再生・編集操作・自動保存はまだ無い。移行計画は [docs/migration-plan.md](docs/migration-plan.md)。
 
 開発の規約は [AGENTS.md](AGENTS.md) に一本化している。
 

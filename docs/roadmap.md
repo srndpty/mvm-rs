@@ -6,5 +6,16 @@
 
 - Undo の memory 予算に使う Project の大きさの見積もり（C++ 版の `approximateProjectBytes`）を、app crate で
   snapshot を持つときに決める。
-- file の保存・読み込み（atomic write・file identity・`.lock`）は platform crate を作る段階で移植する。
+
+## preview
+
+- 停止中の preview は UI thread で同期して decode・合成している。遠い seek の間は画面が止まる。P4 の worker と
+  event mailbox に移す。
+
+## 自動保存と復旧
+
+- file identity と `.lock` は、autosave と recovery を入れるときに platform へ足す。
+
+## 字幕
+
 - C++ 版 test_subtitles.cpp の字幕 raster と書き出し計画の検査は、text crate（P4）と export crate（P6）で移植する。

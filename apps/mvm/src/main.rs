@@ -2,6 +2,11 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod preview_ui;
+mod project_panel;
+mod shell;
+mod timeline_ui;
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -15,7 +20,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("mvm")
-            .with_inner_size([1280.0, 720.0]),
+            .with_inner_size([1440.0, 900.0])
+            .with_min_inner_size([980.0, 640.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -24,7 +30,7 @@ fn main() -> eframe::Result {
         Box::new(|creation| {
             install_ui_font(&creation.egui_ctx, Path::new(UI_FONT_PATH))?;
             creation.egui_ctx.set_theme(egui::Theme::Dark);
-            Ok(Box::new(MvmApp))
+            Ok(Box::new(shell::MvmApp::new()))
         }),
     )
 }
@@ -46,17 +52,4 @@ fn install_ui_font(ctx: &egui::Context, path: &Path) -> Result<(), String> {
     }
     ctx.set_fonts(fonts);
     Ok(())
-}
-
-struct MvmApp;
-
-impl eframe::App for MvmApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("mvm");
-            ui.label("Rust 移行中: P0 基盤");
-            let timecode = mvm_core::timecode::format_timecode(0, 60, 1).unwrap_or_default();
-            ui.monospace(timecode);
-        });
-    }
 }

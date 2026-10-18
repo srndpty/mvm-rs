@@ -1,0 +1,16 @@
+[package]
+name = "mvm-app"
+description = "AppState・command・保存。UI は持たない"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mvm-core = { workspace = true }
+mvm-platform = { workspace = true }
+mvm-preview = { workspace = true }
+mvm-project = { workspace = true }

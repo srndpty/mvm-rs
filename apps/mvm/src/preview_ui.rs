@@ -1,13 +1,30 @@
-//! 停止中の preview。playhead の frame を、あれば画像で出す。
+//! preview。停止中は playhead の frame、再生中は worker が届けた frame を出す。
+
+use std::sync::Arc;
 
 use eframe::egui::{self, Color32, ColorImage, TextureHandle, TextureOptions};
 
 use mvm_app::{PreviewImage, Session};
 
 pub fn show(ui: &mut egui::Ui, session: &mut Session, texture: &mut Option<(u64, TextureHandle)>) {
+    let ctx = ui.ctx().clone();
+    session.set_preview_wake(Arc::new(move || ctx.request_repaint()));
     session.refresh_preview();
+    session.poll_preview();
     ui.horizontal(|ui| {
-        ui.label("停止");
+        let verb = if session.is_playing() {
+            "一時停止"
+        } else {
+            "再生"
+        };
+        if ui.button(verb).clicked() {
+            session.toggle_playback();
+        }
+        ui.label(if session.is_playing() {
+            "再生中"
+        } else {
+            "停止"
+        });
         ui.monospace(session.playhead_label());
     });
     if let Some(note) = session.skipped_note() {

@@ -17,6 +17,8 @@ mvm-platform = { path = "crates/platform" }
 mvm-preview = { path = "crates/preview" }
 mvm-project = { path = "crates/project" }
 mvm-app = { path = "crates/app" }
+mvm-audio = { path = "crates/audio" }
+mvm-text = { path = "crates/text" }
 mvm-testkit = { path = "crates/testkit" }
 
 # foundation

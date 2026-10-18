@@ -1,6 +1,6 @@
 [package]
 name = "mvm-preview"
-description = "停止中の 1 frame を合成する。再生の状態機械はまだ持たない"
+description = "preview の再生。worker が frame を合成し、音声があれば IAudioClock で進める"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,10 +10,12 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+mvm-audio = { workspace = true }
 mvm-core = { workspace = true }
 mvm-gpu = { workspace = true }
 mvm-media = { workspace = true }
 mvm-project = { workspace = true }
+mvm-text = { workspace = true }
 
 [dev-dependencies]
 mvm-testkit = { workspace = true }

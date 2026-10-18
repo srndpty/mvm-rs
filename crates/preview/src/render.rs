@@ -8,6 +8,7 @@ use mvm_media::{
     open_d3d12va,
 };
 use mvm_project::Project;
+use mvm_text::{GlyphRun, SubtitlePaint, raster, raster_subtitle};
 
 use crate::error::PreviewError;
 use crate::geometry::layer_params;
@@ -20,11 +21,25 @@ pub struct StillPreview {
     compositor: Compositor,
     videos: Vec<VideoSlot>,
     images: Vec<(PathBuf, DecodedImage)>,
+    texts: Vec<CachedText>,
 }
 
 struct VideoSlot {
     path: PathBuf,
     decoder: mvm_media::D3d12Decoder,
+}
+
+#[derive(Clone, PartialEq)]
+enum TextKey {
+    Run(GlyphRun),
+    Subtitle(SubtitlePaint),
+}
+
+struct CachedText {
+    key: TextKey,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
 }
 
 struct HeldVideo {
@@ -40,6 +55,7 @@ impl StillPreview {
             compositor,
             videos: Vec::new(),
             images: Vec::new(),
+            texts: Vec::new(),
         })
     }
 
@@ -91,7 +107,7 @@ impl StillPreview {
     }
 
     fn composite(
-        &self,
+        &mut self,
         project: &Project,
         frame: i64,
         plan: &FramePlan,
@@ -106,9 +122,42 @@ impl StillPreview {
             params: backdrop,
             pixels: LayerPixels::Rgba { data: &black },
         });
+        let mut rasters = Vec::new();
+        for layer in &plan.layers {
+            match &layer.source {
+                PlannedSource::Text(run) => {
+                    rasters.push(self.text_rgba(&TextKey::Run(run.clone()), width, height)?)
+                }
+                PlannedSource::Subtitle(paint) => rasters.push(self.text_rgba(
+                    &TextKey::Subtitle(paint.clone()),
+                    width,
+                    height,
+                )?),
+                PlannedSource::Video { .. } | PlannedSource::Image => {}
+            }
+        }
         let mut held_videos = videos.iter();
+        let mut raster_index = 0usize;
         for layer in &plan.layers {
             let (params, pixels) = match &layer.source {
+                PlannedSource::Text(_) | PlannedSource::Subtitle(_) => {
+                    let rgba = rasters
+                        .get(raster_index)
+                        .ok_or_else(|| PreviewError::new("文字画像の数が layer と一致しません"))?;
+                    raster_index += 1;
+                    let params = layer_params(
+                        width,
+                        height,
+                        width,
+                        height,
+                        &layer.effects,
+                        layer.opacity,
+                        SourceKind::Rgba,
+                        mvm_gpu::YuvMatrix::Bt709,
+                        mvm_gpu::YuvRange::Limited,
+                    )?;
+                    (params, LayerPixels::Rgba { data: rgba })
+                }
                 PlannedSource::Video { .. } => {
                     let held = held_videos.next().ok_or_else(|| {
                         PreviewError::new("映像 frame の数が layer と一致しません")
@@ -167,6 +216,36 @@ impl StillPreview {
             height,
             rgba,
         })
+    }
+
+    fn text_rgba(
+        &mut self,
+        key: &TextKey,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, PreviewError> {
+        if let Some(cached) = self
+            .texts
+            .iter()
+            .find(|cached| cached.key == *key && cached.width == width && cached.height == height)
+        {
+            return Ok(cached.rgba.clone());
+        }
+        let rgba = match key {
+            TextKey::Run(run) => raster(run, width, height),
+            TextKey::Subtitle(paint) => raster_subtitle(paint, width, height),
+        }
+        .map_err(|error| PreviewError::new(error.to_string()))?;
+        if self.texts.len() >= 8 {
+            self.texts.remove(0);
+        }
+        self.texts.push(CachedText {
+            key: key.clone(),
+            width,
+            height,
+            rgba: rgba.clone(),
+        });
+        Ok(rgba)
     }
 
     fn ensure_image(&mut self, path: &Path) -> Result<(), PreviewError> {

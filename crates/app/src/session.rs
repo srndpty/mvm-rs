@@ -1,11 +1,11 @@
-//! 開いている Project と、playhead・zoom・停止中の preview。
+//! 開いている Project と、playhead・zoom・preview の再生。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mvm_core::timecode::format_timecode;
 use mvm_platform::atomic_write;
-use mvm_preview::{FramePlan, PreviewImage, StillPreview, black_image, plan_frame};
+use mvm_preview::{PreviewEngine, PreviewImage, plan_frame};
 use mvm_project::Project;
 use mvm_project::json::{parse_project_json, serialize_project_json};
 
@@ -26,7 +26,12 @@ pub struct Session {
     preview_image: Option<Arc<PreviewImage>>,
     preview_error: Option<String>,
     skipped_note: Option<String>,
-    preview_engine: Option<StillPreview>,
+    engine: Option<PreviewEngine>,
+    playing: bool,
+    command_generation: u64,
+    edit_epoch: u64,
+    sent_epoch: u64,
+    preview_wake: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Session {
@@ -50,8 +55,21 @@ impl Session {
             preview_image: None,
             preview_error: None,
             skipped_note: None,
-            preview_engine: None,
+            engine: None,
+            playing: false,
+            command_generation: 0,
+            edit_epoch: 1,
+            sent_epoch: 0,
+            preview_wake: None,
         }
+    }
+
+    /// 画像が届いたときに UI を起こす。egui の `request_repaint` を渡す。
+    pub fn set_preview_wake(&mut self, wake: Arc<dyn Fn() + Send + Sync>) {
+        if let Some(engine) = &self.engine {
+            engine.set_wake(Arc::clone(&wake));
+        }
+        self.preview_wake = Some(wake);
     }
 
     pub fn project(&self) -> &Project {
@@ -94,6 +112,10 @@ impl Session {
         self.preview_generation
     }
 
+    pub fn is_playing(&self) -> bool {
+        self.playing
+    }
+
     /// frame と秒を併記した playhead の表示。
     pub fn playhead_label(&self) -> String {
         let fps = self.project.timeline_fps;
@@ -109,7 +131,11 @@ impl Session {
     /// 編集 command が Project を変えたあとに呼ぶ。保存するまで dirty のままにする。
     pub fn mark_changed(&mut self) {
         self.dirty = true;
+        self.edit_epoch = self.edit_epoch.saturating_add(1);
         self.invalidate_preview();
+        if self.playing {
+            self.pause_playback();
+        }
     }
 
     pub fn select_clip(&mut self, id: Option<String>) {
@@ -128,6 +154,9 @@ impl Session {
 
     /// ドラッグ中は playhead だけ動かし、離したときに preview を描く。
     pub fn set_scrubbing(&mut self, scrubbing: bool) {
+        if scrubbing && self.playing {
+            self.pause_playback();
+        }
         self.scrubbing = scrubbing;
         if !scrubbing {
             self.preview_at = None;
@@ -136,9 +165,42 @@ impl Session {
 
     pub fn seek(&mut self, frame: i64) {
         let frame = frame.max(0);
-        if frame != self.playhead_frame {
-            self.playhead_frame = frame;
+        if frame == self.playhead_frame && self.preview_at == Some(frame) {
+            return;
+        }
+        self.playhead_frame = frame;
+        if self.playing {
+            self.preview_at = Some(frame);
+            self.command_generation = self.command_generation.saturating_add(1);
+            let generation = self.command_generation;
+            if let Err(message) = self.send_seek(frame, generation) {
+                self.playing = false;
+                self.fail_preview(frame, message);
+            }
+        } else {
             self.preview_at = None;
+        }
+    }
+
+    pub fn toggle_playback(&mut self) {
+        if self.playing {
+            self.pause_playback();
+        } else {
+            self.start_playback();
+        }
+    }
+
+    /// 世代を進めて止める。止める前に worker が描いた先の frame は、画面の playhead と
+    /// 食い違うので受け取らない。
+    pub fn pause_playback(&mut self) {
+        self.playing = false;
+        self.command_generation = self.command_generation.saturating_add(1);
+        let generation = self.command_generation;
+        if let Some(engine) = &self.engine
+            && let Err(error) = engine.pause(generation)
+        {
+            let frame = self.playhead_frame;
+            self.fail_preview(frame, error.to_string());
         }
     }
 
@@ -184,32 +246,91 @@ impl Session {
         Ok(())
     }
 
-    /// playhead の frame を、まだ描いていなければ描く。スクラブ中は何もしない。
+    /// worker が届けた frame を反映する。再生中か、まだ画像が無いときは再描画が要る。
+    pub fn poll_preview(&mut self) -> bool {
+        let generation = self.command_generation;
+        let Some(engine) = &self.engine else {
+            return false;
+        };
+        if let Some(delivery) = engine.poll()
+            && delivery.generation == generation
+        {
+            if let Some(image) = delivery.image {
+                let frame = image.frame;
+                if self.playing {
+                    self.playhead_frame = frame;
+                    self.preview_at = Some(frame);
+                }
+                self.store_preview(frame, image, None);
+            }
+            if let Some(playing) = delivery.playing {
+                self.playing = playing;
+            }
+            if let Some(message) = delivery.error {
+                self.playing = false;
+                self.fail_preview(self.playhead_frame, message);
+            }
+        }
+        self.playing
+            || (self.preview_error.is_none()
+                && self.preview_at.is_some()
+                && self.preview_image.as_ref().map(|image| image.frame) != self.preview_at)
+    }
+
+    /// playhead の frame を、まだ描いていなければ worker へ頼む。スクラブ中は何もしない。
     pub fn refresh_preview(&mut self) {
-        if self.scrubbing || self.preview_at == Some(self.playhead_frame) {
+        if self.scrubbing || self.playing {
+            return;
+        }
+        if self.preview_at == Some(self.playhead_frame) && self.sent_epoch == self.edit_epoch {
             return;
         }
         let frame = self.playhead_frame;
-        let plan = match plan_frame(&self.project, frame) {
-            Ok(plan) => plan,
-            Err(error) => {
-                self.fail_preview(frame, error.to_string());
-                return;
-            }
-        };
-        self.skipped_note = (plan.skipped_clips > 0).then(|| {
-            "文字・数式・グラフ・Manim はこの frame にありますが、まだ描きません".to_owned()
-        });
-        if plan.layers.is_empty() {
-            match black_image(frame, &self.project) {
-                Ok(image) => self.store_preview(frame, image, None),
-                Err(error) => self.fail_preview(frame, error.to_string()),
-            }
+        self.note_skipped(frame);
+        if let Err(message) = self.ensure_engine() {
+            self.fail_preview(frame, message);
             return;
         }
-        if let Err(error) = self.render_layers(frame, &plan) {
-            self.fail_preview(frame, error);
+        self.command_generation = self.command_generation.saturating_add(1);
+        let generation = self.command_generation;
+        if self.sent_epoch != self.edit_epoch
+            && let Err(message) = self.send_project(generation)
+        {
+            self.fail_preview(frame, message);
+            return;
         }
+        if let Err(message) = self.send_seek(frame, generation) {
+            self.fail_preview(frame, message);
+            return;
+        }
+        self.preview_at = Some(frame);
+    }
+
+    pub fn start_playback(&mut self) {
+        let frame = self.playhead_frame;
+        self.note_skipped(frame);
+        if let Err(message) = self.ensure_engine() {
+            self.fail_preview(frame, message);
+            return;
+        }
+        self.command_generation = self.command_generation.saturating_add(1);
+        let generation = self.command_generation;
+        if self.sent_epoch != self.edit_epoch
+            && let Err(message) = self.send_project(generation)
+        {
+            self.fail_preview(frame, message);
+            return;
+        }
+        let Some(engine) = &self.engine else {
+            self.fail_preview(frame, "preview を用意できません".to_owned());
+            return;
+        };
+        if let Err(error) = engine.play(frame, generation) {
+            self.fail_preview(frame, error.to_string());
+            return;
+        }
+        self.playing = true;
+        self.preview_at = Some(frame);
     }
 
     /// 同じ frame でも preview を描き直す。
@@ -217,18 +338,44 @@ impl Session {
         self.preview_at = None;
     }
 
-    fn render_layers(&mut self, frame: i64, plan: &FramePlan) -> Result<(), String> {
-        if self.preview_engine.is_none() {
-            self.preview_engine = Some(StillPreview::new().map_err(|error| error.to_string())?);
+    fn note_skipped(&mut self, frame: i64) {
+        self.skipped_note = plan_frame(&self.project, frame).ok().and_then(|plan| {
+            (plan.skipped_clips > 0)
+                .then(|| "数式・グラフ・Manim はこの frame にありますが、まだ描きません".to_owned())
+        });
+    }
+
+    fn ensure_engine(&mut self) -> Result<(), String> {
+        if self.engine.is_none() {
+            let engine = PreviewEngine::start().map_err(|error| error.to_string())?;
+            if let Some(wake) = &self.preview_wake {
+                engine.set_wake(Arc::clone(wake));
+            }
+            self.engine = Some(engine);
+            self.sent_epoch = 0;
         }
-        let Some(engine) = self.preview_engine.as_mut() else {
+        Ok(())
+    }
+
+    fn send_project(&mut self, generation: u64) -> Result<(), String> {
+        let project = Arc::new(self.project.clone());
+        let Some(engine) = &self.engine else {
             return Err("preview を用意できません".to_owned());
         };
-        let image = engine
-            .render(&self.project, frame, plan)
+        engine
+            .set_project(project, generation)
             .map_err(|error| error.to_string())?;
-        self.store_preview(frame, image, None);
+        self.sent_epoch = self.edit_epoch;
         Ok(())
+    }
+
+    fn send_seek(&mut self, frame: i64, generation: u64) -> Result<(), String> {
+        let Some(engine) = &self.engine else {
+            return Err("preview を用意できません".to_owned());
+        };
+        engine
+            .seek(frame, generation)
+            .map_err(|error| error.to_string())
     }
 
     fn store_preview(&mut self, frame: i64, image: PreviewImage, error: Option<String>) {
@@ -252,11 +399,14 @@ impl Session {
         self.playhead_frame = 0;
         self.selected_clip = None;
         self.scrubbing = false;
-        self.preview_engine = None;
+        self.playing = false;
+        self.engine = None;
         self.preview_image = None;
         self.preview_error = None;
         self.skipped_note = None;
         self.preview_at = None;
+        self.sent_epoch = 0;
+        self.edit_epoch = self.edit_epoch.saturating_add(1);
         self.preview_generation = self.preview_generation.saturating_add(1);
     }
 }
@@ -315,6 +465,62 @@ mod tests {
             track: TrackRef::video(0),
             ..TimelineClip::default()
         }
+    }
+
+    fn poll_until(session: &mut Session, mut done: impl FnMut(&Session) -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            session.poll_preview();
+            if done(session) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        false
+    }
+
+    #[test]
+    fn playback_starts_at_the_playhead_and_pause_keeps_the_shown_frame() {
+        let mut clip = text_clip("間");
+        clip.source_frame_count = 600;
+        clip.source_out_frame = 600;
+        let mut session = Session::from_project(Project {
+            timeline_clips: vec![clip],
+            ..Project::default()
+        });
+        session.seek(120);
+        session.refresh_preview();
+        assert!(
+            poll_until(&mut session, |session| session
+                .preview_image()
+                .is_some_and(|image| image.frame == 120)),
+            "停止中の frame が届きません"
+        );
+
+        session.toggle_playback();
+        assert!(session.is_playing());
+        assert!(
+            poll_until(&mut session, |session| session.playhead_frame() > 121),
+            "playhead が進みません: {}",
+            session.playhead_frame()
+        );
+        assert!(session.playhead_frame() < 600);
+
+        session.pause_playback();
+        let paused = session.playhead_frame();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        session.poll_preview();
+        assert!(!session.is_playing());
+        assert_eq!(
+            session.playhead_frame(),
+            paused,
+            "停止後に playhead が動きました"
+        );
+        assert_eq!(
+            session.preview_image().map(|image| image.frame),
+            Some(paused),
+            "表示と playhead が食い違っています"
+        );
     }
 
     #[test]

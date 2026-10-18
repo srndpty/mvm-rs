@@ -1,12 +1,16 @@
-//! 停止中の preview。playhead の 1 frame を、映像と静止画の layer として合成する。
+//! playhead の frame を合成し、音声があるときは IAudioClock で再生する。
 //!
-//! 文字・数式・グラフ・Manim・字幕は描かない。再生・音声・worker は持たない。
+//! 数式・グラフ・Manim は描かない。停止中も再生中も、decode と合成は worker が行う。
 
+mod audio_plan;
+mod engine;
 mod error;
 mod geometry;
+mod mix;
 mod plan;
 mod render;
 
+pub use engine::{PreviewDelivery, PreviewEngine};
 pub use error::PreviewError;
 pub use plan::{
     FramePlan, PlannedLayer, PlannedSource, PreviewImage, black_image, output_size, plan_frame,

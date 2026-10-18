@@ -1,4 +1,4 @@
-//! 画面の背後にある session。Project の読み書き、playhead、停止中の preview を持つ。
+//! 画面の背後にある session。Project の読み書き、playhead、preview の再生を持つ。
 //!
 //! 編集の判定は project、画素の合成は preview が行う。ここは command と、その結果の状態だけを持つ。
 

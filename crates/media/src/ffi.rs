@@ -724,6 +724,35 @@ impl Decoder {
             .ok_or_else(|| MediaError::new("PTS が overflow しました"))
     }
 
+    /// 変換後の sample 番号を stream time_base の PTS にする。
+    pub fn timestamp_for_sample(&self, sample_rate: i32, index: i64) -> Result<i64, MediaError> {
+        if index < 0 || sample_rate <= 0 {
+            return Err(MediaError::new("sample 位置が不正です"));
+        }
+        // SAFETY: av_rescale_q は整数だけを受け取る純粋な計算。
+        let delta = unsafe {
+            ff::av_rescale_q(
+                index,
+                ff::AVRational {
+                    num: 1,
+                    den: sample_rate,
+                },
+                self.time_base,
+            )
+        };
+        if delta == i64::MIN {
+            return Err(MediaError::new("sample 位置を PTS へ換算できません"));
+        }
+        let start = if self.start_time == ff::AV_NOPTS_VALUE {
+            0
+        } else {
+            self.start_time
+        };
+        start
+            .checked_add(delta)
+            .ok_or_else(|| MediaError::new("PTS が overflow しました"))
+    }
+
     /// 溜まっている frame を捨て、次の packet から decode し直せるようにする。context は解放しない。
     pub fn flush_buffers(&mut self) {
         // SAFETY: self.codec は open が成功した context で、Drop まで null にならない。

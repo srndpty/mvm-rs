@@ -5,7 +5,11 @@ use mvm_project::render::{
     TimelineRenderSegment, render_segment_opacity, timeline_render_segments,
 };
 use mvm_project::timeline::{clip_duration_at, clip_interval, clip_source_frame_at};
-use mvm_project::{Project, TimelineClipKind, TrackKind, is_valid_project_output_size};
+use mvm_project::{
+    Project, TextClipData, TimelineClipKind, TrackKind, is_valid_project_output_size,
+    parse_argb_color,
+};
+use mvm_text::{Align, GlyphRun, SubtitlePaint};
 
 use crate::error::PreviewError;
 
@@ -20,16 +24,18 @@ pub struct PlannedLayer {
     pub lane: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum PlannedSource {
     Video { frame: i64 },
     Image,
+    Text(GlyphRun),
+    Subtitle(SubtitlePaint),
 }
 
 #[derive(Clone, Debug)]
 pub struct FramePlan {
     pub layers: Vec<PlannedLayer>,
-    /// この frame にあるが、文字・数式・グラフ・Manim なので描かない clip の数。
+    /// この frame にあるが、数式・グラフ・Manim なので描かない clip の数。
     pub skipped_clips: usize,
 }
 
@@ -104,8 +110,13 @@ pub fn plan_frame(project: &Project, frame: i64) -> Result<FramePlan, PreviewErr
                 PlannedSource::Video { frame: source }
             }
             TimelineClipKind::Image => PlannedSource::Image,
-            TimelineClipKind::Text
-            | TimelineClipKind::Math
+            TimelineClipKind::Text => {
+                let Some(text) = text_source(&segment.clip.text)? else {
+                    continue;
+                };
+                PlannedSource::Text(text)
+            }
+            TimelineClipKind::Math
             | TimelineClipKind::EquationSequence
             | TimelineClipKind::Graph
             | TimelineClipKind::Manim
@@ -134,10 +145,78 @@ pub fn plan_frame(project: &Project, frame: i64) -> Result<FramePlan, PreviewErr
             .cmp(&right.track_index)
             .then(left.lane.cmp(&right.lane))
     });
+    if let Some(track) = &project.subtitles
+        && track.visible
+    {
+        for cue in &track.cues {
+            if cue.content.is_empty() || frame < cue.start_frame || frame >= cue.end_frame {
+                continue;
+            }
+            layers.push(PlannedLayer {
+                media_path: std::path::PathBuf::new(),
+                source: PlannedSource::Subtitle(subtitle_paint(&track.style, &cue.content)?),
+                opacity: 1.0,
+                effects: ClipEffects::default(),
+                track_index: usize::MAX,
+                lane: 0,
+            });
+        }
+    }
     Ok(FramePlan {
         layers,
         skipped_clips,
     })
+}
+
+fn text_source(text: &TextClipData) -> Result<Option<GlyphRun>, PreviewError> {
+    if text.content.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(GlyphRun {
+        content: text.content.clone(),
+        font_family: text.font_family.clone(),
+        font_size: text.font_size,
+        origin_x: text.x,
+        origin_y: text.y,
+        color: argb(&text.color)?,
+        bold: text.bold,
+        align: align(&text.alignment)?,
+        outline_color: argb(&text.outline_color)?,
+        outline_width: text.outline_width,
+        background: argb(&text.background_color)?,
+    }))
+}
+
+fn subtitle_paint(
+    style: &mvm_project::SubtitleStyle,
+    content: &str,
+) -> Result<SubtitlePaint, PreviewError> {
+    Ok(SubtitlePaint {
+        content: content.to_owned(),
+        font_family: style.font_family.clone(),
+        font_size: style.font_size,
+        bold: style.bold,
+        color: argb(&style.color)?,
+        outline_color: argb(&style.outline_color)?,
+        outline_width: style.outline_width,
+        background: argb(&style.background_color)?,
+        align: align(&style.alignment)?,
+        side_margin: style.side_margin,
+        bottom_margin: style.bottom_margin,
+    })
+}
+
+fn argb(text: &str) -> Result<u32, PreviewError> {
+    parse_argb_color(text).ok_or_else(|| PreviewError::new(format!("色が不正です: {text}")))
+}
+
+fn align(text: &str) -> Result<Align, PreviewError> {
+    match text {
+        "left" => Ok(Align::Left),
+        "center" => Ok(Align::Center),
+        "right" => Ok(Align::Right),
+        _ => Err(PreviewError::new(format!("未知の揃えです: {text}"))),
+    }
 }
 
 fn opacity_at(
@@ -249,6 +328,22 @@ mod tests {
                 source_out_frame: 30,
                 timeline_start_frame: 0,
                 track: TrackRef::video(0),
+                text: mvm_project::TextClipData {
+                    content: "こんにちは".to_owned(),
+                    ..mvm_project::TextClipData::default()
+                },
+                ..TimelineClip::default()
+            },
+            TimelineClip {
+                kind: TimelineClipKind::Math,
+                name: "式".to_owned(),
+                id: "math".to_owned(),
+                source_fps: Rational::new(60, 1),
+                source_frame_count: 30,
+                source_in_frame: 0,
+                source_out_frame: 30,
+                timeline_start_frame: 0,
+                track: TrackRef::video(0),
                 ..TimelineClip::default()
             },
             TimelineClip {
@@ -273,9 +368,14 @@ mod tests {
             .map(|layer| {
                 (
                     layer.media_path.display().to_string(),
-                    match layer.source {
-                        PlannedSource::Video { frame } => frame,
+                    match &layer.source {
+                        PlannedSource::Video { frame } => *frame,
                         PlannedSource::Image => -1,
+                        PlannedSource::Text(text) => {
+                            assert_eq!(text.content, "こんにちは");
+                            -2
+                        }
+                        PlannedSource::Subtitle(_) => -3,
                     },
                 )
             })
@@ -284,11 +384,12 @@ mod tests {
             described,
             [
                 ("bottom.mp4".to_owned(), 5),
+                (String::new(), -2),
                 ("still.png".to_owned(), -1),
                 ("top.mp4".to_owned(), 5),
             ]
         );
-        assert_eq!(plan.skipped_clips, 1, "文字 clip は描かない");
+        assert_eq!(plan.skipped_clips, 1, "数式 clip は描かない");
         assert!(
             described
                 .iter()
@@ -318,6 +419,86 @@ mod tests {
                 .0
                 .iter()
                 .all(|pixel| *pixel == [0, 0, 0, 255])
+        );
+    }
+
+    #[test]
+    fn blend_keeps_the_outgoing_clip_opaque_and_fades_the_incoming_one() {
+        let mut project = Project::default();
+        let mut outgoing = video("out.mp4", 0, 0);
+        outgoing.id = "out".to_owned();
+        outgoing.source_frame_count = 600;
+        outgoing.source_out_frame = 300;
+        let mut incoming = video("in.mp4", 0, 300);
+        incoming.id = "in".to_owned();
+        incoming.source_frame_count = 600;
+        incoming.source_in_frame = 300;
+        incoming.source_out_frame = 600;
+        project.timeline_clips = vec![outgoing, incoming];
+        project.timeline_transitions = vec![mvm_project::TimelineTransition {
+            id: "blend".to_owned(),
+            outgoing_clip_id: "out".to_owned(),
+            incoming_clip_id: "in".to_owned(),
+            frames_before_cut: 30,
+            frames_after_cut: 30,
+            kind: mvm_project::TransitionKind::Blend,
+        }];
+
+        let middle = plan_frame(&project, 300).expect("トランジション");
+        assert_eq!(middle.layers.len(), 2);
+        let progress = (30.5_f32) / 60.0;
+        assert!(
+            (middle.layers[0].opacity - 1.0).abs() < 1e-5,
+            "outgoing {}",
+            middle.layers[0].opacity
+        );
+        assert!(
+            (middle.layers[1].opacity - progress).abs() < 1e-5,
+            "incoming {}",
+            middle.layers[1].opacity
+        );
+
+        let before = plan_frame(&project, 10).expect("トランジションの前");
+        assert_eq!(before.layers.len(), 1);
+        assert!((before.layers[0].opacity - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn subtitles_sit_above_the_picture_only_while_the_cue_is_active() {
+        let mut project = Project {
+            timeline_clips: vec![video("bottom.mp4", 0, 0)],
+            subtitles: Some(mvm_project::SubtitleTrack {
+                visible: true,
+                style: mvm_project::SubtitleStyle::default(),
+                cues: vec![mvm_project::SubtitleCue {
+                    id: "cue".to_owned(),
+                    start_frame: 0,
+                    end_frame: 10,
+                    content: "せりふ".to_owned(),
+                    link_clip_id: String::new(),
+                }],
+            }),
+            ..Project::default()
+        };
+        let shown = plan_frame(&project, 5).expect("字幕");
+        assert!(matches!(
+            shown.layers.last().map(|layer| &layer.source),
+            Some(PlannedSource::Subtitle(paint)) if paint.content == "せりふ"
+        ));
+        let later = plan_frame(&project, 10).expect("字幕の外");
+        assert!(
+            later
+                .layers
+                .iter()
+                .all(|layer| !matches!(layer.source, PlannedSource::Subtitle(_)))
+        );
+        project.subtitles.as_mut().unwrap().visible = false;
+        let hidden = plan_frame(&project, 5).expect("非表示");
+        assert!(
+            hidden
+                .layers
+                .iter()
+                .all(|layer| !matches!(layer.source, PlannedSource::Subtitle(_)))
         );
     }
 }

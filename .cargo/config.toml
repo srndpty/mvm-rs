@@ -1,2 +1,6 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+[env]
+# build script と ffmpeg-sys-next が header / import library をここから探す。
+FFMPEG_DIR = { value = "third_party/ffmpeg", relative = true }

@@ -21,6 +21,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: third_party/ffmpeg
+          key: ffmpeg-${{ hashFiles('scripts/ffmpeg.pin.json') }}
+      - name: FFmpeg と libclang
+        shell: pwsh
+        run: |
+          ./dev.ps1 setup
+          . ./scripts/env.ps1
+          "FFMPEG_DIR=$env:FFMPEG_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "LIBCLANG_PATH=$env:LIBCLANG_PATH" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: PSScriptAnalyzer を導入
         shell: pwsh
         run: |
@@ -35,6 +46,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: third_party/ffmpeg
+          key: ffmpeg-${{ hashFiles('scripts/ffmpeg.pin.json') }}
+      - name: FFmpeg と libclang
+        shell: pwsh
+        run: |
+          ./dev.ps1 setup
+          . ./scripts/env.ps1
+          "FFMPEG_DIR=$env:FFMPEG_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "LIBCLANG_PATH=$env:LIBCLANG_PATH" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: type check
         shell: pwsh
         run: ./dev.ps1 check

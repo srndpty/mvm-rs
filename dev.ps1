@@ -27,6 +27,7 @@ Set-StrictMode -Version Latest
 
 $repoRoot = $PSScriptRoot
 $scriptsDirectory = Join-Path $repoRoot 'scripts'
+. (Join-Path $scriptsDirectory 'env.ps1')
 
 function Show-DevHelp {
     Write-Output @'
@@ -37,6 +38,9 @@ function Show-DevHelp {
   run        debug の mvm をビルドして起動する
   gui        release の mvm をビルドして起動する
   test       試験を実行する（workstation 試験は除外。0 件なら失敗）
+  test-full  workstation 試験も含めて実行する（0 件なら失敗）
+  setup      FFmpeg gpl-shared の取得と libclang の確認
+  testmedia  検証素材を生成する（既定は Smoke）
   lint       整形差分・clippy・アーキテクチャ検査・PSScriptAnalyzer を実行する
   fmt        rustfmt で整形する
   check      型検査（cargo check --all-targets）
@@ -60,12 +64,36 @@ function Invoke-Cargo {
     }
 }
 
+function Assert-Toolchain {
+    if (-not $env:FFMPEG_DIR -or -not (Test-Path -LiteralPath (Join-Path $env:FFMPEG_DIR 'include\libavcodec\avcodec.h'))) {
+        [Console]::Error.WriteLine('FFmpeg がありません。先に .\dev.ps1 setup を実行してください。')
+        exit 1
+    }
+    if (-not $env:LIBCLANG_PATH) {
+        [Console]::Error.WriteLine('libclang がありません。先に .\dev.ps1 setup を実行してください。')
+        exit 1
+    }
+}
+
 function Invoke-Tests {
-    param([string[]]$ExtraArguments = @())
+    param(
+        [string[]]$ExtraArguments = @(),
+        [switch]$IncludeIgnored
+    )
 
     Push-Location $repoRoot
     try {
-        & cargo test --workspace --locked @ExtraArguments 2>&1 |
+        $harness = @()
+        $skipped = @()
+        if ($IncludeIgnored) {
+            $harness = @('--', '--include-ignored')
+            # C++ 版の .mvm 群は手元にしか無い。指定が無ければ実行せず、skipped として報告する。
+            if (-not $env:MVM_CPP_PROJECT_CORPUS) {
+                $harness += @('--skip', 'reads_cpp_project_corpus')
+                $skipped += 'reads_cpp_project_corpus（MVM_CPP_PROJECT_CORPUS が未指定）'
+            }
+        }
+        & cargo test --workspace --locked @ExtraArguments @harness 2>&1 |
             Tee-Object -Variable output | Out-Host
         $exitCode = $LASTEXITCODE
         if ($exitCode -ne 0) {
@@ -82,6 +110,9 @@ function Invoke-Tests {
             exit 1
         }
         Write-Output "通過した試験: $passed 件"
+        foreach ($name in $skipped) {
+            Write-Output "skipped: $name"
+        }
         exit 0
     } finally {
         Pop-Location
@@ -89,17 +120,46 @@ function Invoke-Tests {
 }
 
 switch ($Command.ToLowerInvariant()) {
-    'build' { Invoke-Cargo -Arguments @('build', '--workspace', '--locked') -ExtraArguments $CargoArgs }
-    'run' { Invoke-Cargo -Arguments @('run', '--package', 'mvm', '--locked') -ExtraArguments $CargoArgs }
-    'gui' { Invoke-Cargo -Arguments @('run', '--package', 'mvm', '--release', '--locked') -ExtraArguments $CargoArgs }
-    'test' { Invoke-Tests -ExtraArguments $CargoArgs }
+    'build' {
+        Assert-Toolchain
+        Invoke-Cargo -Arguments @('build', '--workspace', '--locked') -ExtraArguments $CargoArgs
+    }
+    'run' {
+        Assert-Toolchain
+        Invoke-Cargo -Arguments @('run', '--package', 'mvm', '--locked') -ExtraArguments $CargoArgs
+    }
+    'gui' {
+        Assert-Toolchain
+        Invoke-Cargo -Arguments @('run', '--package', 'mvm', '--release', '--locked') -ExtraArguments $CargoArgs
+    }
+    'test' {
+        Assert-Toolchain
+        Invoke-Tests -ExtraArguments $CargoArgs
+    }
+    'test-full' {
+        Assert-Toolchain
+        Invoke-Tests -IncludeIgnored -ExtraArguments $CargoArgs
+    }
+    'setup' {
+        & (Get-Process -Id $PID).Path -NoProfile -File (Join-Path $scriptsDirectory 'setup.ps1')
+        exit $LASTEXITCODE
+    }
+    'testmedia' {
+        Assert-Toolchain
+        & (Get-Process -Id $PID).Path -NoProfile -File (Join-Path $scriptsDirectory 'make-testmedia.ps1') @CargoArgs
+        exit $LASTEXITCODE
+    }
     'lint' {
+        Assert-Toolchain
         $pwsh = (Get-Process -Id $PID).Path
         & $pwsh -NoProfile -File (Join-Path $scriptsDirectory 'lint.ps1')
         exit $LASTEXITCODE
     }
     'fmt' { Invoke-Cargo -Arguments @('fmt', '--all') -ExtraArguments $CargoArgs }
-    'check' { Invoke-Cargo -Arguments @('check', '--workspace', '--all-targets', '--locked') -ExtraArguments $CargoArgs }
+    'check' {
+        Assert-Toolchain
+        Invoke-Cargo -Arguments @('check', '--workspace', '--all-targets', '--locked') -ExtraArguments $CargoArgs
+    }
     'clean' { Invoke-Cargo -Arguments @('clean') -ExtraArguments $CargoArgs }
     'help' {
         Show-DevHelp

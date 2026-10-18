@@ -1,0 +1,10 @@
+[package]
+name = "mvm-testkit"
+description = "試験専用の補助。frame marker の読み取りと試験素材の場所"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

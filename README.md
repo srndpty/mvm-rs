@@ -5,9 +5,9 @@ C++/Qt 版 (`C:\dev\soft\mvm`) から Rust への全面移行中。
 
 ## 現在の状態
 
-**P1 core + project。** 純粋ロジック（有理数の時間・timeline 編集・effects・字幕・数式 / Graph のデータ・
-schema 22 の読み書き）を移植した段階。アプリはまだ空の窓を開くだけ。移行計画は
-[docs/migration-plan.md](docs/migration-plan.md)。
+**P2 media 基盤。** 純粋ロジック（P1）に加え、FFmpeg で probe・静止画・音声・映像を読む。映像は
+D3D12VA の texture を wgpu へ渡して合成する（[docs/adr/0001-gpu-path.md](docs/adr/0001-gpu-path.md)）。
+アプリはまだ空の窓を開くだけ。移行計画は [docs/migration-plan.md](docs/migration-plan.md)。
 
 開発の規約は [AGENTS.md](AGENTS.md) に一本化している。
 
@@ -16,6 +16,8 @@ schema 22 の読み書き）を移植した段階。アプリはまだ空の窓�
 | | |
 | --- | --- |
 | Rust | `rust-toolchain.toml` で固定（rustup が自動で取得する） |
+| FFmpeg | `.\dev.ps1 setup` が pin した BtbN gpl-shared を `third_party/ffmpeg` へ置く。別の FFmpeg にはフォールバックしない |
+| libclang | `setup` が無ければ LLVM を入れる。bindgen が使う |
 | target | `x86_64-pc-windows-msvc`（Visual Studio の C++ build tools が必要） |
 | GUI | egui / eframe（wgpu） |
 | PSScriptAnalyzer | `scripts/PSScriptAnalyzer.version` の版（`Install-Module PSScriptAnalyzer -RequiredVersion <版> -Scope CurrentUser`） |
@@ -30,7 +32,10 @@ command の後ろの引数はそのまま cargo へ渡る。
 .\dev.ps1 build      # debug ビルド（--release で release）
 .\dev.ps1 run        # debug の mvm をビルドして起動
 .\dev.ps1 gui        # release の mvm をビルドして起動
+.\dev.ps1 setup      # FFmpeg gpl-shared の取得と libclang の確認
 .\dev.ps1 test       # 試験（workstation 試験は除外。0 件なら失敗）
+.\dev.ps1 test-full  # workstation 試験も含める（0 件なら失敗。C++ 版 corpus の試験は MVM_CPP_PROJECT_CORPUS があるときだけ）
+.\dev.ps1 testmedia  # 検証素材を生成する（既定は Smoke）
 .\dev.ps1 lint       # rustfmt 差分・clippy・アーキテクチャ検査・PSScriptAnalyzer
 .\dev.ps1 fmt        # 整形
 .\dev.ps1 check      # 型検査
@@ -55,6 +60,9 @@ cargo test -p mvm-project --test json reads_cpp_project_corpus -- --include-igno
 | | |
 | --- | --- |
 | `crates/core` | 純粋な計算（有理数・timecode・素材 frame と timeline frame の対応・fade・波形 peak など） |
+| `crates/media` | FFmpeg による probe・静止画・音声・映像 decode |
+| `crates/gpu` | 合成（DX12 / wgpu） |
+| `crates/testkit` | 試験素材の frame marker |
 | `crates/project` | Project model・timeline 編集・effects / keyframe・字幕と SRT・media bin・数式 / Graph のデータ・schema 22 の JSON |
 | `apps/mvm` | 製品アプリ（egui） |
 | `xtask` | アーキテクチャ検査（crate の依存方向・unsafe を許可する crate） |

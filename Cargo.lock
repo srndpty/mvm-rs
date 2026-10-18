@@ -1545,6 +1545,8 @@ name = "mvm-project"
 version = "0.1.0"
 dependencies = [
  "mvm-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

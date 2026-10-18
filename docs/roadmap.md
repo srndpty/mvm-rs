@@ -2,11 +2,12 @@
 
 「今後やること」の一覧。着手したら該当の文書へ移し、ここからは消す。段階の全体像は [migration-plan.md](migration-plan.md)。
 
-## P1 core + project
+## P1 の残り
 
-- C++ 版の `src/core/*`（timecode 以外）と `src/project/*` を移植する。
-- `tests/core/*` と `tests/harness/test_timeline_edit.cpp` などの assertion を `#[test]` へ移す。
-- schema 22 の `.mvm` の読み書きと、C++ 版で保存した実 project の往復を確かめる。
+- Undo の memory 予算に使う Project の大きさの見積もり（C++ 版の `approximateProjectBytes`）を、app crate で
+  snapshot を持つときに決める。
+- file の保存・読み込み（atomic write・file identity・`.lock`）は platform crate を作る段階で移植する。
+- C++ 版 test_subtitles.cpp の字幕 raster と書き出し計画の検査は、text crate（P4）と export crate（P6）で移植する。
 
 ## P2 media 基盤と GPU 方式の判定
 

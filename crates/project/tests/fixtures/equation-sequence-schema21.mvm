@@ -1,0 +1,97 @@
+{
+  "schema_version": 21,
+  "format": "mvm-project",
+  "timeline_fps_num": 60,
+  "timeline_fps_den": 1,
+  "output_width": 1920,
+  "output_height": 1080,
+  "timeline_markers": [],
+  "in_frame": null,
+  "out_frame": null,
+  "subtitles": null,
+  "video_tracks": [
+    { "name": "V1", "muted": false, "solo": false, "mixer_name": "", "mixer_gain_db": 0, "mixer_pan": 0 },
+    { "name": "V2", "muted": false, "solo": false, "mixer_name": "", "mixer_gain_db": 0, "mixer_pan": 0 }
+  ],
+  "audio_tracks": [
+    { "name": "A1", "muted": false, "solo": false, "mixer_name": "", "mixer_gain_db": 0, "mixer_pan": 0 }
+  ],
+  "manim_assets": [  ],
+  "timeline_clips": [
+    {
+      "kind": "equation_sequence",
+      "media_path": "",
+      "name": "P3-4 preview",
+      "id": "seq",
+      "source_fps_num": 60,
+      "source_fps_den": 1,
+      "source_frame_count": 91,
+      "source_in_frame": 0,
+      "source_out_frame": 91,
+      "timeline_start_frame": 0,
+      "speed_num": 1,
+      "speed_den": 1,
+      "preserve_pitch": false,
+      "enabled": true,
+      "frame_hold": null,
+      "track_kind": "video",
+      "track_index": 0,
+      "media_item_id": "",
+      "link_group_id": "",
+      "effects": {
+        "position_x_percent": 0,
+        "position_y_percent": 0,
+        "scale_x_percent": 100,
+        "scale_y_percent": 100,
+        "rotation_degrees": 0,
+        "opacity_percent": 100,
+        "volume_percent": 100,
+        "crop_left_percent": 0,
+        "crop_top_percent": 0,
+        "crop_right_percent": 0,
+        "crop_bottom_percent": 0,
+        "fade_in_frames": 0,
+        "fade_out_frames": 0,
+        "opacity_keys": [],
+        "volume_keys": [],
+        "normalization_gain_db": 0,
+        "ducking_db": 0,
+        "audio_adjustment_settings": "",
+        "audio_adjustment_fingerprint": "",
+        "ducking_keys": [],
+        "position_x_keys": [],
+        "position_y_keys": [],
+        "scale_x_keys": [],
+        "scale_y_keys": [],
+        "rotation_keys": [],
+        "crop_left_keys": [],
+        "crop_top_keys": [],
+        "crop_right_keys": [],
+        "crop_bottom_keys": []
+      },
+      "equation_sequence": {"states": [{"id":"s0","equation":{
+        "syntax": "latex",
+        "source": "SIZE40x20+b",
+        "font_size": 96,
+        "color": "#FF4080C0",
+        "background_color": "#00000000"
+      },"revision":"rev-s0","hold_frames":30,"parts":[{"id":"b0","label":"label","binding":{"revision":"rev-s0","begin":10,"end":11,"expected_text":"b","status":"bound"}}]},{"id":"s1","equation":{
+        "syntax": "latex",
+        "source": "SIZE30x24+b",
+        "font_size": 96,
+        "color": "#FFC04080",
+        "background_color": "#00000000"
+      },"revision":"rev-s1","hold_frames":30,"parts":[{"id":"b1","label":"label","binding":{"revision":"rev-s1","begin":10,"end":11,"expected_text":"b","status":"bound"}}]},{"id":"s2","equation":{
+        "syntax": "latex",
+        "source": "SIZE36x18+c",
+        "font_size": 96,
+        "color": "#FF80C040",
+        "background_color": "#00000000"
+      },"revision":"rev-s2","hold_frames":20,"parts":[]}],"transitions":[{"id":"t0","from":"s0","to":"s1","frames":10,"correspondence":[{"from":"b0","to":"b1"}]},{"id":"t1","from":"s1","to":"s2","frames":1,"correspondence":[]}],"actions":[{"id":"outline","state":"s0","target":"b0","target_status":"present","start":4,"duration":6,"operation":"outline"},{"id":"pulse","state":"s0","target":"b0","target_status":"present","start":16,"duration":6,"operation":"pulse"},{"id":"pulse1","state":"s1","target":"b1","target_status":"present","start":10,"duration":1,"operation":"pulse"}]}
+    }
+  ],
+  "timeline_transitions": [  ],
+  "media_folders": [  ],
+  "media_items": [  ],
+  "last_audio_adjustment_settings": ""
+}

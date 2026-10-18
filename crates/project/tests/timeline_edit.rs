@@ -109,17 +109,6 @@ fn undo_history_budget() {
     assert!(drops(&[500], &[500], 100, 100, 0, 0));
 }
 
-fn speed_edit(num: i64, den: i64) -> ClipSpeedDurationEdit {
-    ClipSpeedDurationEdit {
-        input: SpeedDurationInput::Speed,
-        speed: fps(num, den),
-        duration_frames: 0,
-        preserve_pitch: false,
-        ripple: false,
-        overwrite: false,
-    }
-}
-
 #[test]
 fn speed_duration_without_ripple() {
     let project = three_clips();

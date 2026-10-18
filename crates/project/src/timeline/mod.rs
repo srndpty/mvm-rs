@@ -4,6 +4,7 @@ mod common;
 mod edit;
 mod mapping;
 mod ripple;
+mod sequence;
 mod settings;
 mod speed;
 mod transition_edit;
@@ -29,6 +30,11 @@ pub use mapping::{
 pub use ripple::{
     SelectDirection, clamp_slide_edit, clip_ids_from_frame, edit_timeline_time,
     ripple_trim_timeline_clip, roll_timeline_edit, slide_timeline_clip, slip_timeline_clip,
+};
+pub use sequence::{
+    EquationRenderability, GraphFrame, add_equation_sequence, add_graph, copy_internal_clip,
+    edit_equation_sequence, edit_graph, equation_renderability, evaluate_equation_clip,
+    evaluate_graph_clip, place_new_graph, set_graph_source_duration,
 };
 pub use settings::{
     ClipKeyEditPreview, TimelineGap, add_track, append_manim_timeline_clip_at, delete_clip_key,

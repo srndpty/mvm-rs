@@ -92,3 +92,78 @@ pub fn find<'a>(project: &'a Project, id: &str) -> Option<&'a TimelineClip> {
 pub fn ids(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }
+
+/// 動画・音声・画像の clip に、同じファイルのプロジェクトパネルの素材を付ける（C++ 版の attachFixtureMedia）。
+/// 映像のある clip を先に見る。同じファイルの音声 clip はその素材を共有する。
+pub fn attach_fixture_media(project: &mut Project) {
+    use mvm_project::path_identity::canonical_path_key;
+    use mvm_project::{MediaItem, MediaKind};
+    use std::collections::HashMap;
+    let mut item_by_path: HashMap<Option<String>, String> = project
+        .media_items
+        .iter()
+        .map(|item| (canonical_path_key(&item.media_path), item.id.clone()))
+        .collect();
+    for audio_pass in [false, true] {
+        for index in 0..project.timeline_clips.len() {
+            let clip = &project.timeline_clips[index];
+            if !clip.kind.uses_media_item()
+                || !clip.media_item_id.is_empty()
+                || (clip.kind == TimelineClipKind::Audio) != audio_pass
+            {
+                continue;
+            }
+            let key = canonical_path_key(&clip.media_path);
+            if let Some(id) = item_by_path.get(&key) {
+                project.timeline_clips[index].media_item_id = id.clone();
+                continue;
+            }
+            let id = format!("fixture-media-{}", project.media_items.len());
+            let mut item = MediaItem {
+                id: id.clone(),
+                media_path: clip.media_path.clone(),
+                name: if clip.name.is_empty() {
+                    id.clone()
+                } else {
+                    clip.name.clone()
+                },
+                ..MediaItem::default()
+            };
+            match clip.kind {
+                TimelineClipKind::Video => {
+                    item.kind = MediaKind::Video;
+                    item.fps = clip.source_fps.reduced().unwrap_or(fps(60, 1));
+                    item.frame_count = clip.source_frame_count.max(1);
+                    item.width = 1920;
+                    item.height = 1080;
+                }
+                TimelineClipKind::Audio => {
+                    item.kind = MediaKind::Audio;
+                    item.sample_rate = 48000;
+                    item.duration_samples = 48000;
+                }
+                _ => {
+                    item.kind = MediaKind::Image;
+                    item.width = 1920;
+                    item.height = 1080;
+                }
+            }
+            project.media_items.push(item);
+            project.timeline_clips[index].media_item_id = id.clone();
+            item_by_path.insert(key, id);
+        }
+    }
+}
+
+/// 速度だけを指定する速度・尺の編集（ripple も上書きもしない）。
+pub fn speed_edit(num: i64, den: i64) -> mvm_project::timeline::ClipSpeedDurationEdit {
+    use mvm_project::timeline::{ClipSpeedDurationEdit, SpeedDurationInput};
+    ClipSpeedDurationEdit {
+        input: SpeedDurationInput::Speed,
+        speed: fps(num, den),
+        duration_frames: 0,
+        preserve_pitch: false,
+        ripple: false,
+        overwrite: false,
+    }
+}

@@ -29,6 +29,21 @@ const RULES: &[Rule] = &[
         allows_unsafe: false,
     },
     Rule {
+        name: "mvm-media",
+        allowed_deps: &["mvm-core"],
+        allows_unsafe: true,
+    },
+    Rule {
+        name: "mvm-gpu",
+        allowed_deps: &["mvm-core"],
+        allows_unsafe: false,
+    },
+    Rule {
+        name: "mvm-testkit",
+        allowed_deps: &[],
+        allows_unsafe: false,
+    },
+    Rule {
         name: "mvm",
         allowed_deps: &["mvm-core"],
         allows_unsafe: false,
@@ -109,10 +124,30 @@ fn check_package(package: &Package, workspace: &[&str], manifest: &str) -> Vec<S
             package.name
         ));
     }
+    if rule.allows_unsafe && !has_lint(manifest, "unsafe_code", "deny") {
+        errors.push(format!(
+            "{} は unsafe_code = \"deny\" を [lints.rust] に書く必要があります",
+            package.name
+        ));
+    }
+    if rule.allows_unsafe && !has_lint(manifest, "undocumented_unsafe_blocks", "deny") {
+        errors.push(format!(
+            "{} は undocumented_unsafe_blocks = \"deny\" を [lints.clippy] に書く必要があります",
+            package.name
+        ));
+    }
     errors
 }
 
-/// manifest の `[lints]` 節に `workspace = true` があるか。
+/// manifest の lint 行が `key = "value"` かどうか。コメントと空白は見ない。
+fn has_lint(manifest: &str, key: &str, value: &str) -> bool {
+    let needle = format!("{key}=\"{value}\"");
+    manifest.lines().any(|line| {
+        let code = line.split("//").next().unwrap_or("").replace(' ', "");
+        code == needle
+    })
+}
+
 fn uses_workspace_lints(manifest: &str) -> bool {
     let mut in_lints = false;
     for line in manifest.lines().map(str::trim) {
@@ -163,6 +198,12 @@ fn parse_packages(metadata: &Value) -> Result<Vec<Package>, String> {
                 .and_then(Value::as_array)
                 .ok_or_else(|| format!("{name} に dependencies がありません"))?
                 .iter()
+                .filter(|dep| {
+                    !matches!(
+                        dep.get("kind").and_then(Value::as_str),
+                        Some("dev" | "build")
+                    )
+                })
                 .filter_map(|dep| dep.get("name").and_then(Value::as_str))
                 .map(str::to_owned)
                 .collect();
@@ -213,6 +254,19 @@ mod tests {
     fn rejects_crate_without_rule() {
         let errors = check_package(&package("mvm-unknown", &[]), &[], WORKSPACE_LINTS);
         assert_eq!(errors.len(), 1, "{errors:?}");
+    }
+
+    #[test]
+    fn unsafe_crate_needs_its_own_deny_lints() {
+        let missing = "[package]\nname = \"x\"\n";
+        let errors = check_package(&package("mvm-media", &[]), &["mvm-media"], missing);
+        assert!(
+            errors.iter().any(|error| error.contains("unsafe_code")),
+            "{errors:?}"
+        );
+        let present = "[package]\nname = \"x\"\n[lints.rust]\nunsafe_code = \"deny\"\n[lints.clippy]\nundocumented_unsafe_blocks = \"deny\"\n";
+        let errors = check_package(&package("mvm-media", &[]), &["mvm-media"], present);
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]

@@ -11,7 +11,10 @@ publish = false
 [workspace.dependencies]
 # internal
 mvm-core = { path = "crates/core" }
+mvm-gpu = { path = "crates/gpu" }
+mvm-media = { path = "crates/media" }
 mvm-project = { path = "crates/project" }
+mvm-testkit = { path = "crates/testkit" }
 
 # foundation
 serde = { version = "1", features = ["derive"] }

@@ -1,0 +1,18 @@
+[package]
+name = "mvm-gpu"
+description = "wgpu の compositor。NV12・P010・RGBA を affine・crop・opacity で合成する"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mvm-core = { workspace = true }
+pollster = "0.4"
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "dx12"] }
+
+[dev-dependencies]
+mvm-testkit = { workspace = true }

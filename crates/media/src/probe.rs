@@ -159,6 +159,7 @@ fn input_time_based(input: &Input, facts: &MediaStreamFacts) -> Result<ProbedMed
             sar_num: video.sar.0,
             sar_den: video.sar.1,
             alpha: facts.video_alpha_capable,
+            pixel_format: video.pixel_format,
         })?;
         return Ok(ProbedMedia::Video(ProbedVideo {
             width: classified.width,

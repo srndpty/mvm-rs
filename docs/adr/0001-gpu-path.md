@@ -2,11 +2,13 @@
 
 ## 決定
 
-映像の decode は D3D12VA だけにする。decode 済みの NV12 texture は、同じ DXGI device 上の wgpu texture として合成する。画素を CPU へ戻してから upload する decode 経路は持たない。
+映像の decode は D3D12VA だけにする。decode 済みの NV12（8bit）と P010（10bit）の texture は、同じ DXGI device 上の wgpu texture として合成する。画素を CPU へ戻してから upload する decode 経路は持たない。
 
-texture が shader から読めない（`VIDEO_DECODE_REFERENCE_ONLY` または `DENY_SHADER_RESOURCE`）ときは、別の経路へ切り替えず失敗させる。
+texture が shader から読めない（`VIDEO_DECODE_REFERENCE_ONLY` または `DENY_SHADER_RESOURCE`）とき、または形式が NV12 / P010 でないときは、別の経路へ切り替えず失敗させる。画素形式が header から分かる場合、8bit / 10bit の 4:2:0 以外は動画として受け付けない。
 
-静止画と試験のために、CPU 上の NV12 / P010 / RGBA を compositor へ upload する機能は残す。これは映像 decode の代替ではない。
+YUV から RGB への変換は、frame の色空間（BT.601 / BT.709 / BT.2020 非恒定輝度）とレンジ（limited / full）を使う。未指定の色空間は、高さが 576 以下なら BT.601、それ以外は BT.709 とする。未指定のレンジは limited とする。それ以外の色空間は失敗させる。
+
+静止画と試験のために、CPU 上の NV12 / P010 / RGBA を compositor へ upload する機能は残す。これは映像 decode の代替ではない。upload した画素も、同じ色空間とレンジで RGB にする。
 
 ## 測定
 

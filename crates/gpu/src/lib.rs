@@ -2,9 +2,12 @@
 //!
 //! layer は下から順に、premultiplied alpha で重ねる。座標は出力 pixel の中心
 //! （fragment の position）を affine で素材 pixel へ写す。
+//! YUV から RGB への変換は、layer の色空間とレンジを使う。
 
 mod params;
+mod yuv;
 
+pub use mvm_core::{YuvMatrix, YuvRange};
 pub use params::{LayerParams, MAX_DIMENSION, MAX_PIXELS, SourceKind, validate_output};
 
 use std::fmt;
@@ -50,6 +53,11 @@ pub enum LayerPixels<'a> {
         texture: &'a wgpu::Texture,
         array_layer: u32,
     },
+    /// 同じ [`Compositor`] の device で作った P010 texture。`array_layer` は配列の slice。
+    P010Texture {
+        texture: &'a wgpu::Texture,
+        array_layer: u32,
+    },
 }
 
 pub struct Layer<'a> {
@@ -81,6 +89,7 @@ impl Compositor {
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("mvm-compositor"),
             required_features: wgpu::Features::TEXTURE_FORMAT_NV12
+                | wgpu::Features::TEXTURE_FORMAT_P010
                 | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM,
             ..Default::default()
         }))
@@ -106,7 +115,7 @@ impl Compositor {
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size: std::num::NonZeroU64::new(64),
+                        min_binding_size: std::num::NonZeroU64::new(params::UNIFORM_BYTES),
                     },
                     count: None,
                 },
@@ -409,6 +418,21 @@ impl Compositor {
                     wgpu::TextureAspect::Plane1,
                 )),
             )),
+            LayerPixels::P010Texture {
+                texture,
+                array_layer,
+            } => Ok((
+                texture.create_view(&plane_view(
+                    *array_layer,
+                    wgpu::TextureFormat::R16Unorm,
+                    wgpu::TextureAspect::Plane0,
+                )),
+                texture.create_view(&plane_view(
+                    *array_layer,
+                    wgpu::TextureFormat::Rg16Unorm,
+                    wgpu::TextureAspect::Plane1,
+                )),
+            )),
         }
     }
 
@@ -544,29 +568,11 @@ impl Compositor {
     }
 
     fn uniform(&self, params: &LayerParams) -> wgpu::Buffer {
-        let mut data = [0f32; 16];
-        data[0] = params.affine[0];
-        data[1] = params.affine[1];
-        data[2] = params.affine[2];
-        data[3] = params.affine[3];
-        data[4] = params.affine[4];
-        data[5] = params.affine[5];
-        data[6] = params.opacity;
-        data[7] = match params.kind {
-            SourceKind::Nv12 | SourceKind::Nv12Texture => 0.0,
-            SourceKind::P010 => 1.0,
-            SourceKind::Rgba => 2.0,
-        };
-        data[8] = params.crop[0] as f32;
-        data[9] = params.crop[1] as f32;
-        data[10] = params.crop[2] as f32;
-        data[11] = params.crop[3] as f32;
-        data[12] = params.width as f32;
-        data[13] = params.height as f32;
+        let data = params::uniform_words(params);
         let bytes = f32_bytes(&data);
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("layer-params"),
-            size: 64,
+            size: params::UNIFORM_BYTES,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -613,8 +619,8 @@ fn align_256(value: u32) -> Result<u32, GpuError> {
         .ok_or_else(|| GpuError::new("stride の整列で溢れました"))
 }
 
-fn f32_bytes(values: &[f32; 16]) -> [u8; 64] {
-    let mut bytes = [0u8; 64];
+fn f32_bytes(values: &[f32; 24]) -> [u8; 96] {
+    let mut bytes = [0u8; 96];
     for (index, value) in values.iter().enumerate() {
         bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
     }
@@ -647,7 +653,7 @@ fn check_bytes(layer: &Layer<'_>) -> Result<(), GpuError> {
                 return Err(GpuError::new("NV12 / P010 の画素が足りません"));
             }
         }
-        LayerPixels::Nv12Texture { .. } => {}
+        LayerPixels::Nv12Texture { .. } | LayerPixels::P010Texture { .. } => {}
     }
     Ok(())
 }

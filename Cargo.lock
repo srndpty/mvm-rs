@@ -1626,6 +1626,7 @@ version = "0.1.0"
 name = "mvm-gpu"
 version = "0.1.0"
 dependencies = [
+ "mvm-core",
  "mvm-testkit",
  "pollster 0.4.0",
  "wgpu",

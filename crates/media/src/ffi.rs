@@ -112,6 +112,7 @@ pub struct StreamInfo {
     pub duration: i64,
     pub nb_frames: i64,
     pub sar: (i32, i32),
+    pub pixel_format: crate::classify::PixelFormatClass,
 }
 
 pub enum ReadStatus {
@@ -317,7 +318,31 @@ fn stream_info(format: *mut ff::AVFormatContext, index: usize) -> Result<StreamI
                 (*codecpar).sample_aspect_ratio.num,
                 (*codecpar).sample_aspect_ratio.den,
             ),
+            pixel_format: if codec_type == ff::AVMediaType::AVMEDIA_TYPE_VIDEO {
+                pixel_format_of((*codecpar).format)
+            } else {
+                crate::classify::PixelFormatClass::Unknown
+            },
         })
+    }
+}
+
+pub(crate) fn pixel_format_of(format: c_int) -> crate::classify::PixelFormatClass {
+    // SAFETY: av_pix_fmt_desc_get は静的な descriptor か null を返す。
+    unsafe {
+        let desc = av_pix_fmt_desc_get_int(format);
+        if desc.is_null() {
+            return crate::classify::PixelFormatClass::Unknown;
+        }
+        let flags = (*desc).flags;
+        if flags & (ff::AV_PIX_FMT_FLAG_HWACCEL as u64) != 0 {
+            return crate::classify::PixelFormatClass::Unknown;
+        }
+        let yuv420 = (*desc).nb_components >= 3
+            && (*desc).log2_chroma_w == 1
+            && (*desc).log2_chroma_h == 1
+            && flags & (ff::AV_PIX_FMT_FLAG_RGB as u64) == 0;
+        crate::classify::pixel_format_class((*desc).comp[0].depth, yuv420, true)
     }
 }
 
@@ -647,6 +672,26 @@ impl Decoder {
         }
         Ok(index)
     }
+
+    pub fn yuv_color(&self, frame: &Frame) -> Result<crate::color::VideoColor, MediaError> {
+        // SAFETY: codec は open から Drop まで有効。frame は alloc 済み。
+        // 色指定が frame に無ければ、container から写した codec context を使う。
+        unsafe {
+            let frame_space = (*frame.ptr).colorspace;
+            let frame_range = (*frame.ptr).color_range;
+            let space = if frame_space == ff::AVColorSpace::AVCOL_SPC_UNSPECIFIED {
+                (*self.codec).colorspace
+            } else {
+                frame_space
+            };
+            let range = if frame_range == ff::AVColorRange::AVCOL_RANGE_UNSPECIFIED {
+                (*self.codec).color_range
+            } else {
+                frame_range
+            };
+            crate::color::resolve_yuv(space, range, (*frame.ptr).height)
+        }
+    }
 }
 
 impl Drop for Decoder {
@@ -845,14 +890,21 @@ pub fn frame_icc_profile(frame: &Frame) -> Option<Vec<u8>> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodedTextureFormat {
+    Nv12,
+    P010,
+}
+
 pub struct ImportedTexture {
     pub texture: wgpu::Texture,
     pub array_layer: u32,
     pub width: u32,
     pub height: u32,
+    pub format: DecodedTextureFormat,
 }
 
-pub fn import_d3d12_nv12(
+pub fn import_d3d12_frame(
     frame: &Frame,
     device: &wgpu::Device,
 ) -> Result<ImportedTexture, MediaError> {
@@ -881,10 +933,27 @@ pub fn import_d3d12_nv12(
                 "D3D12VA の texture を shader から読めません",
             ));
         }
-        if raw_desc.Format != windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12 {
+        let nv12 = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12;
+        let p010 = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_P010;
+        let (wgpu_format, format, label) = if raw_desc.Format == nv12 {
+            (
+                wgpu::TextureFormat::NV12,
+                DecodedTextureFormat::Nv12,
+                "d3d12va-nv12",
+            )
+        } else if raw_desc.Format == p010 {
+            (
+                wgpu::TextureFormat::P010,
+                DecodedTextureFormat::P010,
+                "d3d12va-p010",
+            )
+        } else {
             std::mem::forget(resource);
-            return Err(MediaError::new("D3D12VA の texture が NV12 ではありません"));
-        }
+            return Err(MediaError::new(format!(
+                "D3D12VA の texture 形式に対応していません (NV12 / P010 のみ): {:?}",
+                raw_desc.Format
+            )));
+        };
         let width =
             u32::try_from(raw_desc.Width).map_err(|_| MediaError::new("texture の幅が不正です"))?;
         let height = raw_desc.Height;
@@ -898,7 +967,7 @@ pub fn import_d3d12_nv12(
         std::mem::forget(resource);
         let hal = wgpu_hal::dx12::Device::texture_from_raw(
             extra,
-            wgpu::TextureFormat::NV12,
+            wgpu_format,
             wgpu::TextureDimension::D2,
             wgpu::Extent3d {
                 width,
@@ -911,7 +980,7 @@ pub fn import_d3d12_nv12(
         let texture = device.create_texture_from_hal::<wgpu_hal::api::Dx12>(
             hal,
             &wgpu::TextureDescriptor {
-                label: Some("d3d12va-nv12"),
+                label: Some(label),
                 size: wgpu::Extent3d {
                     width,
                     height,
@@ -920,7 +989,7 @@ pub fn import_d3d12_nv12(
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::NV12,
+                format: wgpu_format,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             },
@@ -931,35 +1000,63 @@ pub fn import_d3d12_nv12(
             array_layer: layer,
             width,
             height,
+            format,
         })
     }
 }
 
-fn wait_fence(fence: *mut c_void, value: u64) -> Result<(), MediaError> {
-    if fence.is_null() || value == 0 {
+fn wait_fence(fence_ptr: *mut c_void, value: u64) -> Result<(), MediaError> {
+    if fence_ptr.is_null() || value == 0 {
         return Ok(());
     }
-    // SAFETY: fence は frame が所有する。from_raw の Drop で Release しないよう forget する。
+    // SAFETY: fence は frame が所有する。from_raw は所有を奪うので、成否にかかわらず
+    // Release しないよう forget する。未完了のときだけ event を作り、Drop で閉じる。
     unsafe {
         let fence: windows::Win32::Graphics::Direct3D12::ID3D12Fence =
-            windows::core::Interface::from_raw(fence);
-        let completed = fence.GetCompletedValue();
-        if completed < value {
-            let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None)
-                .map_err(|error| {
-                MediaError::new(format!("fence の event を作れません: {error}"))
-            })?;
-            fence
-                .SetEventOnCompletion(value, event)
-                .map_err(|error| MediaError::new(format!("fence を待てません: {error}")))?;
-            windows::Win32::System::Threading::WaitForSingleObject(
-                event,
-                windows::Win32::System::Threading::INFINITE,
-            );
-        }
+            windows::core::Interface::from_raw(fence_ptr);
+        let result = if fence.GetCompletedValue() < value {
+            wait_until_signaled(&fence, value)
+        } else {
+            Ok(())
+        };
         std::mem::forget(fence);
+        result
     }
-    Ok(())
+}
+
+fn wait_until_signaled(
+    fence: &windows::Win32::Graphics::Direct3D12::ID3D12Fence,
+    value: u64,
+) -> Result<(), MediaError> {
+    // SAFETY: CreateEventW の handle は OwnedEvent が CloseHandle する。
+    // fence は呼び出し側が生存させている。
+    unsafe {
+        let raw = windows::Win32::System::Threading::CreateEventW(None, false, false, None)
+            .map_err(|error| MediaError::new(format!("fence の event を作れません: {error}")))?;
+        let event = OwnedEvent(raw);
+        fence
+            .SetEventOnCompletion(value, event.0)
+            .map_err(|error| MediaError::new(format!("fence を待てません: {error}")))?;
+        let waited = windows::Win32::System::Threading::WaitForSingleObject(
+            event.0,
+            windows::Win32::System::Threading::INFINITE,
+        );
+        if waited != windows::Win32::Foundation::WAIT_OBJECT_0 {
+            return Err(MediaError::new("fence の完了を待てません"));
+        }
+        Ok(())
+    }
+}
+
+struct OwnedEvent(windows::Win32::Foundation::HANDLE);
+
+impl Drop for OwnedEvent {
+    fn drop(&mut self) {
+        // SAFETY: CreateEventW が返した kernel handle を 1 回だけ閉じる。
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
 }
 
 pub struct AudioChunk {
@@ -1152,4 +1249,42 @@ pub fn count_image_packets(input: &mut Input, stream_index: usize) -> Result<i32
         }
     }
     Ok(count)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn software_pixel_formats_map_to_importable_classes() {
+        assert_eq!(
+            pixel_format_of(ff::AVPixelFormat::AV_PIX_FMT_YUV420P as c_int),
+            crate::classify::PixelFormatClass::Yuv420Bit8
+        );
+        assert_eq!(
+            pixel_format_of(ff::AVPixelFormat::AV_PIX_FMT_YUV420P10LE as c_int),
+            crate::classify::PixelFormatClass::Yuv420Bit10
+        );
+        assert_eq!(
+            pixel_format_of(ff::AVPixelFormat::AV_PIX_FMT_YUV420P12LE as c_int),
+            crate::classify::PixelFormatClass::Unsupported
+        );
+        assert_eq!(
+            pixel_format_of(ff::AVPixelFormat::AV_PIX_FMT_YUV422P as c_int),
+            crate::classify::PixelFormatClass::Unsupported
+        );
+        assert_eq!(
+            pixel_format_of(ff::AVPixelFormat::AV_PIX_FMT_RGB24 as c_int),
+            crate::classify::PixelFormatClass::Unsupported
+        );
+        assert_eq!(
+            pixel_format_of(ff::AVPixelFormat::AV_PIX_FMT_NONE as c_int),
+            crate::classify::PixelFormatClass::Unknown
+        );
+        assert_eq!(
+            pixel_format_of(ff::AVPixelFormat::AV_PIX_FMT_D3D12 as c_int),
+            crate::classify::PixelFormatClass::Unknown
+        );
+    }
 }

@@ -35,7 +35,7 @@ const RULES: &[Rule] = &[
     },
     Rule {
         name: "mvm-gpu",
-        allowed_deps: &[],
+        allowed_deps: &["mvm-core"],
         allows_unsafe: false,
     },
     Rule {

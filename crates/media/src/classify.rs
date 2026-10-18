@@ -169,6 +169,7 @@ pub struct VideoFacts {
     pub sar_num: i32,
     pub sar_den: i32,
     pub alpha: bool,
+    pub pixel_format: PixelFormatClass,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -199,6 +200,7 @@ pub fn classify_video(video: &VideoFacts) -> Result<ClassifiedVideo, MediaError>
             "透過 (アルファ) のある動画には対応していません",
         ));
     }
+    ensure_importable_video(video.pixel_format)?;
     let fps = reduce(video.fps_num, video.fps_den);
     let (sar_num, sar_den) = if video.sar_num > 0 && video.sar_den > 0 {
         reduce(video.sar_num, video.sar_den)
@@ -250,6 +252,36 @@ pub fn classify_audio(audio: &AudioFacts) -> Result<ClassifiedAudio, MediaError>
         sample_rate: audio.sample_rate,
         duration_samples: samples,
     })
+}
+
+/// D3D12VA が NV12 / P010 にできる画素形式か。header から分からないときは [`PixelFormatClass::Unknown`]。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PixelFormatClass {
+    Unknown,
+    Yuv420Bit8,
+    Yuv420Bit10,
+    Unsupported,
+}
+
+pub fn pixel_format_class(bit_depth: i32, yuv420: bool, known: bool) -> PixelFormatClass {
+    if !known {
+        return PixelFormatClass::Unknown;
+    }
+    match (yuv420, bit_depth) {
+        (true, 8) => PixelFormatClass::Yuv420Bit8,
+        (true, 10) => PixelFormatClass::Yuv420Bit10,
+        _ => PixelFormatClass::Unsupported,
+    }
+}
+
+pub fn ensure_importable_video(format: PixelFormatClass) -> Result<(), MediaError> {
+    if format == PixelFormatClass::Unsupported {
+        Err(MediaError::new(
+            "8bit または 10bit の 4:2:0 以外の映像には対応していません",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn reduce(num: i32, den: i32) -> (i32, i32) {
@@ -358,6 +390,7 @@ mod tests {
             sar_num: 2,
             sar_den: 2,
             alpha: false,
+            pixel_format: PixelFormatClass::Yuv420Bit8,
         };
         let classified = classify_video(&video).unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(classified.fps_num, 60);
@@ -380,6 +413,46 @@ mod tests {
                 .message()
                 .contains("アルファ")
         );
+        let mut twelve = video;
+        twelve.pixel_format = PixelFormatClass::Unsupported;
+        assert!(
+            classify_video(&twelve)
+                .unwrap_err()
+                .message()
+                .contains("4:2:0")
+        );
+        let mut ten = video;
+        ten.pixel_format = PixelFormatClass::Yuv420Bit10;
+        assert!(classify_video(&ten).is_ok());
+        let mut unknown = video;
+        unknown.pixel_format = PixelFormatClass::Unknown;
+        assert!(classify_video(&unknown).is_ok());
+    }
+
+    #[test]
+    fn pixel_format_class_accepts_only_8_and_10_bit_420() {
+        assert_eq!(
+            pixel_format_class(8, true, true),
+            PixelFormatClass::Yuv420Bit8
+        );
+        assert_eq!(
+            pixel_format_class(10, true, true),
+            PixelFormatClass::Yuv420Bit10
+        );
+        assert_eq!(
+            pixel_format_class(12, true, true),
+            PixelFormatClass::Unsupported
+        );
+        assert_eq!(
+            pixel_format_class(8, false, true),
+            PixelFormatClass::Unsupported
+        );
+        assert_eq!(
+            pixel_format_class(12, true, false),
+            PixelFormatClass::Unknown
+        );
+        assert!(ensure_importable_video(PixelFormatClass::Unknown).is_ok());
+        assert!(ensure_importable_video(PixelFormatClass::Unsupported).is_err());
     }
 
     #[test]

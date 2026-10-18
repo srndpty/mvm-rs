@@ -6,8 +6,8 @@
 use std::path::Path;
 use std::time::Instant;
 
-use mvm_gpu::{Compositor, Layer, LayerParams, LayerPixels, SourceKind};
-use mvm_media::{ProbedMedia, open_d3d12va, probe_media_file};
+use mvm_gpu::{Compositor, Layer, LayerParams, LayerPixels, SourceKind, YuvMatrix, YuvRange};
+use mvm_media::{DecodedTextureFormat, ImportedFrame, ProbedMedia, open_d3d12va, probe_media_file};
 use mvm_testkit::{MARKER_WIDTH, read_frame_marker, read_frame_marker_at, smoke_dir};
 
 const FRAMES: u16 = 60;
@@ -46,7 +46,16 @@ fn d3d12va_two_1080p_layers_match_markers() {
             .expect("hevc の frame が尽きました");
         assert_eq!(left.index, i64::from(expected));
         assert_eq!(right.index, i64::from(expected));
-        let mut shifted = LayerParams::full(SourceKind::Nv12Texture, right.width, right.height);
+        assert_eq!(left.format, DecodedTextureFormat::Nv12);
+        assert_eq!(right.format, DecodedTextureFormat::Nv12);
+        if expected == 0 {
+            // h264 は色指定が無いので HD 既定の BT.709 limited。hevc は BT.470 BG / TV。
+            assert_eq!(left.color.matrix, YuvMatrix::Bt709);
+            assert_eq!(left.color.range, YuvRange::Limited);
+            assert_eq!(right.color.matrix, YuvMatrix::Bt601);
+            assert_eq!(right.color.range, YuvRange::Limited);
+        }
+        let mut shifted = params_for(&right);
         shifted.affine[2] = -(MARKER_WIDTH as f32);
         let rgba = compositor
             .composite(
@@ -54,18 +63,12 @@ fn d3d12va_two_1080p_layers_match_markers() {
                 output_height,
                 &[
                     Layer {
-                        params: LayerParams::full(SourceKind::Nv12Texture, left.width, left.height),
-                        pixels: LayerPixels::Nv12Texture {
-                            texture: &left.texture,
-                            array_layer: left.array_layer,
-                        },
+                        params: params_for(&left),
+                        pixels: pixels_for(&left),
                     },
                     Layer {
                         params: shifted,
-                        pixels: LayerPixels::Nv12Texture {
-                            texture: &right.texture,
-                            array_layer: right.array_layer,
-                        },
+                        pixels: pixels_for(&right),
                     },
                 ],
             )
@@ -87,6 +90,65 @@ fn d3d12va_two_1080p_layers_match_markers() {
             "release で 60 frame の合成が 1 秒を超えました: {elapsed:?}"
         );
     }
+}
+
+fn params_for(frame: &ImportedFrame) -> LayerParams {
+    let kind = match frame.format {
+        DecodedTextureFormat::Nv12 => SourceKind::Nv12Texture,
+        DecodedTextureFormat::P010 => SourceKind::P010Texture,
+    };
+    let mut params = LayerParams::full(kind, frame.width, frame.height);
+    params.matrix = frame.color.matrix;
+    params.range = frame.color.range;
+    params
+}
+
+fn pixels_for(frame: &ImportedFrame) -> LayerPixels<'_> {
+    match frame.format {
+        DecodedTextureFormat::Nv12 => LayerPixels::Nv12Texture {
+            texture: &frame.texture,
+            array_layer: frame.array_layer,
+        },
+        DecodedTextureFormat::P010 => LayerPixels::P010Texture {
+            texture: &frame.texture,
+            array_layer: frame.array_layer,
+        },
+    }
+}
+
+#[test]
+#[ignore = "workstation"]
+fn d3d12va_p010_imports_and_keeps_bt601() {
+    let path = smoke_dir().join("v4k60_hevc10.mp4");
+    require_file(&path);
+    match probe_media_file(&path).expect("10bit HEVC を probe") {
+        ProbedMedia::Video(video) => assert_eq!((video.width, video.height), (3840, 2160)),
+        other => panic!("10bit HEVC は動画です: {other:?}"),
+    }
+    let compositor = Compositor::new().expect("DX12 device がありません");
+    let mut decoder = open_d3d12va(compositor.device(), &path).expect("10bit HEVC の D3D12VA");
+    let frame = decoder
+        .decode_frame()
+        .expect("decode")
+        .expect("frame がありません");
+    assert_eq!(frame.format, DecodedTextureFormat::P010);
+    assert_eq!((frame.width, frame.height), (3840, 2160));
+    assert_eq!(frame.color.matrix, YuvMatrix::Bt601);
+    assert_eq!(frame.color.range, YuvRange::Limited);
+    let rgba = compositor
+        .composite(
+            64,
+            64,
+            &[Layer {
+                params: params_for(&frame),
+                pixels: pixels_for(&frame),
+            }],
+        )
+        .expect("合成");
+    assert!(
+        rgba.iter().any(|byte| *byte != 0),
+        "P010 の合成結果が空です"
+    );
 }
 
 fn require_file(path: &Path) {

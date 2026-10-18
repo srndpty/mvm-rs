@@ -2,7 +2,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use mvm_gpu::{Compositor, Layer, LayerParams, LayerPixels, SourceKind};
+use mvm_gpu::{Compositor, Layer, LayerParams, LayerPixels, SourceKind, YuvMatrix, YuvRange};
 use mvm_testkit::{
     CELL_COUNT, CELL_SIZE, MARKER_HEIGHT, MARKER_WIDTH, read_frame_marker, read_frame_marker_at,
 };
@@ -85,6 +85,158 @@ fn two_layers_keep_both_marker_bands() {
             .expect("右の帯"),
         9
     );
+}
+
+#[test]
+#[ignore = "workstation"]
+fn yuv_matrix_and_range_change_rgb() {
+    let compositor = Compositor::new().expect("DX12 device がありません");
+    let y = 81.0;
+    let cb = 90.0;
+    let cr = 240.0;
+    for matrix in [YuvMatrix::Bt601, YuvMatrix::Bt709, YuvMatrix::Bt2020] {
+        let pixel = composite_solid(
+            &compositor,
+            SourceKind::Nv12,
+            [y as u16, cb as u16, cr as u16],
+            matrix,
+            YuvRange::Limited,
+        );
+        assert_rgb(
+            &pixel,
+            reference_rgb(matrix, false, 8, y, cb, cr),
+            &format!("{matrix:?}"),
+        );
+    }
+    let limited = composite_solid(
+        &compositor,
+        SourceKind::Nv12,
+        [16, 128, 128],
+        YuvMatrix::Bt709,
+        YuvRange::Limited,
+    );
+    assert_eq!(&limited[0..3], &[0, 0, 0]);
+    let full = composite_solid(
+        &compositor,
+        SourceKind::Nv12,
+        [16, 128, 128],
+        YuvMatrix::Bt709,
+        YuvRange::Full,
+    );
+    assert!(full[0] > 8, "full range の Y=16 は黒ではない: {full:?}");
+    let p010 = composite_solid(
+        &compositor,
+        SourceKind::P010,
+        [324, 360, 960],
+        YuvMatrix::Bt601,
+        YuvRange::Limited,
+    );
+    assert_rgb(
+        &p010,
+        reference_rgb(YuvMatrix::Bt601, false, 10, 324.0, 360.0, 960.0),
+        "P010 BT.601",
+    );
+}
+
+fn composite_solid(
+    compositor: &Compositor,
+    kind: SourceKind,
+    codes: [u16; 3],
+    matrix: YuvMatrix,
+    range: YuvRange,
+) -> [u8; 4] {
+    let mut params = LayerParams::full(kind, 2, 2);
+    params.matrix = matrix;
+    params.range = range;
+    let planes = match kind {
+        SourceKind::Nv12 => solid_nv12(codes[0] as u8, codes[1] as u8, codes[2] as u8),
+        SourceKind::P010 => solid_p010(codes[0], codes[1], codes[2]),
+        SourceKind::Rgba | SourceKind::Nv12Texture | SourceKind::P010Texture => {
+            panic!("solid 試験は upload の NV12 / P010 だけ")
+        }
+    };
+    let pixels = match kind {
+        SourceKind::Nv12 => LayerPixels::Nv12 {
+            y: &planes.y,
+            uv: &planes.uv,
+        },
+        SourceKind::P010 => LayerPixels::P010 {
+            y: &planes.y,
+            uv: &planes.uv,
+        },
+        SourceKind::Rgba | SourceKind::Nv12Texture | SourceKind::P010Texture => {
+            panic!("solid 試験は upload の NV12 / P010 だけ")
+        }
+    };
+    let rgba = compositor
+        .composite(2, 2, &[Layer { params, pixels }])
+        .expect("合成");
+    rgba[0..4].try_into().expect("pixel")
+}
+
+fn solid_nv12(y: u8, u: u8, v: u8) -> Planes {
+    Planes {
+        y: vec![y; 4],
+        uv: vec![u, v],
+    }
+}
+
+fn solid_p010(y: u16, u: u16, v: u16) -> Planes {
+    let mut plane_y = Vec::new();
+    let stored_y = (y << 6).to_le_bytes();
+    for _ in 0..4 {
+        plane_y.extend_from_slice(&stored_y);
+    }
+    let mut uv = Vec::new();
+    uv.extend_from_slice(&(u << 6).to_le_bytes());
+    uv.extend_from_slice(&(v << 6).to_le_bytes());
+    Planes { y: plane_y, uv }
+}
+
+fn assert_rgb(pixel: &[u8], expected: [f64; 3], what: &str) {
+    for (index, expected) in expected.iter().enumerate() {
+        let quantized = (expected * 255.0).round() as i32;
+        let actual = i32::from(pixel[index]);
+        let delta = (actual - quantized).abs();
+        assert!(
+            delta <= 2,
+            "{what} ch{index}: got {actual}, expected {quantized}"
+        );
+    }
+}
+
+fn reference_rgb(matrix: YuvMatrix, full: bool, bits: u32, y: f64, cb: f64, cr: f64) -> [f64; 3] {
+    let (kr, kb) = match matrix {
+        YuvMatrix::Bt601 => (0.299, 0.114),
+        YuvMatrix::Bt709 => (0.2126, 0.0722),
+        YuvMatrix::Bt2020 => (0.2627, 0.0593),
+    };
+    let kg = 1.0 - kr - kb;
+    let (yy, cb, cr) = if bits == 8 && !full {
+        (
+            (y - 16.0) / 219.0,
+            (cb - 128.0) / 224.0,
+            (cr - 128.0) / 224.0,
+        )
+    } else if bits == 8 {
+        (y / 255.0, (cb - 128.0) / 255.0, (cr - 128.0) / 255.0)
+    } else if !full {
+        (
+            (y - 64.0) / 876.0,
+            (cb - 512.0) / 896.0,
+            (cr - 512.0) / 896.0,
+        )
+    } else {
+        (y / 1023.0, (cb - 512.0) / 1023.0, (cr - 512.0) / 1023.0)
+    };
+    let red = yy + 2.0 * (1.0 - kr) * cr;
+    let green = yy - 2.0 * kb * (1.0 - kb) / kg * cb - 2.0 * kr * (1.0 - kr) / kg * cr;
+    let blue = yy + 2.0 * (1.0 - kb) * cb;
+    [
+        red.clamp(0.0, 1.0),
+        green.clamp(0.0, 1.0),
+        blue.clamp(0.0, 1.0),
+    ]
 }
 
 fn composite_one(compositor: &Compositor, pixels: LayerPixels<'_>, params: LayerParams) -> u16 {

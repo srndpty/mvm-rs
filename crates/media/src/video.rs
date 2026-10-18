@@ -1,21 +1,27 @@
-//! 映像の decode。D3D12VA の NV12 texture を、同じ DXGI device の wgpu texture として返す。
+//! 映像の decode。D3D12VA の NV12 / P010 texture を、同じ DXGI device の wgpu texture として返す。
 
 use std::path::Path;
 
+use crate::classify::ensure_importable_video;
+use crate::color::VideoColor;
 use crate::error::MediaError;
 use crate::ffi::{
     self, Decoder, Frame, HwDevice, Input, Packet, ReadStatus, ReceiveStatus, SendStatus,
 };
 
+pub use crate::ffi::DecodedTextureFormat;
+
 /// decode 済みの 1 frame。`texture` は decoder の texture pool の一部（配列の `array_layer` 番目）。
 ///
 /// AVFrame を保持している間は、FFmpeg がその slice を次の decode に再利用しない。
 /// この値は、`texture` を読む GPU 処理の完了まで drop しないこと。
-pub struct ImportedNv12 {
+pub struct ImportedFrame {
     pub index: i64,
     pub width: u32,
     pub height: u32,
     pub array_layer: u32,
+    pub format: DecodedTextureFormat,
+    pub color: VideoColor,
     pub texture: wgpu::Texture,
     _frame: Frame,
 }
@@ -31,20 +37,23 @@ pub struct D3d12Decoder {
 }
 
 impl D3d12Decoder {
-    pub fn decode_frame(&mut self) -> Result<Option<ImportedNv12>, MediaError> {
+    pub fn decode_frame(&mut self) -> Result<Option<ImportedFrame>, MediaError> {
         loop {
             match self.decoder.receive(&mut self.frame)? {
                 ReceiveStatus::Frame => {
-                    // frame の所有を ImportedNv12 へ移す。unref すると slice が pool へ戻り、
+                    // frame の所有を ImportedFrame へ移す。unref すると slice が pool へ戻り、
                     // 合成の前に次の decode で上書きされ得る。
                     let frame = std::mem::replace(&mut self.frame, Frame::new()?);
                     let index = self.decoder.frame_index(&frame)?;
-                    let imported = ffi::import_d3d12_nv12(&frame, &self.device)?;
-                    return Ok(Some(ImportedNv12 {
+                    let color = self.decoder.yuv_color(&frame)?;
+                    let imported = ffi::import_d3d12_frame(&frame, &self.device)?;
+                    return Ok(Some(ImportedFrame {
                         index,
                         width: imported.width,
                         height: imported.height,
                         array_layer: imported.array_layer,
+                        format: imported.format,
+                        color,
                         texture: imported.texture,
                         _frame: frame,
                     }));
@@ -85,6 +94,7 @@ pub fn open_d3d12va(device: &wgpu::Device, path: &Path) -> Result<D3d12Decoder, 
         .iter()
         .find(|stream| stream.is_video && !stream.attached_picture)
         .ok_or_else(|| MediaError::new("映像の stream がありません"))?;
+    ensure_importable_video(video.pixel_format)?;
     let stream_index = video.index;
     input.discard_except(stream_index);
     let hardware = HwDevice::d3d12(device)?;

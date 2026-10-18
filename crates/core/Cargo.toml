@@ -1,0 +1,10 @@
+[package]
+name = "mvm-core"
+description = "純粋なデータと計算（有理数 timebase・timecode など）。外部依存を持たない"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

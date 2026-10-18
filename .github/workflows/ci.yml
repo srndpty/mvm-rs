@@ -1,0 +1,43 @@
+# mvm CI
+#
+# 手元と同じ入口 (dev.ps1 / scripts/lint.ps1) を呼ぶ。CI 専用の判定を書かない。
+# toolchain は rust-toolchain.toml の版を rustup が自動で使う。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: PSScriptAnalyzer を導入
+        shell: pwsh
+        run: |
+          $version = (Get-Content -Raw scripts/PSScriptAnalyzer.version).Trim()
+          Install-Module PSScriptAnalyzer -RequiredVersion $version -Scope CurrentUser -Force
+      - name: lint
+        shell: pwsh
+        run: ./dev.ps1 lint
+
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: type check
+        shell: pwsh
+        run: ./dev.ps1 check
+      - name: test
+        shell: pwsh
+        run: ./dev.ps1 test

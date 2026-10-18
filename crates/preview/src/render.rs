@@ -140,6 +140,7 @@ impl StillPreview {
         let mut raster_index = 0usize;
         for layer in &plan.layers {
             let (params, pixels) = match &layer.source {
+                // text crate の raster は straight alpha。静止画と同じ RGBA の経路で重ねる。
                 PlannedSource::Text(_) | PlannedSource::Subtitle(_) => {
                     let rgba = rasters
                         .get(raster_index)

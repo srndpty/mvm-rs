@@ -1,5 +1,7 @@
-//! 文字 block を premultiplied RGBA にする。
+//! 文字 block を straight alpha の RGBA にする。
 //!
+//! 重ね塗りは premultiplied で行い、最後に straight alpha へ戻す。compositor の RGBA layer は
+//! 静止画と同じく straight alpha を受け取り、shader で alpha を掛けるため。
 //! 行の高さは font size の 1.2 倍。輪郭は円に並べた字形で近似する。Qt の
 //! stroke と同じ画素にはならない。preview と、将来の書き出しは同じ関数を使う。
 
@@ -54,7 +56,8 @@ pub struct SubtitlePaint {
 
 const LINE_FACTOR: f64 = 1.2;
 
-/// Meiryo で `run` を `width`×`height` の premultiplied RGBA に描く。
+/// Meiryo で `run` を `width`×`height` の straight alpha の RGBA に描く。
+/// 複数行は block の幅（最も長い行）の中で `run.align` に揃える。
 pub fn raster(run: &GlyphRun, width: u32, height: u32) -> Result<Vec<u8>, TextError> {
     raster_at(run, width, height, Path::new(MEIRYO_PATH))
 }
@@ -133,7 +136,7 @@ pub fn place_subtitle(
     Ok(GlyphRun {
         origin_x: x.round().max(0.0) as i32,
         origin_y: y.round().max(0.0) as i32,
-        align: Align::Left,
+        align: paint.align,
         ..run
     })
 }
@@ -165,7 +168,12 @@ fn raster_at(
     let mut cache = SwashCache::new();
     let (block_w, block_h) = measure(&mut fonts, run)?;
     fill_background(&mut pixels, width, run, block_w, block_h);
-    let mut buffer = shape_lines(&mut fonts, run, None)?;
+    // 揃えの基準は最も長い行の幅。幅を渡さないと cosmic-text は行ごとの幅で揃え、揃えが効かない。
+    let padding = run.outline_width + 2;
+    let content_width = (block_w - 2.0 * f64::from(padding)) as f32;
+    let mut buffer = shape_lines(&mut fonts, run, Some(content_width), Wrap::None)?;
+    let origin_x = run.origin_x + padding;
+    let origin_y = run.origin_y + padding;
     if run.outline_width > 0 {
         let radius = run.outline_width;
         let mut y = -radius;
@@ -179,7 +187,7 @@ fn raster_at(
                         &mut buffer,
                         &mut pixels,
                         width,
-                        (run.origin_x + x, run.origin_y + y),
+                        (origin_x + x, origin_y + y),
                         run.outline_color,
                     );
                 }
@@ -194,9 +202,10 @@ fn raster_at(
         &mut buffer,
         &mut pixels,
         width,
-        (run.origin_x, run.origin_y),
+        (origin_x, origin_y),
         run.color,
     );
+    unpremultiply(&mut pixels);
     Ok(pixels)
 }
 
@@ -287,17 +296,11 @@ fn shape_lines(
     fonts: &mut FontSystem,
     run: &GlyphRun,
     width: Option<f32>,
+    wrap: Wrap,
 ) -> Result<Buffer, TextError> {
     let mut buffer = Buffer::new(fonts, metrics(run.font_size)?);
     buffer.set_size(fonts, width, None);
-    buffer.set_wrap(
-        fonts,
-        if width.is_some() {
-            Wrap::WordOrGlyph
-        } else {
-            Wrap::None
-        },
-    );
+    buffer.set_wrap(fonts, wrap);
     buffer.set_text(fonts, &run.content, &attrs(run.bold), Shaping::Advanced);
     let align = Some(cosmic_align(run.align));
     for line in &mut buffer.lines {
@@ -325,7 +328,7 @@ fn wrap_paragraphs(
         outline_width: paint.outline_width,
         background: paint.background,
     };
-    let buffer = shape_lines(fonts, &probe, Some(available))?;
+    let buffer = shape_lines(fonts, &probe, Some(available), Wrap::WordOrGlyph)?;
     let mut lines = Vec::new();
     for layout in buffer.layout_runs() {
         let text = layout.text.trim_end_matches(['\n', '\r']);
@@ -350,7 +353,7 @@ fn wrap_paragraphs(
 }
 
 fn measure(fonts: &mut FontSystem, run: &GlyphRun) -> Result<(f64, f64), TextError> {
-    let buffer = shape_lines(fonts, run, None)?;
+    let buffer = shape_lines(fonts, run, None, Wrap::None)?;
     let mut max_width = 0f32;
     let mut lines = 0i32;
     for layout in buffer.layout_runs() {
@@ -449,6 +452,20 @@ fn premultiply(argb: u32) -> [u8; 4] {
         scale(blue(argb)),
         a as u8,
     ]
+}
+
+/// premultiplied の画素を straight alpha に戻す。alpha 0 は全て 0 にする。
+fn unpremultiply(pixels: &mut [u8]) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        let a = u32::from(pixel[3]);
+        if a == 0 {
+            pixel[..3].fill(0);
+            continue;
+        }
+        for channel in &mut pixel[..3] {
+            *channel = ((u32::from(*channel) * 255 + a / 2) / a).min(255) as u8;
+        }
+    }
 }
 
 fn blend(pixels: &mut [u8], width: u32, x: i32, y: i32, src: [u8; 4]) {
@@ -564,6 +581,112 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("meiryo.ttc"), "{error}");
+    }
+
+    fn run(content: &str, align: Align, background: u32) -> GlyphRun {
+        GlyphRun {
+            content: content.to_owned(),
+            font_family: "Meiryo".to_owned(),
+            font_size: 64,
+            origin_x: 16,
+            origin_y: 16,
+            color: 0xFFFF_FFFF,
+            bold: false,
+            align,
+            outline_color: 0xFF00_0000,
+            outline_width: 0,
+            background,
+        }
+    }
+
+    /// `top..bottom` の行で、alpha が 0 でない最も左の列。
+    fn leftmost_ink(image: &[u8], width: usize, top: usize, bottom: usize) -> usize {
+        (top..bottom)
+            .filter_map(|y| (0..width).find(|x| image[(y * width + x) * 4 + 3] > 0))
+            .min()
+            .expect("行に字形がありません")
+    }
+
+    #[test]
+    fn unpremultiply_restores_straight_color() {
+        // 半透明の赤（premultiplied で R=64, A=128）は straight で R=128。
+        let mut pixels = [64, 0, 0, 128, 255, 255, 255, 255, 9, 9, 9, 0];
+        unpremultiply(&mut pixels);
+        assert_eq!(pixels, [128, 0, 0, 128, 255, 255, 255, 255, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    #[ignore = "workstation"]
+    fn translucent_background_is_returned_as_straight_alpha() {
+        let image = raster(&run("A", Align::Left, 0x80FF_0000), 256, 256).expect("Meiryo");
+        // block の左上の角は padding の中で、字形は無い。
+        let corner = (16 * 256 + 16) * 4;
+        assert_eq!(&image[corner..corner + 4], &[255, 0, 0, 128]);
+    }
+
+    #[test]
+    #[ignore = "workstation"]
+    fn wrapped_lines_follow_the_alignment_inside_the_block() {
+        // 1 行目は 1 文字、2 行目は 3 文字。全角 1 文字は 1 em = 64 px。
+        let width = 512;
+        let line = 77; // 64 * 1.2 の切り上げ
+        let top = 16 + 2;
+        let left = raster(
+            &run(
+                "あ
+あああ",
+                Align::Left,
+                0,
+            ),
+            512,
+            256,
+        )
+        .expect("Meiryo");
+        let center = raster(
+            &run(
+                "あ
+あああ",
+                Align::Center,
+                0,
+            ),
+            512,
+            256,
+        )
+        .expect("Meiryo");
+        let right = raster(
+            &run(
+                "あ
+あああ",
+                Align::Right,
+                0,
+            ),
+            512,
+            256,
+        )
+        .expect("Meiryo");
+        let shift = |image: &[u8]| {
+            leftmost_ink(image, width, top, top + line) as i64
+                - leftmost_ink(image, width, top + line, top + 2 * line) as i64
+        };
+        assert!(shift(&left).abs() < 8, "左揃え {}", shift(&left));
+        assert!(
+            (48..=80).contains(&shift(&center)),
+            "中央揃え {}",
+            shift(&center)
+        );
+        assert!(
+            (112..=144).contains(&shift(&right)),
+            "右揃え {}",
+            shift(&right)
+        );
+
+        let mut subtitle = paint(
+            "あ
+あああ",
+        );
+        subtitle.align = Align::Right;
+        let placed = place_subtitle(&subtitle, 1920, 1080).expect("字幕");
+        assert_eq!(placed.align, Align::Right, "字幕の揃えが失われています");
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! 鳴っている端点より先に GPU を落とさない。
 
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -35,12 +36,33 @@ enum Command {
         generation: u64,
     },
     Shutdown,
+    /// worker の異常終了を試験で起こす。
+    #[cfg(test)]
+    Panic {
+        generation: u64,
+    },
+}
+
+impl Command {
+    fn generation(&self) -> Option<u64> {
+        match self {
+            Self::Project { generation, .. }
+            | Self::Seek { generation, .. }
+            | Self::Play { generation, .. }
+            | Self::Pause { generation } => Some(*generation),
+            #[cfg(test)]
+            Self::Panic { generation } => Some(*generation),
+            Self::Shutdown => None,
+        }
+    }
 }
 
 struct Mail {
     lock: Mutex<MailInner>,
     changed: Condvar,
     wake: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// UI が最後に送った command の世代。worker が panic したら、この世代で知らせる。
+    requested: AtomicU64,
 }
 
 struct MailInner {
@@ -70,6 +92,7 @@ impl Mail {
             }),
             changed: Condvar::new(),
             wake: Mutex::new(None),
+            requested: AtomicU64::new(0),
         }
     }
 
@@ -212,6 +235,9 @@ impl Worker {
     fn handle(&mut self, command: Command) -> bool {
         match command {
             Command::Shutdown => false,
+            #[cfg(test)]
+            #[allow(clippy::panic)]
+            Command::Panic { .. } => panic!("試験で起こした異常終了"),
             Command::Project {
                 project,
                 generation,
@@ -406,7 +432,10 @@ impl PreviewEngine {
                     Worker::new(worker_mail).run(incoming);
                 }));
                 if finished.is_err() {
-                    panic_mail.publish_error(0, "preview が異常終了しました".to_owned());
+                    // UI は今の世代の通知だけを受け取る。0 などの古い世代で送ると捨てられ、
+                    // 再生中のまま止まった worker が残る。
+                    let generation = panic_mail.requested.load(Ordering::Acquire);
+                    panic_mail.publish_error(generation, "preview が異常終了しました".to_owned());
                 }
             })
             .map_err(|error| PreviewError::new(format!("preview を起動できません: {error}")))?;
@@ -495,6 +524,9 @@ impl PreviewEngine {
     }
 
     fn send(&self, command: Command) -> Result<(), PreviewError> {
+        if let Some(generation) = command.generation() {
+            self.mail.requested.store(generation, Ordering::Release);
+        }
         self.commands
             .send(command)
             .map_err(|_| PreviewError::new("preview が停止しています"))
@@ -589,6 +621,34 @@ mod tests {
         let delivery = mail.take().expect("通知");
         assert_eq!(delivery.image.map(|image| image.frame), Some(8));
         assert_eq!(delivery.playing, Some(true));
+    }
+
+    #[test]
+    fn a_worker_panic_is_reported_on_the_latest_generation() {
+        let engine = PreviewEngine::start().expect("起動");
+        engine.set_project(Arc::new(Project::default()), 1).unwrap();
+        engine.send(Command::Panic { generation: 5 }).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let delivery = loop {
+            if let Some(delivery) = engine.poll()
+                && delivery.error.is_some()
+            {
+                break delivery;
+            }
+            assert!(Instant::now() < deadline, "異常終了が届きません");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(delivery.generation, 5, "古い世代で届くと UI が捨てます");
+        assert_eq!(delivery.playing, Some(false));
+        assert!(delivery.error.unwrap().contains("異常終了"));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while engine.play(0, 6).is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "止まった worker が command を受け取ります"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]

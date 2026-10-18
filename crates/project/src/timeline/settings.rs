@@ -2,7 +2,9 @@
 
 use mvm_core::Rational;
 
-use crate::clip_effects::{ClipEffects, ClipKeyKind, insert_clip_key, remove_clip_keys};
+use crate::clip_effects::{
+    ClipEffects, ClipKeyKind, EFFECT_CHANNELS, insert_clip_key, remove_clip_keys, retime_clip_keys,
+};
 use crate::error::{ProjectResult, fail};
 use crate::model::{
     ManimAsset, Project, TimelineClip, TimelineClipKind, Track, TrackKind, TrackRef,
@@ -10,7 +12,9 @@ use crate::model::{
 };
 
 use super::common::{EditResult, commit_candidate, finalize_timeline_candidate};
-use super::mapping::{clip_interval, source_boundary_to_timeline_boundary, timeline_clip_duration};
+use super::mapping::{
+    clip_duration_at, clip_interval, source_boundary_to_timeline_boundary, timeline_clip_duration,
+};
 use super::ripple::edit_timeline_time;
 
 /// 生成済みの Manim asset を timeline に置く。Manim clip は Project に 1 つだけ。
@@ -59,7 +63,8 @@ pub fn append_manim_timeline_clip_at(
 }
 
 /// 解像度と timeline fps を 1 つの transaction で変更する。既存 clip の素材 domain は変えず、timeline 上の位置
-/// （開始・マーカー・イン/アウト・トランジションの長さ・字幕）だけを、秒の位置が保たれるよう新 fps へ換算する。
+/// （開始・マーカー・イン/アウト・トランジションの長さ・字幕・clip 内の effect key）だけを、秒の位置が保たれるよう
+/// 新 fps へ換算する。key は新しい clip 尺の末尾 frame へ寄せ、同じ frame に重なったものは先の 1 つを残す。
 pub fn set_project_video_settings(
     project: &mut Project,
     width: i32,
@@ -128,6 +133,29 @@ pub fn set_project_video_settings(
                     "clip開始位置を新しいtimeline frame rateへ変換できません: {}",
                     clip.name
                 ));
+            }
+            // 尺は素材 domain と新しい timeline fps から決まる。開始位置の換算とは独立。
+            let new_duration = match clip_duration_at(clip, fps) {
+                Ok(duration) => duration,
+                Err(error) => {
+                    return fail(format!(
+                        "clipの尺を新しいtimeline frame rateへ変換できません: {}: {error}",
+                        clip.name
+                    ));
+                }
+            };
+            for channel in &EFFECT_CHANNELS {
+                if let Err(error) = retime_clip_keys(
+                    clip.effects.keys_mut(channel.kind),
+                    old_fps,
+                    fps,
+                    new_duration,
+                ) {
+                    return fail(format!(
+                        "キーフレームを新しいtimeline frame rateへ変換できません: {}: {error}",
+                        clip.name
+                    ));
+                }
             }
         }
         for transition in &mut candidate.timeline_transitions {

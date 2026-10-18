@@ -317,6 +317,13 @@ mod tests {
             half.exact_media_time(i64::MAX),
             Err(TimebaseError::ResultOverflow)
         );
+        // i64::MIN * 2^62 * 4 = i128::MIN。ceil 除算が分子を否定すると panic する。
+        // 商の絶対値は 2^64 を超えるので、結果は i64 に収まらない。
+        let extreme = OutputTimebase::new(rate(3, 1 << 62), 4).unwrap();
+        assert_eq!(
+            extreme.first_audio_sample(i64::MIN),
+            Err(TimebaseError::ResultOverflow)
+        );
     }
 
     // 期待値は floor(ns * num / (den * 1e9)) を独立に計算した literal。

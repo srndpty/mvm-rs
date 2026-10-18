@@ -63,8 +63,15 @@ pub fn div_floor(numerator: i128, denominator: i128) -> i128 {
 }
 
 /// 数学的な ceil 除算（負の値も +∞ 方向へ丸める）。`denominator > 0`。
+/// 分子は否定しない。`i128::MIN` の否定は溢れる。
 pub fn div_ceil(numerator: i128, denominator: i128) -> i128 {
-    -(-numerator).div_euclid(denominator)
+    let quotient = numerator.div_euclid(denominator);
+    if numerator.rem_euclid(denominator) == 0 {
+        quotient
+    } else {
+        // 余りがあるとき商は i128::MAX 未満（分母が 1 なら余りは 0）。+1 は溢れない。
+        quotient + 1
+    }
 }
 
 #[cfg(test)]
@@ -106,5 +113,13 @@ mod tests {
         assert_eq!(div_ceil(7, 2), 4);
         assert_eq!(div_ceil(-7, 2), -3);
         assert_eq!(div_ceil(8, 2), 4);
+        // ceil(-2^127 / 3) = -(2^127 - 2) / 3。分子を否定する実装はここで溢れる。
+        assert_eq!(
+            div_ceil(i128::MIN, 3),
+            -56_713_727_820_156_410_577_229_101_238_628_035_242
+        );
+        assert_eq!(div_ceil(i128::MIN, 1), i128::MIN);
+        assert_eq!(div_ceil(i128::MIN, 2), i128::MIN / 2);
+        assert_eq!(div_ceil(i128::MIN, i128::MAX), -1);
     }
 }

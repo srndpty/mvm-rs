@@ -557,6 +557,83 @@ fn timeline_frame_rate_change() {
     set_timeline_frame_rate(&mut with_clip, fps(24, 1)).unwrap();
 }
 
+// effect key は clip 先頭からの timeline frame なので、fps を変えても秒位置を保つ。
+// 換算しないと尺が縮んだとき末尾の key が clip の外に出て、設定変更全体が拒否される。
+#[test]
+fn timeline_frame_rate_change_retimes_effect_keys() {
+    let mut project = Project::default();
+    let mut video = clip("keyed");
+    video.effects.fade_in_frames = 30;
+    video.effects.fade_out_frames = 15;
+    video.effects.opacity_keys = vec![key(120, 40.0), key(200, 10.0)];
+    video.effects.position_x_keys = vec![key(299, 25.0)];
+    let mut audio = audio_clip("keyed-audio");
+    audio.timeline_start_frame = 300;
+    audio.effects.volume_keys = vec![key(90, 80.0)];
+    audio.effects.ducking_keys = vec![key(9, -6.0), key(10, -12.0)];
+    project.timeline_clips = vec![video, audio];
+    let before_invalid = project.clone();
+    assert!(set_timeline_frame_rate(&mut project, fps(48, 1)).is_err());
+    assert_eq!(project, before_invalid);
+
+    set_timeline_frame_rate(&mut project, fps(30, 1)).unwrap();
+    let video = &project.timeline_clips[0];
+    assert_eq!(
+        video
+            .effects
+            .opacity_keys
+            .iter()
+            .map(|key| (key.frame, key.value))
+            .collect::<Vec<_>>(),
+        vec![(60, 40.0), (100, 10.0)],
+        "60fps の 2 秒と 10/3 秒は 30fps の frame 60 と 100"
+    );
+    assert_eq!(
+        (
+            video.effects.position_x_keys[0].frame,
+            video.effects.position_x_keys[0].value
+        ),
+        (149, 25.0),
+        "尺の末尾 key は新しい尺の最終 frame へ寄せる"
+    );
+    assert_eq!(
+        (video.effects.fade_in_frames, video.effects.fade_out_frames),
+        (30, 15),
+        "fade は素材 frame なので timeline fps では動かさない"
+    );
+    let audio = &project.timeline_clips[1];
+    assert_eq!(audio.timeline_start_frame, 150);
+    assert_eq!(
+        (
+            audio.effects.volume_keys[0].frame,
+            audio.effects.volume_keys[0].value
+        ),
+        (45, 80.0)
+    );
+    assert_eq!(
+        audio
+            .effects
+            .ducking_keys
+            .iter()
+            .map(|key| (key.frame, key.value))
+            .collect::<Vec<_>>(),
+        vec![(5, -6.0)],
+        "同じ frame に重なった key は先の 1 つを残す"
+    );
+
+    set_timeline_frame_rate(&mut project, fps(60, 1)).unwrap();
+    assert_eq!(
+        project.timeline_clips[0]
+            .effects
+            .opacity_keys
+            .iter()
+            .map(|key| (key.frame, key.value))
+            .collect::<Vec<_>>(),
+        vec![(120, 40.0), (200, 10.0)],
+        "尺の内側の key は往復しても同じ frame に戻る"
+    );
+}
+
 #[test]
 fn trim_and_lookup() {
     let mut project = Project::default();

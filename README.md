@@ -5,11 +5,13 @@ C++/Qt 版 (`C:\dev\soft\mvm`) から Rust への全面移行中。
 
 ## 現在の状態
 
-**P4 preview の再生。** 純粋ロジック（P1）と、FFmpeg で probe・静止画・音声・映像を読む経路（P2）、
-メニュー・プロジェクトパネル・timeline の GUI（P3）に加え、preview を再生できる。decode と合成は
-worker thread が行い、音声があれば WASAPI の IAudioClock を正にして映像を進める。文字・字幕は
-Meiryo で描く。映像は D3D12VA の texture を wgpu へ渡して合成する
-（[docs/adr/0001-gpu-path.md](docs/adr/0001-gpu-path.md)）。編集操作・自動保存・数式系の描画はまだ無い。移行計画は [docs/migration-plan.md](docs/migration-plan.md)。
+**P5 編集 UI。** 純粋ロジック（P1）と、FFmpeg で probe・静止画・音声・映像を読む経路（P2）、
+メニュー・プロジェクトパネル・timeline の GUI（P3）、preview の再生（P4）に加え、timeline で編集できる。
+全 tool（V A C B N R Y U P H Z T）・inspector・keyframe（Pen）・transition の長さ・track の表示 / 消音 / ソロ・
+copy / paste・undo / redo を持つ。編集中は自動復旧データ（`.mvm.recovery`）を書き、`.mvm.lock` で
+同じ Project の二重起動を止め、外部で書き換えられた file には上書きの前に確認を出す。
+preview の decode と合成は worker thread が行い、音声があれば WASAPI の IAudioClock を正にして映像を進める
+（[docs/adr/0001-gpu-path.md](docs/adr/0001-gpu-path.md)）。書き出しと数式系の描画はまだ無い。移行計画は [docs/migration-plan.md](docs/migration-plan.md)。
 
 開発の規約は [AGENTS.md](AGENTS.md) に一本化している。
 
@@ -65,7 +67,9 @@ cargo test -p mvm-project --test json reads_cpp_project_corpus -- --include-igno
 | `crates/media` | FFmpeg による probe・静止画・音声・映像 decode |
 | `crates/gpu` | 合成（DX12 / wgpu） |
 | `crates/testkit` | 試験素材の frame marker |
-| `crates/project` | Project model・timeline 編集・effects / keyframe・字幕と SRT・media bin・数式 / Graph のデータ・schema 22 の JSON |
+| `crates/project` | Project model・timeline 編集・tool の判定・effects / keyframe・字幕と SRT・media bin・数式 / Graph のデータ・schema 22 の JSON・自動復旧の envelope |
+| `crates/platform` | OS の file 操作（atomic write・file の実体・Project lock） |
+| `crates/app` | session（command・undo / redo・保存・自動保存・preview の再生） |
 | `apps/mvm` | 製品アプリ（egui） |
 | `xtask` | アーキテクチャ検査（crate の依存方向・unsafe を許可する crate） |
 | `scripts` | lint などの正式スクリプト |

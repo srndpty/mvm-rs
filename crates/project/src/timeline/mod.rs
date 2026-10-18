@@ -1,8 +1,11 @@
 //! timeline の検証と編集。全ての編集は候補全体を検証し、失敗時は Project を変えない。
 
+mod clipboard;
 mod common;
 mod edit;
+mod gestures;
 mod mapping;
+mod marks;
 mod ripple;
 mod sequence;
 mod settings;
@@ -10,14 +13,24 @@ mod speed;
 mod transition_edit;
 mod validate;
 
+pub use clipboard::{CopyPlacement, place_copied_clips};
 pub use common::{ClipIdIndex, EditResult, LinkMode, TrimEdge, finalize_timeline_candidate};
 pub use edit::{
     EdgeEditKind, active_clip_at, active_clips_at, append_timeline_clip, apply_default_clip_fades,
     clamp_edge_edit, clip_ids_spanning_frame, clip_ids_spanning_frame_among, clip_with_edge_at,
-    default_transition_frames, delete_timeline_clip, move_clip, move_clips, place_audio_clip_at,
-    place_linked_av_pair_at, place_media_at_drop, place_still_clip_at, place_timeline_clip_at,
-    split_timeline_clips, step_clip_volume, timeline_track_end_frame, toggle_clips_enabled,
-    touching_clip_id, trim_timeline_clip, unlink_timeline_clip,
+    default_transition_frames, delete_timeline_clip, delete_timeline_clips, move_clip, move_clips,
+    place_audio_clip_at, place_linked_av_pair_at, place_media_at_drop, place_still_clip_at,
+    place_text_clip, place_timeline_clip_at, split_timeline_clips, step_clip_volume,
+    timeline_track_end_frame, toggle_clips_enabled, touching_clip_id, trim_timeline_clip,
+    unlink_timeline_clip,
+};
+pub use gestures::{
+    BodyAction, BodyGesture, BodyPress, ClipSpan, DragBounds, EdgeAction, GestureModifiers,
+    PenGeometry, PenKey, PenPoint, PenPress, PenRelease, PenSample, SnapFrames, SnapOffset, TOOLS,
+    TimelineTool, ToolSpec, body_press, body_release, drag_snap_frames, edge_release,
+    group_drag_offset_x, group_drag_track_index, linked_for, marker_near_ruler_x, pen_line_points,
+    pen_line_y_at, pen_nearest_key, pen_press, pen_release, pen_snap_value, pen_usable_height,
+    pen_value_at, pen_visible_keys, pen_visible_line_points, pen_y, snap_drag_offset_x,
 };
 pub use mapping::{
     ClipProducerRange, clip_duration_at, clip_fade_source_frame_at, clip_interval,
@@ -26,6 +39,10 @@ pub use mapping::{
     frame_hold_producer_position, math_intro_source_frame_at, math_intro_timeline_frames,
     source_boundary_to_timeline_boundary, source_rate_matches_timeline_rate,
     timeline_boundary_to_source_boundary, timeline_clip_duration,
+};
+pub use marks::{
+    add_timeline_marker, delete_timeline_marker, set_clip_effect_base, set_mark_in, set_mark_out,
+    set_subtitle_visible,
 };
 pub use ripple::{
     SelectDirection, clamp_slide_edit, clip_ids_from_frame, edit_timeline_time,

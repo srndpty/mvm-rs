@@ -338,6 +338,85 @@ pub fn delete_timeline_clip(project: &mut Project, selected_index: usize) -> Edi
         .map(|last| selected_index.min(last)))
 }
 
+/// 選択した clip を一度に消す。リンク相手も同じ link group なら一緒に消す（単体削除と同じ）。
+pub fn delete_timeline_clips(project: &mut Project, clip_ids: &[String]) -> EditResult {
+    if clip_ids.is_empty() {
+        return fail("削除する timeline clip がありません");
+    }
+    let mut candidate = project.clone();
+    let mut erased: HashSet<String> = HashSet::new();
+    for id in clip_ids {
+        let Some(clip) = candidate.clip(id) else {
+            return fail("削除する timeline clip がありません");
+        };
+        erased.insert(clip.id.clone());
+        if !clip.link_group_id.is_empty() {
+            let group = clip.link_group_id.clone();
+            erased.extend(
+                candidate
+                    .timeline_clips
+                    .iter()
+                    .filter(|other| other.link_group_id == group)
+                    .map(|other| other.id.clone()),
+            );
+        }
+    }
+    candidate
+        .timeline_clips
+        .retain(|clip| !erased.contains(&clip.id));
+    erase_linked_subtitles(&mut candidate, &erased);
+    finalize_timeline_candidate(&mut candidate)?;
+    *project = candidate;
+    Ok(project.timeline_clips.len().checked_sub(1))
+}
+
+/// 文字 clip を指定位置へ置く。中身が空、または既存 clip と重なるときは Project を変えない。
+pub fn place_text_clip(
+    project: &mut Project,
+    track: TrackRef,
+    timeline_start_frame: i64,
+    content: &str,
+    new_id: &mut dyn FnMut() -> String,
+) -> EditResult {
+    let content = content.trim();
+    if content.is_empty() || !project.is_valid_track_ref(track) || timeline_start_frame < 0 {
+        return fail("文字 clip の内容または位置が不正です");
+    }
+    if track.kind != TrackKind::Video {
+        return fail("文字 clip は video track に置きます");
+    }
+    let length = crate::model::default_still_clip_frames(project.timeline_fps);
+    let id = new_id();
+    if id.is_empty() {
+        return fail("文字 clip の ID を作れません");
+    }
+    let name = content.lines().next().unwrap_or(content);
+    let name = if name.chars().count() > 24 {
+        let mut short: String = name.chars().take(24).collect();
+        short.push('…');
+        short
+    } else {
+        name.to_owned()
+    };
+    let clip = TimelineClip {
+        kind: TimelineClipKind::Text,
+        name,
+        id,
+        source_fps: project.timeline_fps,
+        source_frame_count: length,
+        source_in_frame: 0,
+        source_out_frame: length,
+        timeline_start_frame,
+        track,
+        text: crate::model::TextClipData {
+            content: content.to_owned(),
+            ..crate::model::TextClipData::default()
+        },
+        ..TimelineClip::default()
+    };
+    place_timeline_clip_at(project, clip, track, timeline_start_frame)
+}
+
 /// kind の track を `first_index` から順に試し、mute されていない track で `place` が成功したら確定する。
 /// 既存 track に空きが無ければ track を上へ足していく。足した track は空で mute もされていないので、
 /// そこへ置けなければ別の理由の失敗としてそのまま返す。

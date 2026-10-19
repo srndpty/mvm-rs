@@ -1865,4 +1865,34 @@ mod tests {
         harness.get_by(spin_starting_with("15"));
         assert!(!harness.state().session.can_undo());
     }
+
+    #[test]
+    fn a_folder_is_dragged_into_another_folder_and_back_to_the_root() {
+        let folder = |id: &str, name: &str| MediaFolder {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            parent_id: String::new(),
+        };
+        let project = Project {
+            media_folders: vec![folder("a", "フォルダA"), folder("b", "フォルダB")],
+            ..Project::default()
+        };
+        let mut harness = harness(MvmApp::new());
+        harness.state_mut().session = Session::from_project(project);
+        harness.run();
+        let from = harness.get_by_label("フォルダA").rect().center();
+        let to = harness.get_by_label("フォルダB").rect().center();
+        press_and_release(&mut harness, from, to);
+        let parent = |harness: &Harness<'static, MvmApp>| {
+            harness.state().session.project().media_folders[0]
+                .parent_id
+                .clone()
+        };
+        assert_eq!(parent(&harness), "b", "フォルダをフォルダへ移せません");
+        // 開いたフォルダB の中の A を、パネル下の空白（root）へ戻す。
+        let from = harness.get_by_label("フォルダA").rect().center();
+        let empty = harness.get_by_label("フォルダB").rect().center() + egui::vec2(0.0, 300.0);
+        press_and_release(&mut harness, from, empty);
+        assert_eq!(parent(&harness), "", "root へ戻せません");
+    }
 }

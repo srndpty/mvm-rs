@@ -135,7 +135,9 @@ fn show_folder(
             .show(ui, |ui| {
                 show_folder(ui, project, panel, in_use, &folder.id, seen, actions);
             });
-        let response = header.header_response;
+        // 見出しもドラッグで動かせる（別のフォルダや root の空白へ落として移す）。
+        let response = header.header_response.interact(Sense::drag());
+        response.dnd_set_drag_payload(MediaDrag(panel.drag_ids(&folder.id)));
         if selected {
             ui.painter().rect_stroke(
                 response.rect,

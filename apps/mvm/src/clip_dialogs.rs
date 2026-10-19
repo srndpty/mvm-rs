@@ -13,6 +13,9 @@ const ERROR: egui::Color32 = egui::Color32::from_rgb(230, 120, 120);
 #[derive(Default)]
 pub struct SpeedDialog {
     clip_id: Option<String>,
+    /// 開いたときの速度。尺から決めた速度は整数 % で表せないことがあるので、速度・尺のどちらも編集していない間は
+    /// 丸めた % ではなくこれを使う（ピッチ・リップルだけを変えて適用しても速度と尺を変えない）。
+    original_speed: Option<Rational>,
     speed_percent: i64,
     duration_frames: i64,
     input: Option<SpeedDurationInput>,
@@ -43,6 +46,7 @@ impl SpeedDialog {
         };
         *self = Self {
             clip_id: Some(clip_id.to_owned()),
+            original_speed: Some(clip.speed),
             speed_percent: speed_percent(clip.speed),
             duration_frames: duration,
             input: None,
@@ -60,7 +64,10 @@ impl SpeedDialog {
     fn edit(&self, overwrite: bool) -> Option<ClipSpeedDurationEdit> {
         Some(ClipSpeedDurationEdit {
             input: self.input.unwrap_or(SpeedDurationInput::Speed),
-            speed: Rational::new(self.speed_percent, 100).reduced()?,
+            speed: match (self.input, self.original_speed) {
+                (None, Some(original)) => original,
+                _ => Rational::new(self.speed_percent, 100).reduced()?,
+            },
             duration_frames: self.duration_frames,
             preserve_pitch: self.preserve_pitch,
             ripple: self.ripple,
@@ -318,5 +325,54 @@ pub fn fps_label(fps: Rational) -> String {
         )
     } else {
         "-- fps".to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mvm_project::{Project, TimelineClip, TimelineClipKind, TrackRef};
+
+    use super::*;
+
+    /// 尺から決めた 2/3 倍（66.666…%）の clip。
+    fn session() -> Session {
+        Session::from_project(Project {
+            timeline_clips: vec![TimelineClip {
+                kind: TimelineClipKind::Video,
+                media_path: "v.mp4".into(),
+                name: "v".to_owned(),
+                id: "v".to_owned(),
+                source_fps: Rational::new(60, 1),
+                source_frame_count: 200,
+                source_out_frame: 200,
+                speed: Rational::new(2, 3),
+                track: TrackRef::video(0),
+                ..TimelineClip::default()
+            }],
+            ..Project::default()
+        })
+    }
+
+    #[test]
+    fn an_unedited_fractional_speed_is_kept_as_is() {
+        let mut session = session();
+        let mut dialog = SpeedDialog::default();
+        dialog.open(&mut session, "v");
+        assert_eq!(dialog.speed_percent, 67);
+        // ピッチだけを変えても、速度は丸めた 67% ではなく元の 2/3 のまま。
+        dialog.preserve_pitch = true;
+        let edit = dialog.edit(false).expect("編集");
+        assert_eq!(edit.speed, Rational::new(2, 3));
+    }
+
+    #[test]
+    fn an_edited_speed_uses_the_entered_percentage() {
+        let mut session = session();
+        let mut dialog = SpeedDialog::default();
+        dialog.open(&mut session, "v");
+        dialog.speed_percent = 50;
+        dialog.input = Some(SpeedDurationInput::Speed);
+        let edit = dialog.edit(false).expect("編集");
+        assert_eq!(edit.speed, Rational::new(1, 2));
     }
 }

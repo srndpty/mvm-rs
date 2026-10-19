@@ -14,6 +14,8 @@ pub(crate) struct ShuttleState {
     started_ms: u64,
     /// 最後に seek した frame。playhead がこれと違えば、利用者が動かしたので止める。
     shown_frame: i64,
+    /// 始めたときの Project。編集・undo で変われば、古い基準の frame で送り続けずに止める。
+    revision: u64,
 }
 
 impl Session {
@@ -45,6 +47,7 @@ impl Session {
             base_frame,
             started_ms: now_ms,
             shown_frame: self.playhead_frame,
+            revision: self.edit_revision,
         });
         Ok(())
     }
@@ -72,7 +75,10 @@ impl Session {
             return false;
         };
         // 再生を始めた・playhead を動かした・Project を変えたら、シャトルをやめる。
-        if self.is_playing() || self.playhead_frame != state.shown_frame {
+        if self.is_playing()
+            || self.playhead_frame != state.shown_frame
+            || self.edit_revision != state.revision
+        {
             self.shuttle = None;
             return false;
         }
@@ -201,6 +207,20 @@ mod tests {
         assert!(!session.poll_shuttle(clock + 5_000));
         assert_eq!(session.playhead_frame(), shown);
         assert!(shown < 170);
+    }
+
+    #[test]
+    fn an_edit_during_the_shuttle_ends_it() {
+        let mut session = session();
+        session.seek(170);
+        session.shuttle(-1, 0).expect("逆");
+        assert!(session.poll_shuttle(100));
+        let shown = session.playhead_frame();
+        // playhead を動かさない編集（マーカーの追加）でも、シャトルは止める。
+        session.add_marker().expect("マーカー");
+        assert!(!session.poll_shuttle(1_000));
+        assert_eq!(session.shuttle_rate(), 0);
+        assert_eq!(session.playhead_frame(), shown);
     }
 
     #[test]

@@ -20,30 +20,65 @@ pub fn start_audio(
     fps: Rational,
 ) -> Result<WasapiSink, PreviewError> {
     WasapiSink::spawn(move |host| {
-        let mut streams = HashMap::new();
-        for span in &spans {
-            if streams.contains_key(&span.path) {
-                continue;
+        let mut mixer = match AudioMixer::open(spans, timebase, fps) {
+            Ok(mixer) => mixer,
+            Err(error) => {
+                host.report(error.to_string());
+                return;
             }
-            match PcmStream::open(&span.path) {
-                Ok(stream) => {
-                    streams.insert(span.path.clone(), stream);
-                }
-                Err(error) => {
-                    host.report(error.to_string());
-                    return;
-                }
-            }
-        }
+        };
         let result = host.run(start_sample, |start, _count, samples| {
-            mix_block(timebase, fps, &spans, &mut streams, start, samples)
-                .map_err(|error| error.to_string())
+            mixer.mix(start, samples).map_err(|error| error.to_string())
         });
         if let Err(error) = result {
             host.report(error.to_string());
         }
     })
     .map_err(|error| PreviewError::new(error.to_string()))
+}
+
+/// 音声区間を、素材ごとに 1 つ開いた PCM から足し合わせる。再生と書き出しが同じ mix を使う。
+pub struct AudioMixer {
+    timebase: OutputTimebase,
+    fps: Rational,
+    spans: Vec<AudioSpan>,
+    streams: HashMap<PathBuf, PcmStream>,
+}
+
+impl AudioMixer {
+    pub fn open(
+        spans: Vec<AudioSpan>,
+        timebase: OutputTimebase,
+        fps: Rational,
+    ) -> Result<Self, PreviewError> {
+        let mut streams = HashMap::new();
+        for span in &spans {
+            if streams.contains_key(&span.path) {
+                continue;
+            }
+            let stream = PcmStream::open(&span.path)
+                .map_err(|error| PreviewError::new(format!("{}: {error}", span.path.display())))?;
+            streams.insert(span.path.clone(), stream);
+        }
+        Ok(Self {
+            timebase,
+            fps,
+            spans,
+            streams,
+        })
+    }
+
+    /// timeline の `start` sample から、左右を交互に並べた `samples` を埋める。区間の外は無音。
+    pub fn mix(&mut self, start: i64, samples: &mut [f32]) -> Result<(), PreviewError> {
+        mix_block(
+            self.timebase,
+            self.fps,
+            &self.spans,
+            &mut self.streams,
+            start,
+            samples,
+        )
+    }
 }
 
 fn mix_block(

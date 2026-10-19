@@ -2,6 +2,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod export_ui;
 mod inspector;
 mod preview_ui;
 mod project_panel;

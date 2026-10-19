@@ -1,10 +1,13 @@
-//! 素材の種別判定と decode。判定はここだけに置く。
+//! 素材の種別判定と decode、書き出しの encode。判定はここだけに置く。
 //!
-//! unsafe は [`ffi`] だけ。公開 API は path と画素と [`Result`] だけを扱う。
+//! unsafe は [`ffi`] と [`encode_ffi`] だけ。公開 API は path と画素と [`Result`] だけを扱う。
 
 mod audio;
 mod classify;
 mod color;
+mod encode;
+#[allow(unsafe_code)]
+mod encode_ffi;
 mod error;
 #[allow(unsafe_code)]
 mod ffi;
@@ -21,6 +24,7 @@ pub use classify::{
     classify_video, image_codec_kind, route_media, webp_animation_flag,
 };
 pub use color::VideoColor;
+pub use encode::{MAX_CRF, Mp4Settings, Mp4Summary, Mp4Writer};
 pub use error::MediaError;
 pub use icc::icc_profile_is_srgb;
 pub use orientation::apply_orientation;

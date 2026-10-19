@@ -1931,6 +1931,7 @@ name = "mvm-app"
 version = "0.1.0"
 dependencies = [
  "mvm-core",
+ "mvm-export",
  "mvm-platform",
  "mvm-preview",
  "mvm-project",
@@ -1948,6 +1949,17 @@ dependencies = [
 [[package]]
 name = "mvm-core"
 version = "0.1.0"
+
+[[package]]
+name = "mvm-export"
+version = "0.1.0"
+dependencies = [
+ "mvm-core",
+ "mvm-media",
+ "mvm-preview",
+ "mvm-project",
+ "mvm-testkit",
+]
 
 [[package]]
 name = "mvm-gpu"

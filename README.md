@@ -5,13 +5,15 @@ C++/Qt 版 (`C:\dev\soft\mvm`) から Rust への全面移行中。
 
 ## 現在の状態
 
-**P5 編集 UI。** 純粋ロジック（P1）と、FFmpeg で probe・静止画・音声・映像を読む経路（P2）、
+**P6 書き出し。** 純粋ロジック（P1）と、FFmpeg で probe・静止画・音声・映像を読む経路（P2）、
 メニュー・プロジェクトパネル・timeline の GUI（P3）、preview の再生（P4）に加え、timeline で編集できる。
 全 tool（V A C B N R Y U P H Z T）・inspector・keyframe（Pen）・transition の長さ・track の表示 / 消音 / ソロ・
 copy / paste・undo / redo を持つ。編集中は自動復旧データ（`.mvm.recovery`）を書き、`.mvm.lock` で
 同じ Project の二重起動を止め、外部で書き換えられた file には上書きの前に確認を出す。
 preview の decode と合成は worker thread が行い、音声があれば WASAPI の IAudioClock を正にして映像を進める
-（[docs/adr/0001-gpu-path.md](docs/adr/0001-gpu-path.md)）。書き出しと数式系の描画はまだ無い。移行計画は [docs/migration-plan.md](docs/migration-plan.md)。
+（[docs/adr/0001-gpu-path.md](docs/adr/0001-gpu-path.md)）。
+「ファイル > 書き出し」（Ctrl+M）で、preview と同じ合成を H.264 / AAC の MP4 にする
+（[docs/adr/0002-export-path.md](docs/adr/0002-export-path.md)）。数式系の描画はまだ無い。移行計画は [docs/migration-plan.md](docs/migration-plan.md)。
 
 開発の規約は [AGENTS.md](AGENTS.md) に一本化している。
 
@@ -64,12 +66,14 @@ cargo test -p mvm-project --test json reads_cpp_project_corpus -- --include-igno
 | | |
 | --- | --- |
 | `crates/core` | 純粋な計算（有理数・timecode・素材 frame と timeline frame の対応・fade・波形 peak など） |
-| `crates/media` | FFmpeg による probe・静止画・音声・映像 decode |
+| `crates/media` | FFmpeg による probe・静止画・音声・映像 decode と MP4 の encode |
 | `crates/gpu` | 合成（DX12 / wgpu） |
 | `crates/testkit` | 試験素材の frame marker |
 | `crates/project` | Project model・timeline 編集・tool の判定・effects / keyframe・字幕と SRT・media bin・数式 / Graph のデータ・schema 22 の JSON・自動復旧の envelope |
 | `crates/platform` | OS の file 操作（atomic write・file の実体・Project lock） |
-| `crates/app` | session（command・undo / redo・保存・自動保存・preview の再生） |
+| `crates/preview` | preview の 1 frame の計画・合成・音声の mix と再生 |
+| `crates/export` | 書き出し（preview と同じ合成を MP4 へ encode する） |
+| `crates/app` | session（command・undo / redo・保存・自動保存・preview の再生・書き出しの開始と取消） |
 | `apps/mvm` | 製品アプリ（egui） |
 | `xtask` | アーキテクチャ検査（crate の依存方向・unsafe を許可する crate） |
 | `scripts` | lint などの正式スクリプト |

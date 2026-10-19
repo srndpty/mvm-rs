@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 mvm-core = { workspace = true }
+mvm-export = { workspace = true }
 mvm-platform = { workspace = true }
 mvm-preview = { workspace = true }
 mvm-project = { workspace = true }

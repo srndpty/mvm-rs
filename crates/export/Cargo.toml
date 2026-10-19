@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 mvm-core = { workspace = true }
+mvm-math = { workspace = true }
 mvm-media = { workspace = true }
 mvm-preview = { workspace = true }
 mvm-project = { workspace = true }

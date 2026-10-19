@@ -1,6 +1,6 @@
 //! 素材の種別判定と decode、書き出しの encode。判定はここだけに置く。
 //!
-//! unsafe は [`ffi`] と [`encode_ffi`] だけ。公開 API は path と画素と [`Result`] だけを扱う。
+//! unsafe は [`ffi`]・[`encode_ffi`]・[`stretch_ffi`] だけ。公開 API は path と画素と [`Result`] だけを扱う。
 
 mod audio;
 mod classify;
@@ -15,8 +15,13 @@ mod icc;
 mod orientation;
 mod pcm;
 mod probe;
+mod speech;
 mod still;
+mod stretch;
+#[allow(unsafe_code)]
+mod stretch_ffi;
 mod video;
+mod wav;
 
 pub use audio::decode_waveform;
 pub use classify::{
@@ -30,5 +35,8 @@ pub use icc::icc_profile_is_srgb;
 pub use orientation::apply_orientation;
 pub use pcm::PcmStream;
 pub use probe::{ProbedAudio, ProbedMedia, ProbedVideo, probe_media_file};
+pub use speech::{SPEECH_SAMPLE_RATE, decode_speech};
 pub use still::{DecodedImage, StillLimits, decode_still_image};
+pub use stretch::TimeStretcher;
 pub use video::{D3d12Decoder, DecodedTextureFormat, ImportedFrame, open_d3d12va};
+pub use wav::write_pcm16_wav;

@@ -10,9 +10,14 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+mvm-audio = { workspace = true }
 mvm-core = { workspace = true }
 mvm-export = { workspace = true }
+mvm-math = { workspace = true }
+mvm-media = { workspace = true }
 mvm-platform = { workspace = true }
 mvm-preview = { workspace = true }
 mvm-project = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 sha2 = { workspace = true }

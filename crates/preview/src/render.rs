@@ -2,7 +2,11 @@
 
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
+
 use mvm_gpu::{Compositor, Layer, LayerParams, LayerPixels, SourceKind};
+use mvm_math::compose as compose_math;
+use mvm_math::graph::GraphLayout;
 use mvm_media::{
     DecodedImage, DecodedTextureFormat, ImportedFrame, StillLimits, decode_still_image,
     open_d3d12va,
@@ -12,9 +16,11 @@ use mvm_text::{GlyphRun, SubtitlePaint, raster, raster_subtitle};
 
 use crate::error::PreviewError;
 use crate::geometry::layer_params;
-use crate::plan::{FramePlan, PlannedSource, PreviewImage, black_image, output_size};
+use crate::plan::{FramePlan, GraphSource, PlannedSource, PreviewImage, black_image, output_size};
 
 const VIDEO_POOL: usize = 4;
+/// 標本化まで済ませた Graph を覚えておく数。
+const GRAPH_POOL: usize = 4;
 
 /// compositor と、開き直さないための decoder。UI thread から 1 frame ずつ呼ぶ。
 pub struct StillPreview {
@@ -22,6 +28,15 @@ pub struct StillPreview {
     videos: Vec<VideoSlot>,
     images: Vec<(PathBuf, DecodedImage)>,
     texts: Vec<CachedText>,
+    graphs: Vec<CachedGraph>,
+}
+
+struct CachedGraph {
+    data: mvm_project::graph_clip::GraphClipData,
+    length: i64,
+    width: u32,
+    height: u32,
+    layout: Arc<GraphLayout>,
 }
 
 struct VideoSlot {
@@ -56,6 +71,7 @@ impl StillPreview {
             videos: Vec::new(),
             images: Vec::new(),
             texts: Vec::new(),
+            graphs: Vec::new(),
         })
     }
 
@@ -133,6 +149,11 @@ impl StillPreview {
                     width,
                     height,
                 )?),
+                PlannedSource::Math(paint) => rasters.push(
+                    compose_math(paint, width, height)
+                        .map_err(|error| PreviewError::new(error.to_string()))?,
+                ),
+                PlannedSource::Graph(graph) => rasters.push(self.graph_rgba(graph, width, height)?),
                 PlannedSource::Video { .. } | PlannedSource::Image => {}
             }
         }
@@ -140,8 +161,11 @@ impl StillPreview {
         let mut raster_index = 0usize;
         for layer in &plan.layers {
             let (params, pixels) = match &layer.source {
-                // text crate の raster は straight alpha。静止画と同じ RGBA の経路で重ねる。
-                PlannedSource::Text(_) | PlannedSource::Subtitle(_) => {
+                // 文字・数式・Graph の raster は出力の大きさの straight alpha。静止画と同じ RGBA の経路で重ねる。
+                PlannedSource::Text(_)
+                | PlannedSource::Subtitle(_)
+                | PlannedSource::Math(_)
+                | PlannedSource::Graph(_) => {
                     let rgba = rasters
                         .get(raster_index)
                         .ok_or_else(|| PreviewError::new("文字画像の数が layer と一致しません"))?;
@@ -247,6 +271,49 @@ impl StillPreview {
             rgba: rgba.clone(),
         });
         Ok(rgba)
+    }
+
+    fn graph_rgba(
+        &mut self,
+        graph: &GraphSource,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, PreviewError> {
+        let cached = self.graphs.iter().find(|cached| {
+            cached.width == width
+                && cached.height == height
+                && cached.length == graph.length
+                && cached.data == graph.data
+        });
+        let layout = match cached {
+            Some(cached) => Arc::clone(&cached.layout),
+            None => {
+                let layout = Arc::new(
+                    GraphLayout::new(&graph.data, graph.length, width, height)
+                        .map_err(|error| PreviewError::new(error.to_string()))?,
+                );
+                if self.graphs.len() >= GRAPH_POOL {
+                    self.graphs.remove(0);
+                }
+                self.graphs.push(CachedGraph {
+                    data: graph.data.clone(),
+                    length: graph.length,
+                    width,
+                    height,
+                    layout: Arc::clone(&layout),
+                });
+                layout
+            }
+        };
+        layout
+            .render(graph.frame, &|text| {
+                graph
+                    .labels
+                    .iter()
+                    .find(|(label, _)| label == text)
+                    .map(|(_, mask)| Arc::clone(mask))
+            })
+            .map_err(|error| PreviewError::new(error.to_string()))
     }
 
     fn ensure_image(&mut self, path: &Path) -> Result<(), PreviewError> {

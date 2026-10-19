@@ -5,7 +5,7 @@ C++/Qt 版 (`C:\dev\soft\mvm`) から Rust への全面移行中。
 
 ## 現在の状態
 
-**P6 書き出し。** 純粋ロジック（P1）と、FFmpeg で probe・静止画・音声・映像を読む経路（P2）、
+**P7 残りの機能。** 純粋ロジック（P1）と、FFmpeg で probe・静止画・音声・映像を読む経路（P2）、
 メニュー・プロジェクトパネル・timeline の GUI（P3）、preview の再生（P4）に加え、timeline で編集できる。
 全 tool（V A C B N R Y U P H Z T）・inspector・keyframe（Pen）・transition の長さ・track の表示 / 消音 / ソロ・
 copy / paste・undo / redo を持つ。編集中は自動復旧データ（`.mvm.recovery`）を書き、`.mvm.lock` で
@@ -13,7 +13,12 @@ copy / paste・undo / redo を持つ。編集中は自動復旧データ（`.mvm
 preview の decode と合成は worker thread が行い、音声があれば WASAPI の IAudioClock を正にして映像を進める
 （[docs/adr/0001-gpu-path.md](docs/adr/0001-gpu-path.md)）。
 「ファイル > 書き出し」（Ctrl+M）で、preview と同じ合成を H.264 / AAC の MP4 にする
-（[docs/adr/0002-export-path.md](docs/adr/0002-export-path.md)）。数式系の描画はまだ無い。移行計画は [docs/migration-plan.md](docs/migration-plan.md)。
+（[docs/adr/0002-export-path.md](docs/adr/0002-export-path.md)）。
+「挿入」で数式・数式列・グラフ・Manim clip を置ける。数式は Manim と MiKTeX で描いて cache し、
+preview と書き出しに重ねる（[docs/adr/0003-math-render.md](docs/adr/0003-math-render.md)）。
+左パネルの「字幕」で字幕の編集・SRT・Whisper による文字起こし、「ミキサー」で track の音量・定位とメーター、
+「音声 > 自動音量調整」でラウドネスの正規化と BGM の ducking を行う。ピッチ保持の速度変更も鳴る
+（[docs/adr/0004-audio-subtitles.md](docs/adr/0004-audio-subtitles.md)）。移行計画は [docs/migration-plan.md](docs/migration-plan.md)。
 
 開発の規約は [AGENTS.md](AGENTS.md) に一本化している。
 
@@ -28,6 +33,8 @@ preview の decode と合成は worker thread が行い、音声があれば WAS
 | GUI | egui / eframe（wgpu） |
 | PSScriptAnalyzer | `scripts/PSScriptAnalyzer.version` の版（`Install-Module PSScriptAnalyzer -RequiredVersion <版> -Scope CurrentUser`） |
 | pre-commit | `python -m pip install pre-commit` の後に `pre-commit install` |
+| 数式（任意） | Manim Community（`manim.exe` を PATH に）と MiKTeX（`latex.exe`・`dvisvgm.exe` を PATH に）。無ければ数式は「描画できません」になり、書き出しは拒否する |
+| 文字起こし（任意） | whisper.cpp の `whisper-cli.exe` と多言語の ggml model。場所は文字起こしの dialog で指定する |
 
 ## 開発用コマンド
 
@@ -40,7 +47,8 @@ command の後ろの引数はそのまま cargo へ渡る。
 .\dev.ps1 gui        # release の mvm をビルドして起動
 .\dev.ps1 setup      # FFmpeg gpl-shared の取得と libclang の確認
 .\dev.ps1 test       # 試験（workstation 試験は除外。0 件なら失敗）
-.\dev.ps1 test-full  # workstation 試験も含める（0 件なら失敗。C++ 版 corpus の試験は MVM_CPP_PROJECT_CORPUS があるときだけ）
+.\dev.ps1 test-full  # workstation 試験も含める（0 件なら失敗。C++ 版 corpus の試験は MVM_CPP_PROJECT_CORPUS、
+                     # Whisper の試験は MVM_WHISPER_CLI・MVM_WHISPER_MODEL・MVM_TRANSCRIBE_AUDIO があるときだけ）
 .\dev.ps1 testmedia  # 検証素材を生成する（既定は Smoke）
 .\dev.ps1 lint       # rustfmt 差分・clippy・アーキテクチャ検査・PSScriptAnalyzer
 .\dev.ps1 fmt        # 整形
@@ -66,14 +74,16 @@ cargo test -p mvm-project --test json reads_cpp_project_corpus -- --include-igno
 | | |
 | --- | --- |
 | `crates/core` | 純粋な計算（有理数・timecode・素材 frame と timeline frame の対応・fade・波形 peak など） |
-| `crates/media` | FFmpeg による probe・静止画・音声・映像 decode と MP4 の encode |
+| `crates/media` | FFmpeg による probe・静止画・音声・映像 decode と MP4 の encode、time stretch、文字起こし用の音声 |
+| `crates/audio` | WASAPI の再生と時計、ラウドネスの測定 |
+| `crates/math` | 数式・数式列・Graph・Manim clip の描画（Manim / LaTeX の外部 process と cache） |
 | `crates/gpu` | 合成（DX12 / wgpu） |
 | `crates/testkit` | 試験素材の frame marker |
 | `crates/project` | Project model・timeline 編集・tool の判定・effects / keyframe・字幕と SRT・media bin・数式 / Graph のデータ・schema 22 の JSON・自動復旧の envelope |
-| `crates/platform` | OS の file 操作（atomic write・file の実体・Project lock） |
+| `crates/platform` | OS の file 操作（atomic write・file の実体・Project lock）と Job Object 付きの外部 process |
 | `crates/preview` | preview の 1 frame の計画・合成・音声の mix と再生 |
 | `crates/export` | 書き出し（preview と同じ合成を MP4 へ encode する） |
-| `crates/app` | session（command・undo / redo・保存・自動保存・preview の再生・書き出しの開始と取消） |
+| `crates/app` | session（command・undo / redo・保存・自動保存・preview の再生・書き出し・字幕・文字起こし・自動音量・数式の描画の管理） |
 | `apps/mvm` | 製品アプリ（egui） |
 | `xtask` | アーキテクチャ検査（crate の依存方向・unsafe を許可する crate） |
 | `scripts` | lint などの正式スクリプト |

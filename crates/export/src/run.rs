@@ -136,13 +136,15 @@ fn frame_layers(
     plan: &ExportPlan,
     frame: i64,
 ) -> Result<FramePlan, ExportError> {
-    let mut layers = plan_frame(project, frame).map_err(|error| frame_error(frame, plan, error))?;
+    let mut layers =
+        plan_frame(project, frame, &plan.math).map_err(|error| frame_error(frame, plan, error))?;
     if layers.skipped_clips > 0 {
-        return Err(frame_error(
-            frame,
-            plan,
-            "書き出せない clip が含まれています",
-        ));
+        let reason = layers
+            .notes
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "書き出せない clip が含まれています".to_owned());
+        return Err(frame_error(frame, plan, reason));
     }
     if !plan.burn_subtitles {
         layers

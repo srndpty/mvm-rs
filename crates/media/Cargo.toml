@@ -23,6 +23,7 @@ undocumented_unsafe_blocks = "deny"
 mvm-core = { workspace = true }
 ffmpeg-sys-next = { version = "=8.1.0", default-features = false, features = [
     "avcodec",
+    "avfilter",
     "avformat",
     "swresample",
     "swscale",

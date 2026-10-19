@@ -15,7 +15,7 @@ use mvm_export::{
     temporary_path,
 };
 use mvm_media::PcmStream;
-use mvm_preview::{PreviewImage, StillPreview, plan_frame};
+use mvm_preview::{MathLibrary, PreviewImage, StillPreview, plan_frame};
 use mvm_project::timeline::insert_frame_hold;
 use mvm_project::{
     Project, SubtitleCue, SubtitleStyle, SubtitleTrack, TimelineClip, TimelineClipKind, TrackRef,
@@ -102,7 +102,7 @@ fn render_all(project: &Project, frames: i64) -> Vec<PreviewImage> {
     let mut preview = StillPreview::new().expect("DX12 device がありません");
     (0..frames)
         .map(|frame| {
-            let plan = plan_frame(project, frame).expect("計画");
+            let plan = plan_frame(project, frame, &MathLibrary::default()).expect("計画");
             preview.render(project, frame, &plan).expect("合成")
         })
         .collect()
@@ -165,7 +165,12 @@ fn export_matches_the_preview_and_the_hand_computed_source_frames() {
         }
     };
 
-    let plan = plan_export(&project, &request(&output, ExportQuality::High)).expect("計画");
+    let plan = plan_export(
+        &project,
+        &request(&output, ExportQuality::High),
+        std::sync::Arc::new(MathLibrary::default()),
+    )
+    .expect("計画");
     assert_eq!(plan.total_frames, total);
     let recorder = Recorder::default();
     let summary = run_export(&project, &plan, &recorder).expect("書き出し");
@@ -232,7 +237,12 @@ fn exported_audio_follows_the_clip_volume_and_the_track_pan() {
     // 全部左へ。素材の右（750 Hz）は出ない。
     project.audio_tracks[0].mixer_pan = -1.0;
 
-    let plan = plan_export(&project, &request(&output, ExportQuality::Standard)).expect("計画");
+    let plan = plan_export(
+        &project,
+        &request(&output, ExportQuality::Standard),
+        std::sync::Arc::new(MathLibrary::default()),
+    )
+    .expect("計画");
     assert!(plan.has_audio());
     let summary = run_export(&project, &plan, &Recorder::default()).expect("書き出し");
     assert_eq!(summary.audio_samples, 60 * 800);
@@ -280,7 +290,12 @@ fn burned_subtitles_appear_only_inside_the_cue() {
         ..Project::default()
     };
     let burned = dir.join("burned.mp4");
-    let plan = plan_export(&project, &request(&burned, ExportQuality::High)).expect("計画");
+    let plan = plan_export(
+        &project,
+        &request(&burned, ExportQuality::High),
+        std::sync::Arc::new(MathLibrary::default()),
+    )
+    .expect("計画");
     // job 経由でも同じ書き出しになる。
     let summary = ExportJob::start(std::sync::Arc::new(project.clone()), plan, None)
         .expect("開始")
@@ -300,7 +315,12 @@ fn burned_subtitles_appear_only_inside_the_cue() {
     let plain = dir.join("plain.mp4");
     let mut unburned = request(&plain, ExportQuality::High);
     unburned.burn_subtitles = false;
-    let plan = plan_export(&project, &unburned).expect("計画");
+    let plan = plan_export(
+        &project,
+        &unburned,
+        std::sync::Arc::new(MathLibrary::default()),
+    )
+    .expect("計画");
     run_export(&project, &plan, &Recorder::default()).expect("焼き込まない書き出し");
     let frames = read_back(&plain, 15);
     assert!(
@@ -320,7 +340,12 @@ fn cancelling_or_failing_leaves_no_file_behind() {
         timeline_clips: vec![video_clip("clip", &media, 0, 0, 120)],
         ..Project::default()
     };
-    let plan = plan_export(&project, &request(&output, ExportQuality::Compact)).expect("計画");
+    let plan = plan_export(
+        &project,
+        &request(&output, ExportQuality::Compact),
+        std::sync::Arc::new(MathLibrary::default()),
+    )
+    .expect("計画");
     let recorder = Recorder {
         cancel_at: Some(5),
         ..Recorder::default()
@@ -347,7 +372,12 @@ fn cancelling_or_failing_leaves_no_file_behind() {
         ..Project::default()
     };
     let failed = dir.join("failed.mp4");
-    let plan = plan_export(&missing, &request(&failed, ExportQuality::Compact)).expect("計画");
+    let plan = plan_export(
+        &missing,
+        &request(&failed, ExportQuality::Compact),
+        std::sync::Arc::new(MathLibrary::default()),
+    )
+    .expect("計画");
     let error = run_export(&missing, &plan, &Recorder::default()).unwrap_err();
     assert!(
         matches!(&error, ExportError::Failed(message) if message.contains("frame 0")),
@@ -372,4 +402,188 @@ fn bright_pixels(image: &PreviewImage) -> usize {
 
 fn rms(samples: &[f32]) -> f32 {
     (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt()
+}
+
+/// 赤（R が高く G・B が低い）の画素の数。数式と Graph の曲線を赤で描いて数える。
+fn red_pixels(image: &PreviewImage) -> usize {
+    image
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|pixel| pixel[0] > 150 && pixel[1] < 90 && pixel[2] < 90)
+        .count()
+}
+
+fn render_with(project: &Project, frames: i64, math: &MathLibrary) -> Vec<PreviewImage> {
+    let mut preview = StillPreview::new().expect("DX12 device がありません");
+    (0..frames)
+        .map(|frame| {
+            let plan = plan_frame(project, frame, math).expect("計画");
+            assert_eq!(plan.skipped_clips, 0, "frame {frame}: {:?}", plan.notes);
+            preview.render(project, frame, &plan).expect("合成")
+        })
+        .collect()
+}
+
+/// 実 Manim で数式（先頭 10 frame は Write）を描き、書き出した MP4 で Write の進みと静止の式が出ること、
+/// preview の合成と画素が一致することを確かめる。
+#[test]
+#[ignore = "workstation"]
+fn math_clips_are_exported_with_the_rendered_masks() {
+    use mvm_math::{MathService, MathStatus, wanted_jobs};
+    use mvm_project::math_clip::{MathClipAnimation, MathClipData, MathIntroKind};
+
+    let dir = work_dir("math");
+    let clip = TimelineClip {
+        kind: TimelineClipKind::Math,
+        name: "式".to_owned(),
+        id: "math".to_owned(),
+        source_fps: Rational::new(60, 1),
+        source_frame_count: 20,
+        source_in_frame: 0,
+        source_out_frame: 20,
+        track: TrackRef::video(0),
+        math: MathClipData {
+            source: "x^2 + y^2 = r^2".to_owned(),
+            font_size: 120,
+            color: "#FFFF0000".to_owned(),
+            ..MathClipData::default()
+        },
+        math_animation: MathClipAnimation {
+            intro: MathIntroKind::Write,
+            intro_frames: 10,
+        },
+        ..TimelineClip::default()
+    };
+    let project = Project {
+        timeline_clips: vec![clip],
+        ..Project::default()
+    };
+    let service = MathService::start(dir.join("cache"), None).expect("描画の service");
+    let jobs = wanted_jobs(&project, 0);
+    assert_eq!(jobs.len(), 2, "静止と Write");
+    service.request(jobs.clone());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    while jobs
+        .iter()
+        .any(|job| service.status(job) != MathStatus::Ready)
+    {
+        assert!(std::time::Instant::now() < deadline, "描画が終わりません");
+        for job in &jobs {
+            if let status @ (MathStatus::Failed { .. }
+            | MathStatus::InvalidSource { .. }
+            | MathStatus::Unavailable(_)) = service.status(job)
+            {
+                panic!("描けません: {status:?}");
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let library = service.library();
+
+    // 描画が無ければ計画の時点で止まる（負の対照）。
+    let output = dir.join("math.mp4");
+    assert!(
+        plan_export(
+            &project,
+            &request(&output, ExportQuality::High),
+            std::sync::Arc::new(MathLibrary::default()),
+        )
+        .is_err()
+    );
+    let plan = plan_export(
+        &project,
+        &request(&output, ExportQuality::High),
+        std::sync::Arc::clone(&library),
+    )
+    .expect("計画");
+    let summary = run_export(&project, &plan, &Recorder::default()).expect("書き出し");
+    assert_eq!(summary.frames, 20);
+
+    let exported = read_back(&output, 20);
+    let expected = render_with(&project, 20, &library);
+    let counts: Vec<usize> = exported.iter().map(red_pixels).collect();
+    // Write の 0 枚目は何も書いていない。進むほど増え、Write の後は静止の式。
+    assert!(counts[0] < 50, "frame 0 に式があります ({})", counts[0]);
+    assert!(counts[5] > counts[1], "Write が進みません {counts:?}");
+    assert!(
+        counts[15] > counts[5],
+        "静止の式が Write の途中より少ない {counts:?}"
+    );
+    assert!(
+        counts[15] > 2_000,
+        "静止の式が小さすぎます ({})",
+        counts[15]
+    );
+    for frame in [0usize, 5, 15, 19] {
+        let difference = mean_difference(&exported[frame], &expected[frame]);
+        assert!(
+            difference < PARITY_MEAN_LIMIT,
+            "frame {frame}: preview との平均差 {difference:.3}"
+        );
+    }
+    // 指標の負の対照: Write の途中と静止は区別できる。
+    assert!(mean_difference(&expected[2], &expected[15]) > 0.05);
+    drop(service);
+    std::fs::remove_dir_all(&dir).expect("片付け");
+}
+
+/// Graph（ラベル無し）を書き出し、曲線が plot の中に出ることと preview との一致を確かめる。
+#[test]
+#[ignore = "workstation"]
+fn graph_clips_are_exported_like_the_preview() {
+    use mvm_project::graph_clip::{GraphClipData, GraphFunction, GraphFunctionId};
+
+    let dir = work_dir("graph");
+    let mut graph = GraphClipData::with_default_function(GraphFunctionId("f".to_owned()));
+    graph.axes.x_label = String::new();
+    graph.axes.y_label = String::new();
+    graph.functions[0] = GraphFunction {
+        id: GraphFunctionId("f".to_owned()),
+        expression: "x".to_owned(),
+        color: "#FFFF0000".to_owned(),
+        stroke_width: 8.0,
+        ..GraphFunction::default()
+    };
+    let project = Project {
+        timeline_clips: vec![TimelineClip {
+            kind: TimelineClipKind::Graph,
+            name: "グラフ".to_owned(),
+            id: "graph".to_owned(),
+            source_fps: Rational::new(60, 1),
+            source_frame_count: 6,
+            source_in_frame: 0,
+            source_out_frame: 6,
+            track: TrackRef::video(0),
+            graph,
+            ..TimelineClip::default()
+        }],
+        ..Project::default()
+    };
+    let output = dir.join("graph.mp4");
+    let library = std::sync::Arc::new(MathLibrary::default());
+    let plan =
+        plan_export(&project, &request(&output, ExportQuality::High), library).expect("計画");
+    run_export(&project, &plan, &Recorder::default()).expect("書き出し");
+    let exported = read_back(&output, 6);
+    let expected = render_with(&project, 6, &MathLibrary::default());
+    // 1920x1080 の plot は (240, 135) から 1440x810。y = x は plot の対角線で、(5, 5) の端は (1680, 135)。
+    let red = red_pixels(&exported[3]);
+    assert!(red > 3_000, "曲線が見えません ({red})");
+    let at = |image: &PreviewImage, x: u32, y: u32| {
+        let index = ((y * image.width + x) * 4) as usize;
+        [
+            image.rgba[index],
+            image.rgba[index + 1],
+            image.rgba[index + 2],
+        ]
+    };
+    let center = at(&exported[3], 960, 540);
+    assert!(center[0] > 150 && center[1] < 90, "中央 {center:?}");
+    assert!(
+        mean_difference(&exported[3], &expected[3]) < PARITY_MEAN_LIMIT,
+        "preview と違います"
+    );
+    std::fs::remove_dir_all(&dir).expect("片付け");
 }

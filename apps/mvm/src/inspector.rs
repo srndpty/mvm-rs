@@ -16,7 +16,6 @@ macro_rules! report {
     }};
 }
 
-#[derive(Clone, Debug)]
 pub struct InspectorState {
     clip_id: Option<String>,
     /// 下書きを読んだときの [`Session::edit_revision`]。undo などで Project が変われば読み直す。
@@ -25,6 +24,7 @@ pub struct InspectorState {
     volume: f64,
     speed_percent: f64,
     spans: Vec<SpanDraft>,
+    math: crate::math_ui::MathInspector,
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +43,7 @@ impl Default for InspectorState {
             volume: 100.0,
             speed_percent: 100.0,
             spans: Vec::new(),
+            math: crate::math_ui::MathInspector::default(),
         }
     }
 }
@@ -164,6 +165,7 @@ pub fn show(ui: &mut egui::Ui, session: &mut Session, state: &mut InspectorState
             load(session, &clip, state);
         }
     }
+    crate::math_ui::show(ui, session, &mut state.math, &clip);
     math_button(ui, session);
 }
 

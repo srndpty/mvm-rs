@@ -18,6 +18,7 @@ use mvm_project::recovery::{
 use mvm_project::timeline::TimelineTool;
 
 use crate::autosave::AutosaveSchedule;
+use crate::background::BackgroundWork;
 use crate::error::AppError;
 use crate::files::{identity_key, lock_path, recovery_path, sha256_hex, utc_timestamp};
 use crate::history::History;
@@ -74,6 +75,15 @@ pub struct Session {
     pub(crate) edit_revision: u64,
     pub(crate) id_serial: u64,
     pub(crate) alert: String,
+    pub(crate) background: BackgroundWork,
+    /// 再生の出口の音量。engine を作り直しても引き継ぐ。
+    pub(crate) monitor_gain: f32,
+    /// 選択中の字幕。clip の選択とは同時に持たない。
+    pub(crate) subtitle_selection: Vec<String>,
+    /// 最後にコピーしたのが字幕なら、その字幕（clip の clipboard は空にする）。
+    pub(crate) subtitle_clipboard: Option<Vec<mvm_project::SubtitleCue>>,
+    /// 数式の描画。数式の clip が現れたときに起こす。
+    pub(crate) math: Option<crate::math::MathState>,
 }
 
 #[derive(Clone)]
@@ -148,6 +158,11 @@ impl Session {
             edit_revision: 1,
             id_serial: 1,
             alert: String::new(),
+            background: BackgroundWork::default(),
+            monitor_gain: 1.0,
+            subtitle_selection: Vec::new(),
+            subtitle_clipboard: None,
+            math: None,
         }
     }
 
@@ -521,10 +536,10 @@ impl Session {
     }
 
     fn note_skipped(&mut self, frame: i64) {
-        self.skipped_note = plan_frame(&self.project, frame).ok().and_then(|plan| {
-            (plan.skipped_clips > 0)
-                .then(|| "数式・グラフ・Manim はこの frame にありますが、まだ描きません".to_owned())
-        });
+        let library = self.math_library();
+        self.skipped_note = plan_frame(&self.project, frame, &library)
+            .ok()
+            .and_then(|plan| (plan.skipped_clips > 0).then(|| plan.notes.join(" / ")));
     }
 
     fn ensure_engine(&mut self) -> Result<(), String> {
@@ -533,19 +548,27 @@ impl Session {
             if let Some(wake) = &self.preview_wake {
                 engine.set_wake(Arc::clone(wake));
             }
+            engine
+                .set_monitor_volume(self.monitor_gain)
+                .map_err(|error| error.to_string())?;
             self.engine = Some(engine);
             self.sent_epoch = 0;
         }
         Ok(())
     }
 
+    pub(crate) fn meter_source(&self) -> Option<&PreviewEngine> {
+        self.engine.as_ref()
+    }
+
     fn send_project(&mut self, generation: u64) -> Result<(), String> {
         let project = Arc::new(self.project.clone());
+        let library = self.math_library();
         let Some(engine) = &self.engine else {
             return Err("preview を用意できません".to_owned());
         };
         engine
-            .set_project(project, generation)
+            .set_project(project, library, generation)
             .map_err(|error| error.to_string())?;
         self.sent_epoch = self.edit_epoch;
         Ok(())
@@ -685,6 +708,9 @@ impl Session {
 
     fn scrub_selection(&mut self) {
         self.selection.retain(|id| self.project.clip(id).is_some());
+        let cues = self.project.subtitles.as_ref();
+        self.subtitle_selection
+            .retain(|id| cues.is_some_and(|track| track.cues.iter().any(|cue| cue.id == *id)));
         if self
             .selected_edge
             .as_ref()

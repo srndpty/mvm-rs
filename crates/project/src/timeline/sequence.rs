@@ -8,6 +8,7 @@ use crate::equation_sequence::{
 };
 use crate::error::{ProjectError, ProjectResult, fail};
 use crate::graph_clip::{GraphClipData, GraphFunctionId, GraphIntroKind, GraphValidationStatus};
+use crate::math_clip::{MathClipAnimation, MathClipData};
 use crate::model::{Project, TimelineClip, TimelineClipKind, TrackRef, default_still_clip_frames};
 
 use super::common::EditResult;
@@ -72,6 +73,83 @@ pub fn add_equation_sequence(
     validate_timeline(&candidate)?;
     *project = candidate;
     Ok(Some(project.timeline_clips.len() - 1))
+}
+
+/// 数式 clip を `start` の空いている映像 track へ置く（文字・静止画と同じ配置規則）。既定の尺は 5 秒。
+pub fn place_new_math(
+    project: &mut Project,
+    clip_id: String,
+    data: MathClipData,
+    start: i64,
+) -> EditResult {
+    data.validate(project.output_height)?;
+    let frames = default_still_clip_frames(project.timeline_fps);
+    let name = data
+        .source
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(24)
+        .collect();
+    let clip = TimelineClip {
+        kind: TimelineClipKind::Math,
+        id: clip_id,
+        name,
+        source_fps: project.timeline_fps,
+        source_frame_count: frames,
+        source_out_frame: frames,
+        math: data,
+        ..TimelineClip::default()
+    };
+    place_still_clip_at(project, clip, start)
+}
+
+/// 数式 clip の式・見た目と intro（Write）を変える。描けるかどうかは見ない（描けない式も保存できる）。
+/// 変形の条件（後ろの clip に Write を付けない・背景を透明にするなど）は timeline 全体の検証が見る。
+pub fn edit_math_clip(
+    project: &mut Project,
+    clip_id: &str,
+    data: MathClipData,
+    animation: MathClipAnimation,
+) -> EditResult {
+    let mut candidate = project.clone();
+    let Some(index) = candidate.clip_index(clip_id) else {
+        return fail("数式 clip が存在しません");
+    };
+    let clip = &mut candidate.timeline_clips[index];
+    if clip.kind != TimelineClipKind::Math {
+        return fail("数式 clip ではありません");
+    }
+    data.validate(candidate.output_height)?;
+    animation.validate(clip.source_duration())?;
+    clip.math = data;
+    clip.math_animation = animation;
+    validate_timeline(&candidate)?;
+    *project = candidate;
+    Ok(Some(index))
+}
+
+/// 数式 sequence を `start` の空いている映像 track へ置く。
+pub fn place_new_equation_sequence(
+    project: &mut Project,
+    clip_id: String,
+    name: String,
+    data: EquationSequenceClipData,
+    start: i64,
+) -> EditResult {
+    let (_, length) = data.intervals()?;
+    let clip = TimelineClip {
+        kind: TimelineClipKind::EquationSequence,
+        id: clip_id,
+        name,
+        source_fps: project.timeline_fps,
+        source_frame_count: length,
+        source_out_frame: length,
+        equation_sequence: data,
+        ..TimelineClip::default()
+    };
+    place_still_clip_at(project, clip, start)
 }
 
 /// clip の複製。clip の ID と、数式 sequence・グラフの内部 ID を全て発行し直す。

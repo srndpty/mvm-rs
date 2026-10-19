@@ -50,14 +50,15 @@ pub use ripple::{
 };
 pub use sequence::{
     EquationRenderability, GraphFrame, add_equation_sequence, add_graph, copy_internal_clip,
-    edit_equation_sequence, edit_graph, equation_renderability, evaluate_equation_clip,
-    evaluate_graph_clip, place_new_graph, set_graph_source_duration,
+    edit_equation_sequence, edit_graph, edit_math_clip, equation_renderability,
+    evaluate_equation_clip, evaluate_graph_clip, place_new_equation_sequence, place_new_graph,
+    place_new_math, set_graph_source_duration,
 };
 pub use settings::{
     ClipKeyEditPreview, TimelineGap, add_track, append_manim_timeline_clip_at, delete_clip_key,
-    edit_clip_key, gap_at, preview_clip_key_edit, remove_track, ripple_delete_gap,
-    set_project_video_settings, set_timeline_frame_rate, set_track_muted, set_track_solo,
-    set_tracks_muted,
+    edit_clip_key, gap_at, install_manim_asset, preview_clip_key_edit, remove_track,
+    ripple_delete_gap, set_audio_track_mix, set_project_video_settings, set_timeline_frame_rate,
+    set_track_muted, set_track_solo, set_tracks_muted,
 };
 pub use speed::{
     ClipSpeedDurationEdit, ClipSpeedDurationPreview, RateStretchPreview, RateStretchPreviewClip,

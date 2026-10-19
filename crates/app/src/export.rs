@@ -27,7 +27,7 @@ impl Session {
                 "書き出し中です。終わるか取り消してから始めてください",
             ));
         }
-        let plan = plan_export(&self.project, request)
+        let plan = plan_export(&self.project, request, self.math_library())
             .map_err(|error| AppError::new(error.to_string()))?;
         if self.is_playing() {
             self.pause_playback();

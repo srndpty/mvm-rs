@@ -1,7 +1,9 @@
 //! timeline に描く音声波形の cache。素材 file ごとに背景で decode し、peak を `Arc` で共有する。
 //!
 //! entry は file の実体（volume・file ID・大きさ・更新時刻）と組で持つ。実体が変われば読み直し、読めなかった file
-//! も実体が変われば読み直す。decode 中に実体が変わったら、その結果は捨てる（古い波形で新しい entry を上書きしない）。
+//! も実体が変われば読み直す。decode の結果は、受け取る直前に file を確かめ直し、始めたときと実体が違えば捨てて
+//! 読み直す（古い波形で新しい entry を上書きしない）。ただし始めと終わりの実体が同じでも、decode の途中で書き換えて
+//! 戻した場合までは見分けられない [推測: 編集中の素材でそれが起きることは稀]。
 //! 実体の確認と、timeline から消えた素材の entry の解放は、[`CHECK_INTERVAL_MS`] ごとに行う。
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -90,7 +92,7 @@ impl Waveforms {
         };
         let (path, identity) = (path.clone(), *identity);
         self.job = None;
-        // 始めたときと実体が違えば（decode 中に書き換わった・entry を捨てた）結果を捨てる。
+        // entry を捨てた・始めた後で別の実体として読み直しに回した、のどちらかなら結果は要らない。
         let Some(entry) = self
             .entries
             .get_mut(&path)
@@ -98,6 +100,15 @@ impl Waveforms {
         else {
             return false;
         };
+        // decode の間に file が書き換わっていれば、結果を使わずに今の実体で読み直す。
+        let now = probe_file(&path);
+        if now != identity {
+            entry.identity = now;
+            if !self.queue.contains(&path) {
+                self.queue.push_back(path);
+            }
+            return false;
+        }
         entry.state = match result.and_then(|decoded| decoded) {
             Ok(peaks) => State::Ready(Arc::new(peaks)),
             Err(_) => State::Failed,
@@ -275,25 +286,57 @@ mod tests {
         assert_eq!(state(&waveforms, &path), "ready");
     }
 
-    #[test]
-    fn a_result_for_an_older_file_does_not_overwrite_the_entry() {
-        let path = scratch("stale.wav");
-        tone(&path, 0.1);
-        let mut waveforms = Waveforms::default();
-        assert!(waveforms.get(&path).is_none());
-        // decode を始めた後で、entry の実体を別のものにする（decode 中の書き換えに相当）。
-        waveforms.poll(0, &HashSet::from([path.clone()]), None);
-        assert!(waveforms.job.is_some());
-        if let Some(entry) = waveforms.entries.get_mut(&path) {
-            entry.identity.size += 1;
-        }
+    /// decode を始め、終わるまで待つ（結果はまだ受け取らない）。
+    fn decode_without_taking(waveforms: &mut Waveforms, path: &Path) {
+        assert!(waveforms.get(path).is_none());
+        assert!(!waveforms.start_next(None));
         for _ in 0..1_000 {
-            waveforms.take_finished();
-            if waveforms.job.is_none() {
-                break;
+            if waveforms
+                .job
+                .as_ref()
+                .is_some_and(|(_, _, job)| job.is_finished())
+            {
+                return;
             }
             std::thread::sleep(Duration::from_millis(2));
         }
+        panic!("波形の decode が終わりません");
+    }
+
+    #[test]
+    fn a_file_rewritten_during_the_decode_is_decoded_again() {
+        let path = scratch("rewritten-during.wav");
+        tone(&path, 0.1);
+        let mut waveforms = Waveforms::default();
+        decode_without_taking(&mut waveforms, &path);
+        // decode が終わってから結果を受け取るまでの間に、file を書き換える。
+        std::thread::sleep(Duration::from_millis(20));
+        let samples: Vec<f32> = (0..9_600)
+            .map(|index| if index % 2 == 0 { 0.9 } else { -0.9 })
+            .collect();
+        mvm_media::write_pcm16_wav(&path, 48_000, 2, &samples).expect("書き換え");
+        // 定期の確認（check）を待たずに、受け取る時点で古い結果を捨てる。
+        assert!(!waveforms.take_finished());
+        assert_eq!(state(&waveforms, &path), "pending", "古い波形を使いました");
+        assert_eq!(waveforms.queue.len(), 1);
+        let in_use = HashSet::from([path.clone()]);
+        let mut clock = 0;
+        settle(&mut waveforms, &in_use, &mut clock);
+        let loud = waveforms.get(&path).expect("書き換えた後の波形");
+        assert!(loudness(&loud) > 0.8, "古い波形のままです");
+    }
+
+    #[test]
+    fn a_result_for_an_entry_reset_during_the_decode_is_dropped() {
+        let path = scratch("stale.wav");
+        tone(&path, 0.1);
+        let mut waveforms = Waveforms::default();
+        decode_without_taking(&mut waveforms, &path);
+        // 定期の確認が、decode 中に entry を別の実体として読み直しに回した場合。
+        if let Some(entry) = waveforms.entries.get_mut(&path) {
+            entry.identity.size += 1;
+        }
+        assert!(!waveforms.take_finished());
         assert!(waveforms.job.is_none());
         assert_eq!(
             state(&waveforms, &path),

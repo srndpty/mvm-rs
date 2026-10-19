@@ -1796,4 +1796,73 @@ mod tests {
         assert!(state.notice.contains("素材.mp4"), "{}", state.notice);
         assert_eq!(state.left_tab, LeftTab::Project);
     }
+
+    fn animated_clip(name: &str, start: i64) -> TimelineClip {
+        let mut clip = video_clip(name, start);
+        clip.effects.position_x_keys = vec![
+            mvm_project::clip_effects::ClipKeyframe::new(0, 0.0),
+            mvm_project::clip_effects::ClipKeyframe::new(100, 50.0),
+        ];
+        clip
+    }
+
+    /// 値が `prefix` で始まる、inspector の数値欄。
+    fn spin_starting_with(
+        prefix: &str,
+    ) -> impl Fn(&egui_kittest::kittest::AccessKitNode<'_>) -> bool {
+        move |node| {
+            node.role() == egui::accesskit::Role::SpinButton
+                && node.value().is_some_and(|value| value.starts_with(prefix))
+        }
+    }
+
+    #[test]
+    fn focusing_a_field_and_moving_the_playhead_adds_no_key() {
+        let mut harness = harness_with(vec![animated_clip("映像", 0)]);
+        harness
+            .state_mut()
+            .session
+            .select_only("id-映像".to_owned());
+        harness.state_mut().session.seek(30);
+        harness.run();
+        // 30 frame の位置 X（15%）の欄に入り、値を変えずに再生ヘッドを動かしてから抜ける。
+        harness.get_by(spin_starting_with("15")).focus();
+        harness.run();
+        harness.state_mut().session.seek(80);
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        let session = &harness.state().session;
+        assert_eq!(
+            session.project().timeline_clips[0]
+                .effects
+                .position_x_keys
+                .len(),
+            2,
+            "値を変えていないのにキーが増えました"
+        );
+        assert!(!session.can_undo());
+    }
+
+    #[test]
+    fn an_unfinished_edit_is_dropped_when_another_clip_is_selected() {
+        let mut harness = harness_with(vec![animated_clip("一", 0), animated_clip("二", 200)]);
+        harness.state_mut().session.select_only("id-一".to_owned());
+        harness.state_mut().session.seek(30);
+        harness.run();
+        harness.get_by(spin_starting_with("15")).focus();
+        harness.run();
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.get_by(|node| node.is_focused()).type_text("40");
+        harness.run();
+        // 確定せずに別の clip を選び、元の clip へ戻る。
+        harness.state_mut().session.select_only("id-二".to_owned());
+        harness.run();
+        harness.state_mut().session.select_only("id-一".to_owned());
+        harness.run();
+        // 戻っても未確定の 40 は出ず、Project の 15% を見せる。
+        assert!(harness.query_by(spin_starting_with("40")).is_none());
+        harness.get_by(spin_starting_with("15"));
+        assert!(!harness.state().session.can_undo());
+    }
 }

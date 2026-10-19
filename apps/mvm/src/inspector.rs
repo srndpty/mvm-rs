@@ -61,10 +61,12 @@ pub fn show(ui: &mut egui::Ui, session: &mut Session, state: &mut InspectorState
             ui.label("選択なし");
         }
         math_button(ui, session);
+        state.motion.forget();
         return;
     };
     let Some(clip) = session.project().clip(&id).cloned() else {
         ui.label("選択なし");
+        state.motion.forget();
         return;
     };
     if state.clip_id.as_deref() != Some(id.as_str()) || state.revision != session.edit_revision() {

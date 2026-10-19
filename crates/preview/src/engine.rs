@@ -85,6 +85,9 @@ struct Mail {
     wake: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// UI が最後に送った command の世代。worker が panic したら、この世代で知らせる。
     requested: AtomicU64,
+    /// 試験用: worker が出した画像の枚数。
+    #[cfg(test)]
+    published: AtomicU64,
 }
 
 struct MailInner {
@@ -115,6 +118,8 @@ impl Mail {
             changed: Condvar::new(),
             wake: Mutex::new(None),
             requested: AtomicU64::new(0),
+            #[cfg(test)]
+            published: AtomicU64::new(0),
         }
     }
 
@@ -157,6 +162,8 @@ impl Mail {
     }
 
     fn publish_image(&self, generation: u64, image: PreviewImage) {
+        #[cfg(test)]
+        self.published.fetch_add(1, Ordering::Relaxed);
         let mut inner = self.enter(generation);
         inner.image = Some(image);
         inner.error = None;
@@ -748,6 +755,71 @@ mod tests {
         if let Some(image) = delivery.image {
             assert_eq!(image.frame, 299);
         }
+    }
+
+    fn flooded_engine(frames: i64) -> PreviewEngine {
+        let engine = PreviewEngine::start().expect("起動");
+        let project = Project {
+            timeline_clips: vec![span(frames)],
+            ..Project::default()
+        };
+        engine
+            .set_project(Arc::new(project), Arc::new(MathLibrary::default()), 1)
+            .unwrap();
+        for frame in 0..frames {
+            engine.seek(frame, frame as u64 + 2).unwrap();
+        }
+        engine
+    }
+
+    #[test]
+    fn a_pause_after_a_flood_of_seeks_publishes_no_later_frame() {
+        let engine = flooded_engine(300);
+        engine.pause(1_000).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        // 止めた世代の画像は届かない（UI は古い世代の画像を捨てる）。
+        if let Some(delivery) = engine.poll() {
+            assert!(
+                delivery.generation < 1_000 || delivery.image.is_none(),
+                "止めた後に frame を出しました"
+            );
+        }
+    }
+
+    #[test]
+    fn a_project_change_after_a_flood_of_seeks_shows_only_the_new_project() {
+        let engine = flooded_engine(300);
+        let smaller = Project {
+            timeline_clips: vec![span(60)],
+            output_width: 1280,
+            output_height: 720,
+            ..Project::default()
+        };
+        engine
+            .set_project(Arc::new(smaller), Arc::new(MathLibrary::default()), 1_000)
+            .unwrap();
+        engine.seek(10, 1_001).unwrap();
+        let image = engine
+            .wait_image_until(Duration::from_secs(5), |image| image.frame == 10)
+            .expect("新しい Project の frame が届きません");
+        assert_eq!((image.width, image.height), (1280, 720));
+        std::thread::sleep(Duration::from_millis(100));
+        let delivery = engine.poll().expect("通知");
+        assert_eq!(delivery.generation, 1_001);
+        if let Some(image) = delivery.image {
+            assert_eq!(image.width, 1280, "古い Project の画像が後から届きました");
+        }
+    }
+
+    #[test]
+    fn shutting_down_after_a_flood_of_seeks_does_not_draw_them_all() {
+        let engine = flooded_engine(300);
+        let mail = Arc::clone(&engine.mail);
+        drop(engine);
+        // 終了までに描くのは、worker が受け取った batch ごとの最後の seek だけ。300 枚を順に描いていないことを、
+        // 出した画像の枚数で確かめる（描画の速さには依らない）。
+        let published = mail.published.load(Ordering::Relaxed);
+        assert!(published < 30, "{published} 枚描きました");
     }
 
     #[test]

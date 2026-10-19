@@ -50,8 +50,13 @@ struct EffectDraft {
     kind: ClipKeyKind,
     frame: i64,
     revision: u64,
+    /// 編集を始めたときの値。これと変わらなければ確定しない。
+    original_value: f64,
     value: f64,
 }
+
+/// 入力欄は小数 2 桁で見せる。focus を抜けるときに表示の文字列を読み直すので、その丸め以内の差は変更とみなさない。
+const UNCHANGED: f64 = 0.005;
 
 pub struct MotionState {
     clip_id: Option<String>,
@@ -83,8 +88,21 @@ impl Default for MotionState {
 }
 
 impl MotionState {
+    /// clip を選んでいないとき。編集中の下書きを捨てる。
+    pub fn forget(&mut self) {
+        self.draft = None;
+    }
+
     /// Project・再生ヘッド・clip が変わったら、下書きを Project の値で読み直す。
     fn load(&mut self, session: &Session, clip: &TimelineClip) {
+        // 別の clip の下書きは捨てる（戻ってきたときに古い未確定の値を出さない）。
+        if self
+            .draft
+            .as_ref()
+            .is_some_and(|draft| draft.clip_id != clip.id)
+        {
+            self.draft = None;
+        }
         let frame = session.effect_frame(&clip.id).unwrap_or(0);
         let same = self.clip_id.as_deref() == Some(clip.id.as_str())
             && self.revision == session.edit_revision();
@@ -188,6 +206,7 @@ fn effect_row(
             kind,
             frame: state.frame,
             revision: session.edit_revision(),
+            original_value: shown,
             value,
         });
     } else if let Some(draft) = state
@@ -211,8 +230,9 @@ fn effect_row(
         if let Some(other) = pair {
             values.push((other, draft.value));
         }
-        // 値が変わっていなければ確定しない（focus を抜けただけで undo を積まない）。
-        if draft.value != shown || draft.frame != state.frame {
+        // 始めたときの値から変わっていなければ確定しない（focus を抜けただけ・再生ヘッドが動いただけで、キーや
+        // undo を積まない）。
+        if (draft.value - draft.original_value).abs() >= UNCHANGED {
             report!(
                 session,
                 session.commit_effects(&clip.id, draft.frame, draft.revision, &values)

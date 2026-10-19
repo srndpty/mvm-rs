@@ -5,8 +5,15 @@ use std::sync::Arc;
 use eframe::egui::{self, Color32, ColorImage, TextureHandle, TextureOptions};
 
 use mvm_app::{PreviewImage, Session};
+use mvm_project::timeline::TimelineTool;
 
-pub fn show(ui: &mut egui::Ui, session: &mut Session, texture: &mut Option<(u64, TextureHandle)>) {
+pub fn show(
+    ui: &mut egui::Ui,
+    session: &mut Session,
+    texture: &mut Option<(u64, TextureHandle)>,
+    draft: &mut String,
+    notice: &mut String,
+) {
     let ctx = ui.ctx().clone();
     session.set_preview_wake(Arc::new(move || ctx.request_repaint()));
     session.refresh_preview();
@@ -27,6 +34,24 @@ pub fn show(ui: &mut egui::Ui, session: &mut Session, texture: &mut Option<(u64,
         });
         ui.monospace(session.playhead_label());
     });
+    if session.tool() == TimelineTool::Text {
+        ui.label("置く文字");
+        ui.add(egui::TextEdit::multiline(draft).desired_rows(3));
+        let commit = ui.button("文字を置く").clicked()
+            || ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
+        if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            draft.clear();
+        }
+        if commit {
+            match session.place_text(draft) {
+                Ok(()) => {
+                    draft.clear();
+                    notice.clear();
+                }
+                Err(error) => *notice = error.message().to_owned(),
+            }
+        }
+    }
     if let Some(note) = session.skipped_note() {
         ui.label(note);
     }

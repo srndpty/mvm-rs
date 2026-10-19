@@ -188,7 +188,7 @@ impl<'de> Visitor<'de> for UniqueKeys {
     }
 }
 
-fn reject_duplicate_keys(text: &str) -> ProjectResult<()> {
+pub(crate) fn reject_duplicate_keys(text: &str) -> ProjectResult<()> {
     let mut deserializer = serde_json::Deserializer::from_str(text);
     UniqueKeys
         .deserialize(&mut deserializer)

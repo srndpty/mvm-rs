@@ -3,7 +3,6 @@
 //! C++ 版 `mvm_atomic_write_file` と同じ手順。置換先を他の process が開いている間は
 //! 短い間待ってやり直す。`ReplaceFileW` は使わない。
 
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -19,8 +18,8 @@ use windows::Win32::System::Threading::{GetCurrentProcessId, Sleep};
 use windows::core::{HRESULT, PCWSTR};
 
 use crate::error::PlatformError;
+use crate::wide::wide_path;
 
-const MAX_WIDE: usize = 32768;
 const REPLACE_ATTEMPTS: u32 = 40;
 const REPLACE_WAIT_MS: u32 = 50;
 
@@ -53,15 +52,6 @@ fn temporary_path(target: &Path) -> Result<PathBuf, PlatformError> {
     let mut name = target.as_os_str().to_owned();
     name.push(format!(".mvmtmp.{process_id}.{serial}"));
     Ok(PathBuf::from(name))
-}
-
-fn wide_path(path: &Path) -> Result<Vec<u16>, PlatformError> {
-    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-    if wide.len() >= MAX_WIDE {
-        return Err(PlatformError::new("パスが長すぎます"));
-    }
-    wide.push(0);
-    Ok(wide)
 }
 
 struct TemporaryFile {

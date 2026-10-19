@@ -371,8 +371,11 @@ fn draw_clip(
     {
         draw_ghost(ui, active, rect);
     }
-    if response.drag_started()
-        && let Some(pointer) = response.interact_pointer_pos()
+    // 押した瞬間に始める。drag_started はクリックの閾値を超えるまで来ないので、
+    // それを待つとクリック（選択・レーザー）が gesture を持たず、ドラッグの起点もずれる。
+    if response.is_pointer_button_down_on()
+        && ui.input(|input| input.pointer.primary_pressed())
+        && let Some(pointer) = ui.input(|input| input.pointer.press_origin())
     {
         *gesture = begin_gesture(ui, session, clip, pointer, origin_x, ppf, rect);
     }
@@ -385,8 +388,9 @@ fn draw_clip(
             active.moved = true;
         }
     }
-    if (response.drag_stopped() || response.clicked())
-        && let Some(active) = gesture.take().filter(|active| active.clip_id == clip.id)
+    // 離した frame は全 clip で真になるので、自分の gesture だけを取り出す。
+    if ui.input(|input| input.pointer.primary_released())
+        && let Some(active) = gesture.take_if(|active| active.clip_id == clip.id)
     {
         commit_gesture(ui, session, active, origin_x, ppf, rows, rect);
     }

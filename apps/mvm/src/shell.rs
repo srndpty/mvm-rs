@@ -934,6 +934,108 @@ mod tests {
         assert!(clean.confirm.is_none(), "未変更なのに確認を出しました");
     }
 
+    /// 実際の mouse と同じく、押す・離すを別の frame で送る（accesskit の click は pointer を通らない）。
+    fn press_and_release(harness: &mut Harness<'static, MvmApp>, from: egui::Pos2, to: egui::Pos2) {
+        harness.hover_at(from);
+        harness.event(egui::Event::PointerButton {
+            pos: from,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+        if from != to {
+            harness.hover_at(egui::pos2((from.x + to.x) / 2.0, (from.y + to.y) / 2.0));
+            harness.run();
+            harness.hover_at(to);
+            harness.run();
+        }
+        harness.event(egui::Event::PointerButton {
+            pos: to,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+    }
+
+    fn harness_with(clips: Vec<TimelineClip>) -> Harness<'static, MvmApp> {
+        let project = Project {
+            timeline_clips: clips,
+            ..Project::default()
+        };
+        let mut harness = harness(MvmApp::new());
+        harness.state_mut().session = Session::from_project(project);
+        harness.run();
+        harness
+    }
+
+    #[test]
+    fn clicking_a_clip_selects_it() {
+        let mut harness = harness_with(vec![text_clip("A", 0), text_clip("B", 40)]);
+        let b = harness.get_by_label("B").rect().center();
+        press_and_release(&mut harness, b, b);
+        assert_eq!(harness.state().session.selection(), ["id-B".to_owned()]);
+    }
+
+    /// 検証を通る文字 clip を playhead（0 frame）に置いた画面。clip は画面より長いので、中心ではなく左寄りを押す。
+    fn harness_with_placed_text(name: &str) -> Harness<'static, MvmApp> {
+        let mut harness = harness(MvmApp::new());
+        harness.state_mut().session.place_text(name).expect("文字");
+        harness.run();
+        harness
+    }
+
+    fn clip_range(clip: &TimelineClip) -> (i64, i64) {
+        let start = clip.timeline_start_frame;
+        (start, start + clip.source_out_frame - clip.source_in_frame)
+    }
+
+    #[test]
+    fn a_razor_click_without_shift_splits_the_clip() {
+        let mut harness = harness_with_placed_text("切る文字");
+        let (_, end) = clip_range(&harness.state().session.project().timeline_clips[0]);
+        harness.state_mut().session.set_tool(TimelineTool::Razor);
+        harness.run();
+        let rect = harness.get_by_label("切る文字").rect();
+        let at = egui::pos2(rect.min.x + 80.0, rect.center().y);
+        press_and_release(&mut harness, at, at);
+        let session = &harness.state().session;
+        let mut ranges: Vec<(i64, i64)> = session
+            .project()
+            .timeline_clips
+            .iter()
+            .map(clip_range)
+            .collect();
+        ranges.sort();
+        assert_eq!(
+            ranges.len(),
+            2,
+            "レーザーのクリックで分割されません: {:?}",
+            session.alert()
+        );
+        assert_eq!(ranges[0].0, 0);
+        assert_eq!(ranges[0].1, ranges[1].0);
+        assert_eq!(ranges[1].1, end);
+        assert!(ranges[0].1 > 0 && ranges[0].1 < end);
+    }
+
+    #[test]
+    fn dragging_a_clip_moves_it_by_the_pointer_delta() {
+        let mut harness = harness_with_placed_text("動かす文字");
+        let rect = harness.get_by_label("動かす文字").rect();
+        let at = egui::pos2(rect.min.x + 80.0, rect.center().y);
+        // 100% は 1 frame 8px。80px 右は 10 frame。
+        press_and_release(&mut harness, at, at + egui::vec2(80.0, 0.0));
+        let session = &harness.state().session;
+        assert_eq!(
+            session.project().timeline_clips[0].timeline_start_frame,
+            10,
+            "{:?}",
+            session.alert()
+        );
+    }
+
     #[test]
     fn tool_button_track_visibility_and_undo_are_reachable() {
         let mut harness = harness(MvmApp::new());

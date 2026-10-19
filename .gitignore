@@ -5,3 +5,4 @@
 *.mvm.lock
 .vs/
 *.pdb
+tmp/

@@ -63,6 +63,22 @@ impl Command {
     }
 }
 
+/// 1 回に受けた command のうち、後に Seek / Play（どちらも描く）が続く Seek を除く。除いた Seek の frame と
+/// 世代は後の command が上書きするので、描かないこと以外は変わらない。
+fn coalesce_seeks(batch: Vec<Command>) -> Vec<Command> {
+    let last_draw = batch
+        .iter()
+        .rposition(|command| matches!(command, Command::Seek { .. } | Command::Play { .. }));
+    batch
+        .into_iter()
+        .enumerate()
+        .filter(|(index, command)| {
+            !matches!(command, Command::Seek { .. }) || Some(*index) == last_draw
+        })
+        .map(|(_, command)| command)
+        .collect()
+}
+
 struct Mail {
     lock: Mutex<MailInner>,
     changed: Condvar,
@@ -225,14 +241,17 @@ impl Worker {
                 }
             };
             if let Some(command) = command {
-                if !self.handle(command) {
-                    break;
-                }
+                // 溜まった command をまとめて受け、後で描き直す Seek は描かずに飛ばす（シャトルやスクラブで seek が
+                // 描画より速く届いても、待ち行列を伸ばさず最新の frame だけを描く）。
+                let mut batch = vec![command];
                 while let Ok(command) = commands.try_recv() {
-                    if !self.handle(command) {
-                        self.shutdown();
-                        return;
-                    }
+                    batch.push(command);
+                }
+                if !coalesce_seeks(batch)
+                    .into_iter()
+                    .all(|command| self.handle(command))
+                {
+                    break;
                 }
             }
             if self.playing
@@ -655,6 +674,80 @@ mod tests {
             "再生が 300 から始まっていません: {}",
             image.frame
         );
+    }
+
+    fn names(batch: &[Command]) -> Vec<String> {
+        batch
+            .iter()
+            .map(|command| match command {
+                Command::Seek { frame, .. } => format!("seek {frame}"),
+                Command::Play { frame, .. } => format!("play {frame}"),
+                Command::Pause { .. } => "pause".to_owned(),
+                Command::Shutdown => "shutdown".to_owned(),
+                _ => "other".to_owned(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn only_the_last_queued_seek_is_drawn() {
+        let seek = |frame| Command::Seek {
+            frame,
+            generation: 1,
+        };
+        let kept = coalesce_seeks(vec![
+            seek(1),
+            seek(2),
+            Command::Pause { generation: 2 },
+            seek(3),
+        ]);
+        assert_eq!(names(&kept), ["pause", "seek 3"]);
+        // 後に Play があれば、Play が描くので Seek は描かない。
+        let kept = coalesce_seeks(vec![
+            seek(4),
+            Command::Play {
+                frame: 5,
+                generation: 3,
+            },
+        ]);
+        assert_eq!(names(&kept), ["play 5"]);
+        // Play の後の Seek は描く。Shutdown は残す。
+        let kept = coalesce_seeks(vec![
+            Command::Play {
+                frame: 5,
+                generation: 3,
+            },
+            seek(6),
+            Command::Shutdown,
+        ]);
+        assert_eq!(names(&kept), ["play 5", "seek 6", "shutdown"]);
+    }
+
+    #[test]
+    fn a_flood_of_seeks_ends_on_the_last_requested_frame() {
+        let engine = PreviewEngine::start().expect("起動");
+        let project = Project {
+            timeline_clips: vec![span(600)],
+            ..Project::default()
+        };
+        engine
+            .set_project(Arc::new(project), Arc::new(MathLibrary::default()), 1)
+            .unwrap();
+        // シャトルのように、描くより速く seek を送る。世代は送るたびに進める。
+        for frame in 0..300_u64 {
+            engine.seek(frame as i64, frame + 2).unwrap();
+        }
+        let image = engine
+            .wait_image_until(Duration::from_secs(5), |image| image.frame == 299)
+            .expect("最後に要求した frame が届きません");
+        assert_eq!(image.frame, 299);
+        // 最後の画像の後に、古い seek の画像が届かない。
+        std::thread::sleep(Duration::from_millis(100));
+        let delivery = engine.poll().expect("通知");
+        assert_eq!(delivery.generation, 301);
+        if let Some(image) = delivery.image {
+            assert_eq!(image.frame, 299);
+        }
     }
 
     #[test]

@@ -40,9 +40,6 @@ pub struct TimelineState {
     pub subtitle_gesture: Option<SubtitleGesture>,
     /// 右クリックの「自動字幕を生成」で選んだ clip。shell が文字起こしの dialog を開く。
     pub transcribe_clip: Option<String>,
-    /// OS からこの frame に落とされたファイル。track の行の上なら timeline へ置いて空にし、残れば shell が
-    /// プロジェクトパネルへ読み込む。
-    pub dropped_files: Vec<std::path::PathBuf>,
     /// 右クリックの「速度・デュレーション」で選んだ clip。shell が dialog を開く。
     pub speed_clip: Option<String>,
     /// 右クリックの「プロジェクト設定をこの素材に合わせる」で選んだ clip。
@@ -272,7 +269,7 @@ fn draw_contents(
         subtitle_lane::draw(ui, session, &mut state.subtitle_gesture, lane, window, ppf);
     }
     draw_playhead(ui, rect, session.playhead_frame(), ppf);
-    receive_media(ui, session, state, rect, rows, ppf);
+    receive_media(ui, session, rect, rows, ppf);
     if interval_failed {
         ui.label("区間を計算できない clip があります");
     }
@@ -419,27 +416,20 @@ fn drop_target(
     ))
 }
 
-/// プロジェクトパネルからのドラッグと、OS から落とされたファイルを受ける。ドラッグ中は置く位置を線で見せる。
+/// プロジェクトパネルからのドラッグを受ける。ドラッグ中は置く位置を枠で見せる。
+/// OS から落とされたファイルは受けない（ドラッグ中の pointer の位置が届かず、置く行を確かめられないため）。
 fn receive_media(
     ui: &mut egui::Ui,
     session: &mut Session,
-    state: &mut TimelineState,
     rect: Rect,
     rows: &[(TrackKind, usize, String)],
     ppf: f32,
 ) {
-    let pointer = ui.input(|input| input.pointer.latest_pos());
-    let target = pointer.and_then(|pointer| drop_target(pointer, rect, rows, ppf));
-    if !state.dropped_files.is_empty()
-        && let Some((track, frame)) = target
-    {
-        let files = std::mem::take(&mut state.dropped_files);
-        report!(session, session.place_media_files_at(&files, track, frame));
-        return;
-    }
     if !egui::DragAndDrop::has_payload_of_type::<MediaDrag>(ui.ctx()) {
         return;
     }
+    let pointer = ui.input(|input| input.pointer.latest_pos());
+    let target = pointer.and_then(|pointer| drop_target(pointer, rect, rows, ppf));
     let Some((track, frame)) = target else {
         return;
     };

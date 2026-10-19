@@ -917,7 +917,7 @@ impl MvmApp {
         }
         self.session.poll_maintenance(now_ms);
         let math = self.session.poll_math();
-        let waveforms = self.session.poll_waveforms();
+        let waveforms = self.session.poll_waveforms(now_ms);
         let shuttle = self.session.poll_shuttle(now_ms);
         if math || waveforms || shuttle {
             ui.ctx().request_repaint();
@@ -941,15 +941,6 @@ impl MvmApp {
             self.shown_title = Some(title);
         }
         self.handle_shortcuts(ui);
-        // OS から落とされたファイル。timeline の行の上なら timeline が置き、残りはプロジェクトパネルへ読み込む。
-        self.timeline.dropped_files = ui.input(|input| {
-            input
-                .raw
-                .dropped_files
-                .iter()
-                .map(|file| file.path().to_path_buf())
-                .collect()
-        });
         egui::Panel::top("menu").show(ui, |ui| self.menu(ui));
         egui::Panel::bottom("timeline")
             .resizable(true)
@@ -957,7 +948,16 @@ impl MvmApp {
             .show(ui, |ui| {
                 timeline_ui::show(ui, &mut self.session, &mut self.timeline);
             });
-        let dropped = std::mem::take(&mut self.timeline.dropped_files);
+        // OS から落とされたファイルはプロジェクトパネルへ読み込む。Windows の OLE のドラッグ中は窓に pointer の
+        // 位置が届かず、どの行に落としたかを確かめられないので、timeline へは置かない。
+        let dropped: Vec<PathBuf> = ui.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .map(|file| file.path().to_path_buf())
+                .collect()
+        });
         if !dropped.is_empty() {
             project_panel::import(&mut self.session, &dropped, "");
             self.left_tab = LeftTab::Project;
@@ -1722,5 +1722,78 @@ mod tests {
         harness.get_by_label_contains("左へシャトル");
         harness.get_by_label_contains("次の編集点へ");
         harness.get_by_label_contains("マーカーを追加");
+    }
+
+    #[test]
+    fn an_inspector_edit_lands_on_the_frame_where_it_started() {
+        let mut clip = video_clip("映像", 0);
+        clip.effects.position_x_keys = vec![
+            mvm_project::clip_effects::ClipKeyframe::new(0, 0.0),
+            mvm_project::clip_effects::ClipKeyframe::new(100, 50.0),
+        ];
+        let mut harness = harness_with(vec![clip]);
+        harness
+            .state_mut()
+            .session
+            .select_only("id-映像".to_owned());
+        harness.state_mut().session.seek(30);
+        harness.run();
+        // 位置 X は 30 frame で 15%。
+        let field = |node: &egui_kittest::kittest::AccessKitNode<'_>| {
+            node.role() == egui::accesskit::Role::SpinButton
+                && node.value().is_some_and(|value| value.starts_with("15"))
+        };
+        harness.get_by(field).focus();
+        harness.run();
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.get_by(|node| node.is_focused()).type_text("12");
+        harness.run();
+        // 入力の途中で再生ヘッドが動いても、下書きは消えず、始めた 30 frame へ書く。
+        harness.state_mut().session.seek(80);
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        let keys: Vec<_> = harness.state().session.project().timeline_clips[0]
+            .effects
+            .position_x_keys
+            .iter()
+            .map(|key| (key.frame, key.value))
+            .collect();
+        assert_eq!(keys, [(0, 0.0), (30, 12.0), (100, 50.0)]);
+    }
+
+    /// 試験で OS から落とすファイル。中身は読まない。
+    #[derive(Debug)]
+    struct DroppedPath(PathBuf);
+
+    impl egui::DroppedFile for DroppedPath {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            Err("試験では読まない".to_owned())
+        }
+    }
+
+    #[test]
+    fn a_file_dropped_from_the_os_goes_to_the_panel_not_the_timeline() {
+        let mut harness = harness(MvmApp::new());
+        // timeline の行の上に pointer を置いてから落としても、timeline には置かない。
+        let row = harness.get_by_label("V1").rect().center() + egui::vec2(400.0, 0.0);
+        harness.hover_at(row);
+        harness.run();
+        harness
+            .input_mut()
+            .dropped_files
+            .push(std::sync::Arc::new(DroppedPath(PathBuf::from(
+                "Z:/無い/素材.mp4",
+            ))));
+        harness.run();
+        let state = harness.state();
+        assert!(state.session.project().timeline_clips.is_empty());
+        // 読み込もうとして、読めなかったことを知らせる。
+        assert!(state.notice.contains("素材.mp4"), "{}", state.notice);
+        assert_eq!(state.left_tab, LeftTab::Project);
     }
 }

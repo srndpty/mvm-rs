@@ -476,6 +476,39 @@ impl Session {
         values: &[(ClipKeyKind, f64)],
     ) -> Result<(), AppError> {
         let frame = self.effect_frame(clip_id)?;
+        self.set_effects_at(clip_id, frame, values)
+    }
+
+    /// ドラッグ・入力で編集した effect を、編集を始めたときの clip 内 `frame` へ確定する。編集の途中で Project が
+    /// 変わっていれば（undo・別の編集）、古い値を新しい Project へ書かずに失敗する。
+    pub fn commit_effects(
+        &mut self,
+        clip_id: &str,
+        frame: i64,
+        revision: u64,
+        values: &[(ClipKeyKind, f64)],
+    ) -> Result<(), AppError> {
+        self.expect_revision(revision)?;
+        self.set_effects_at(clip_id, frame, values)
+    }
+
+    /// 編集を始めたときの revision と今が違えば失敗する。
+    pub(crate) fn expect_revision(&self, revision: u64) -> Result<(), AppError> {
+        if revision == self.edit_revision {
+            Ok(())
+        } else {
+            Err(AppError::new(
+                "編集中に Project が変わったため、この変更は取り消しました",
+            ))
+        }
+    }
+
+    fn set_effects_at(
+        &mut self,
+        clip_id: &str,
+        frame: i64,
+        values: &[(ClipKeyKind, f64)],
+    ) -> Result<(), AppError> {
         self.transact(|project| {
             let mut selected = None;
             for (kind, value) in values {
@@ -897,5 +930,66 @@ fn link_mode(linked: bool) -> LinkMode {
         LinkMode::Linked
     } else {
         LinkMode::Single
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mvm_core::Rational;
+    use mvm_project::clip_effects::ClipKeyframe;
+    use mvm_project::{Project, TimelineClip, TimelineClipKind, TrackRef};
+
+    use super::*;
+
+    fn animated() -> Session {
+        let mut clip = TimelineClip {
+            kind: TimelineClipKind::Video,
+            media_path: "v.mp4".into(),
+            name: "v".to_owned(),
+            id: "v".to_owned(),
+            source_fps: Rational::new(60, 1),
+            source_frame_count: 120,
+            source_out_frame: 120,
+            track: TrackRef::video(0),
+            ..TimelineClip::default()
+        };
+        clip.effects.position_x_keys =
+            vec![ClipKeyframe::new(0, 0.0), ClipKeyframe::new(100, 50.0)];
+        Session::from_project(Project {
+            timeline_clips: vec![clip],
+            ..Project::default()
+        })
+    }
+
+    #[test]
+    fn an_effect_edit_lands_on_the_frame_where_it_started() {
+        let mut session = animated();
+        session.seek(30);
+        let revision = session.edit_revision();
+        // 編集の途中で再生ヘッドが動いても、始めた frame のキーへ書く。
+        session.seek(80);
+        session
+            .commit_effects("v", 30, revision, &[(ClipKeyKind::PositionX, 10.0)])
+            .expect("確定");
+        let keys = &session.project().timeline_clips[0].effects.position_x_keys;
+        let frames: Vec<_> = keys.iter().map(|key| (key.frame, key.value)).collect();
+        assert_eq!(frames, [(0, 0.0), (30, 10.0), (100, 50.0)]);
+    }
+
+    #[test]
+    fn an_effect_edit_started_before_an_undo_is_rejected() {
+        let mut session = animated();
+        session
+            .set_effect("v", ClipKeyKind::PositionY, 5.0)
+            .expect("編集");
+        let revision = session.edit_revision();
+        session.undo().expect("戻す");
+        let before = session.project().clone();
+        assert!(
+            session
+                .commit_effects("v", 0, revision, &[(ClipKeyKind::PositionX, 10.0)])
+                .is_err()
+        );
+        assert_eq!(session.project(), &before);
     }
 }

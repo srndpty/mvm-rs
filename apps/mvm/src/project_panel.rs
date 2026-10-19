@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 
 use eframe::egui::{self, Sense};
-use mvm_app::Session;
+use mvm_app::{RemovalPlan, Session};
 use mvm_project::media_bin::media_items_in_use;
 use mvm_project::{MediaKind, Project};
 
@@ -20,8 +20,8 @@ pub struct ProjectPanel {
     selected: Vec<String>,
     /// 名前を変えている項目と、入力中の名前。
     renaming: Option<(String, String)>,
-    /// 削除の確認。消える素材・フォルダと、一緒に消える clip の数。
-    removing: Option<(Vec<String>, usize)>,
+    /// 削除の確認。確認したときの計画（消える項目・一緒に消える clip の数・Project の revision）。
+    removing: Option<RemovalPlan>,
     filter: String,
 }
 
@@ -33,7 +33,7 @@ enum Action {
     BeginRename(String, String),
     Rename(String, String),
     AskRemove(Vec<String>),
-    Remove(Vec<String>),
+    Remove(RemovalPlan),
     Move(Vec<String>, String),
 }
 
@@ -278,9 +278,10 @@ fn rename_field(
 }
 
 fn confirm_remove(ui: &mut egui::Ui, panel: &mut ProjectPanel, actions: &mut Vec<Action>) {
-    let Some((ids, clips)) = panel.removing.clone() else {
+    let Some(plan) = panel.removing.clone() else {
         return;
     };
+    let clips = plan.clip_count;
     egui::Window::new("素材を削除")
         .collapsible(false)
         .resizable(false)
@@ -291,7 +292,10 @@ fn confirm_remove(ui: &mut egui::Ui, panel: &mut ProjectPanel, actions: &mut Vec
                     "選択した素材を削除すると、タイムライン上の {clips} 個の clip も削除されます。"
                 ));
             } else {
-                ui.label(format!("{} 件をプロジェクトから削除します。", ids.len()));
+                ui.label(format!(
+                    "{} 件をプロジェクトから削除します。",
+                    plan.entry_ids.len()
+                ));
             }
             ui.horizontal(|ui| {
                 if ui.button("キャンセル").clicked() {
@@ -299,7 +303,7 @@ fn confirm_remove(ui: &mut egui::Ui, panel: &mut ProjectPanel, actions: &mut Vec
                 }
                 if ui.button("削除").clicked() {
                     panel.removing = None;
-                    actions.push(Action::Remove(ids.clone()));
+                    actions.push(Action::Remove(plan.clone()));
                 }
             });
         });
@@ -344,12 +348,24 @@ fn apply(session: &mut Session, panel: &mut ProjectPanel, action: Action) {
             panel.renaming = None;
             session.rename_media_entry(&id, &name)
         }
-        Action::AskRemove(ids) => session.media_removal_clip_count(&ids).map(|clips| {
-            panel.removing = Some((ids, clips));
+        Action::AskRemove(ids) => session.plan_media_removal(&ids).map(|plan| {
+            panel.removing = Some(plan);
         }),
-        Action::Remove(ids) => session.remove_media_entries(&ids).map(|()| {
-            panel.selected.retain(|selected| !ids.contains(selected));
-        }),
+        Action::Remove(plan) => match session.remove_media_entries(&plan) {
+            Ok(()) => {
+                panel
+                    .selected
+                    .retain(|selected| !plan.entry_ids.contains(selected));
+                Ok(())
+            }
+            // 確認の後で Project が変わった。今の内容で確認し直す。
+            Err(error) => {
+                if let Ok(again) = session.plan_media_removal(&plan.entry_ids) {
+                    panel.removing = Some(again);
+                }
+                Err(error)
+            }
+        },
         Action::Move(ids, folder) => {
             // 自分の上へ落としただけなら何もしない。
             if ids.iter().all(|id| *id == folder) {

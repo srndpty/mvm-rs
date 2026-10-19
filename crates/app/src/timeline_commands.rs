@@ -161,20 +161,23 @@ impl Session {
         )
     }
 
-    /// 見えている矩形を (x, y, width, height)（出力画素）にする位置と拡大率を、1 つの undo で設定する。
-    /// キーのある channel は再生ヘッドの位置のキーを置き換える。
+    /// 見えている矩形を (x, y, width, height)（出力画素）にする位置と拡大率を、1 つの undo で設定する。`frame` と
+    /// `revision` はドラッグを始めたときの clip 内 frame と Project。途中で Project が変わっていれば失敗する。
+    /// キーのある channel は `frame` のキーを置き換える。
     pub fn place_clip_visual_rect(
         &mut self,
         clip_id: &str,
+        frame: i64,
+        revision: u64,
         rect: [f64; 4],
     ) -> Result<(), AppError> {
+        self.expect_revision(revision)?;
         let Some(clip) = self.project.clip(clip_id) else {
             return Err(AppError::new("動かす clip がありません"));
         };
         let Some((width, height)) = source_size(&self.project, clip) else {
             return Err(AppError::new("この clip は preview で動かせません"));
         };
-        let frame = self.effect_frame(clip_id)?;
         let mut effects = clip.effects.evaluated_at(frame);
         let [x, y, w, h] = rect;
         set_effects_for_visual_rect(
@@ -189,8 +192,10 @@ impl Session {
             h,
         )
         .map_err(|error| AppError::new(error.to_string()))?;
-        self.set_effects(
+        self.commit_effects(
             clip_id,
+            frame,
+            revision,
             &[
                 (ClipKeyKind::PositionX, effects.position_x_percent),
                 (ClipKeyKind::PositionY, effects.position_y_percent),
@@ -335,8 +340,9 @@ mod tests {
             (0.0, 0.0, 1920.0, 1080.0)
         );
         // 右下 1/4 へ縮める: 拡大率 50%・中心は (1440, 810)。
+        let revision = session.edit_revision();
         session
-            .place_clip_visual_rect("v", [960.0, 540.0, 960.0, 540.0])
+            .place_clip_visual_rect("v", 0, revision, [960.0, 540.0, 960.0, 540.0])
             .expect("移動");
         let effects = &session.project().timeline_clips[0].effects;
         assert!((effects.scale_x_percent - 50.0).abs() < 1e-6);

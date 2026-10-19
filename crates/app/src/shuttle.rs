@@ -182,6 +182,28 @@ mod tests {
     }
 
     #[test]
+    fn rapid_shuttle_keys_leave_the_playhead_on_the_last_shown_frame() {
+        let mut session = session();
+        session.seek(170);
+        let mut clock = 0;
+        for direction in [-1, -1, -1, 1, -1, 1, 1] {
+            session.shuttle(direction, clock).expect("シャトル");
+            clock += 20;
+            session.poll_shuttle(clock);
+            clock += 20;
+        }
+        // J ×3（-4 倍）→ L（-2）→ J（-4）→ L（-2）→ L（-1）。
+        assert_eq!(session.shuttle_rate(), -1);
+        session.poll_shuttle(clock);
+        let shown = session.playhead_frame();
+        session.stop_shuttle();
+        // 止めた後は時間が経っても playhead が動かない。
+        assert!(!session.poll_shuttle(clock + 5_000));
+        assert_eq!(session.playhead_frame(), shown);
+        assert!(shown < 170);
+    }
+
+    #[test]
     fn an_empty_timeline_has_nothing_to_shuttle() {
         let mut session = Session::new();
         assert!(session.shuttle(-1, 0).is_err());

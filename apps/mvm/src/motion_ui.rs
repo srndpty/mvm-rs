@@ -2,6 +2,9 @@
 //!
 //! 値は再生ヘッドの位置（clip の外なら先頭）で評価して見せる。ドラッグを離すか入力欄を抜けたときに 1 回だけ
 //! commit する。キーのある channel を変えると、その位置のキーを置き換える。
+//!
+//! 表示する評価値と、編集中の下書きは分けて持つ。下書きは編集を始めたときの clip・channel・frame・revision を
+//! 覚え、途中で再生ヘッドが動いても始めた frame へ書く。途中で Project が変われば app が確定を断る。
 
 use eframe::egui;
 use mvm_app::Session;
@@ -40,11 +43,23 @@ const AUDIO_ROWS: [(ClipKeyKind, &str, &str); 2] = [
 
 const CHANNELS: usize = 12;
 
+/// 編集中の effect の値と、編集を始めたときの対象。
+#[derive(Clone, Debug, PartialEq)]
+struct EffectDraft {
+    clip_id: String,
+    kind: ClipKeyKind,
+    frame: i64,
+    revision: u64,
+    value: f64,
+}
+
 pub struct MotionState {
     clip_id: Option<String>,
     revision: u64,
     frame: i64,
+    /// 再生ヘッドの位置で評価した値（表示用）。
     values: [f64; CHANNELS],
+    draft: Option<EffectDraft>,
     lock_aspect: bool,
     fade_in: i64,
     fade_out: i64,
@@ -58,6 +73,7 @@ impl Default for MotionState {
             revision: 0,
             frame: 0,
             values: [0.0; CHANNELS],
+            draft: None,
             lock_aspect: true,
             fade_in: 0,
             fade_out: 0,
@@ -75,7 +91,7 @@ impl MotionState {
         if same && self.frame == frame {
             return;
         }
-        // 再生ヘッドが動いただけなら、評価し直す値だけを読み直す（入力中の文字は残す）。
+        // 再生ヘッドが動いただけなら、表示する評価値だけを読み直す（入力中の文字と effect の下書きは残す）。
         self.frame = frame;
         for (index, value) in self.values.iter_mut().enumerate() {
             if let Some(kind) = kind_at(index) {
@@ -148,31 +164,59 @@ fn effect_row(
     let at_key = keys.iter().any(|key| key.frame == state.frame);
     let index = kind as usize;
     ui.label(label);
-    let Some(value) = state.values.get_mut(index) else {
+    let editing = state
+        .draft
+        .as_ref()
+        .filter(|draft| draft.clip_id == clip.id && draft.kind == kind)
+        .map(|draft| draft.value);
+    let Some(shown) = state.values.get(index).copied() else {
         return;
     };
+    let mut value = editing.unwrap_or(shown);
     let response = ui.add(
-        egui::DragValue::new(value)
+        egui::DragValue::new(&mut value)
             .range(channel.minimum..=channel.maximum)
             .speed(0.5)
             .max_decimals(2)
             .suffix(suffix),
     );
-    if response.drag_stopped() || response.lost_focus() {
-        let value = *value;
+    if editing.is_none()
+        && (response.drag_started() || response.gained_focus() || response.changed())
+    {
+        state.draft = Some(EffectDraft {
+            clip_id: clip.id.clone(),
+            kind,
+            frame: state.frame,
+            revision: session.edit_revision(),
+            value,
+        });
+    } else if let Some(draft) = state
+        .draft
+        .as_mut()
+        .filter(|draft| draft.clip_id == clip.id && draft.kind == kind)
+    {
+        draft.value = value;
+    }
+    if (response.drag_stopped() || response.lost_focus())
+        && let Some(draft) = state
+            .draft
+            .take_if(|draft| draft.clip_id == clip.id && draft.kind == kind)
+    {
         let pair = match kind {
             ClipKeyKind::ScaleX if state.lock_aspect => Some(ClipKeyKind::ScaleY),
             ClipKeyKind::ScaleY if state.lock_aspect => Some(ClipKeyKind::ScaleX),
             _ => None,
         };
-        match pair {
-            Some(other) => {
-                report!(
-                    session,
-                    session.set_effects(&clip.id, &[(kind, value), (other, value)])
-                );
-            }
-            None => report!(session, session.set_effect(&clip.id, kind, value)),
+        let mut values = vec![(kind, draft.value)];
+        if let Some(other) = pair {
+            values.push((other, draft.value));
+        }
+        // 値が変わっていなければ確定しない（focus を抜けただけで undo を積まない）。
+        if draft.value != shown || draft.frame != state.frame {
+            report!(
+                session,
+                session.commit_effects(&clip.id, draft.frame, draft.revision, &values)
+            );
         }
     }
     ui.horizontal(|ui| {

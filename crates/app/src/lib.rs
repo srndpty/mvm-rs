@@ -28,7 +28,7 @@ mod waveforms;
 pub use audio_adjust::{AudioAdjustmentClipReport, AudioAdjustmentOutcome};
 pub use error::AppError;
 pub use math::MathClipStatus;
-pub use media::ImportReport;
+pub use media::{ImportReport, RemovalPlan};
 pub use mvm_export::{ExportError, ExportProgress, ExportQuality, ExportRequest, ExportSummary};
 pub use mvm_preview::{MeterPeaks, PreviewImage};
 pub use mvm_project::audio_adjustment::AudioAdjustmentSettings;

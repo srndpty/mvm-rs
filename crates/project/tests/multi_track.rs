@@ -448,3 +448,30 @@ fn a_text_clip_keeps_a_body_and_valid_style() {
     assert!(edit_text_clip(&mut project, "無い", text).is_err());
     assert_eq!(project, before);
 }
+
+#[test]
+fn a_broken_linked_pair_reports_its_own_error_without_a_new_track() {
+    let mut project = Project::default();
+    let (video, mut audio) = linked_pair("v");
+    audio.link_group_id = "別のリンク".to_owned();
+    let error = place_video_media_at(&mut project, video, Some(audio), 0).unwrap_err();
+    // A1 は空いているので、track を足して試し直さずに元の原因を返す。
+    assert!(
+        error
+            .to_string()
+            .starts_with("リンクclipは同じlink IDを持つ"),
+        "{error}"
+    );
+    assert_eq!(project.audio_tracks.len(), 1);
+}
+
+#[test]
+fn a_linked_pair_uses_a1_when_it_is_free_after_the_busy_span() {
+    let mut project = Project::default();
+    project.timeline_clips = vec![clip("busy", A1, 0)];
+    let (video, audio) = linked_pair("v");
+    // A1 の clip は [0, 100) なので、100 からなら A1 に置ける。
+    place_video_media_at(&mut project, video, Some(audio), 100).unwrap();
+    assert_eq!(project.clip("v-a").unwrap().track, A1);
+    assert_eq!(project.audio_tracks.len(), 1);
+}

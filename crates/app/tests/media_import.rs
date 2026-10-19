@@ -81,11 +81,14 @@ fn a_video_with_sound_is_placed_as_a_linked_pair_at_the_playhead() {
 
 #[test]
 #[ignore = "workstation"]
-fn dropped_files_are_lined_up_from_the_drop_point() {
+fn panel_items_dropped_on_the_timeline_are_lined_up_from_the_drop_point() {
     let mut session = Session::new();
-    let wav = smoke("wav_48k.wav");
     session
-        .place_media_files_at(&[wav.clone(), wav], TrackRef::audio(0), 12)
+        .import_media_files(&[smoke("wav_48k.wav")], "")
+        .expect("読み込み");
+    let id = session.project().media_items[0].id.clone();
+    session
+        .place_media_items_at(&[id.clone(), id], TrackRef::audio(0), 12)
         .expect("ドロップ");
     let clips = &session.project().timeline_clips;
     assert_eq!(clips.len(), 2);
@@ -109,13 +112,11 @@ fn a_panel_item_is_placed_and_removing_it_takes_its_clips() {
     session.add_media_item_at_playhead(&id).expect("配置");
     let clip = &session.project().timeline_clips[0];
     assert_eq!(clip.kind, TimelineClipKind::Image);
-    assert_eq!(
-        session
-            .media_removal_clip_count(std::slice::from_ref(&id))
-            .unwrap(),
-        1
-    );
-    session.remove_media_entries(&[id]).expect("削除");
+    let plan = session
+        .plan_media_removal(std::slice::from_ref(&id))
+        .unwrap();
+    assert_eq!(plan.clip_count, 1);
+    session.remove_media_entries(&plan).expect("削除");
     assert!(session.project().timeline_clips.is_empty());
     assert!(session.project().media_items.is_empty());
 }
@@ -125,11 +126,14 @@ fn a_panel_item_is_placed_and_removing_it_takes_its_clips() {
 fn the_waveform_of_a_wav_is_decoded_in_the_background() {
     let mut session = Session::new();
     let wav = smoke("wav_48k.wav");
-    assert!(session.waveform(&wav).is_none());
+    // 波形は timeline にある素材の分だけを持つ。
+    session.add_media_file_at_playhead(&wav).expect("配置");
+    let placed = session.project().timeline_clips[0].media_path.clone();
+    assert!(session.waveform(&placed).is_none());
     let mut peaks = None;
-    for _ in 0..2_000 {
-        session.poll_waveforms();
-        peaks = session.waveform(&wav);
+    for step in 0..2_000_u64 {
+        session.poll_waveforms(step * 10);
+        peaks = session.waveform(&placed);
         if peaks.is_some() {
             break;
         }

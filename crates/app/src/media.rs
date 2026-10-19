@@ -140,10 +140,10 @@ impl ImportReport {
     }
 }
 
-/// 置く素材 1 つ。パネルの素材なら `item_id`、ファイルなら調べた結果を持つ。
+/// 置くパネルの素材 1 つと、使う時点で調べ直した結果。
 struct Placement {
     path: PathBuf,
-    item_id: Option<String>,
+    item_id: String,
     probed: Probed,
 }
 
@@ -241,29 +241,7 @@ impl Session {
                 .map_err(|error| AppError::new(format!("{}: {}", item.name, error.message())))?;
             placements.push(Placement {
                 path,
-                item_id: Some(id.clone()),
-                probed,
-            });
-        }
-        self.place_at(placements, track, frame)
-    }
-
-    /// OS からドロップしたファイルを素材として登録し、ドロップした track・位置から順に並べて置く。
-    pub fn place_media_files_at(
-        &mut self,
-        paths: &[PathBuf],
-        track: TrackRef,
-        frame: i64,
-    ) -> Result<(), AppError> {
-        let mut placements = Vec::new();
-        for path in paths {
-            let path = local_file(path)?;
-            let probed = probe(&path).map_err(|error| {
-                AppError::new(format!("{}: {}", file_name(&path), error.message()))
-            })?;
-            placements.push(Placement {
-                path,
-                item_id: None,
+                item_id: id.clone(),
                 probed,
             });
         }
@@ -284,14 +262,11 @@ impl Session {
             let mut first = None;
             for placement in &placements {
                 let name = file_name(&placement.path);
-                let item_id = match &placement.item_id {
-                    Some(id) => id.clone(),
-                    None => register(project, &placement.path, &placement.probed, new_id)?,
-                };
-                refresh_media_item(project, &item_id, &placement.probed.item)
+                let item_id = &placement.item_id;
+                refresh_media_item(project, item_id, &placement.probed.item)
                     .map_err(project_error(&name))?;
                 let clips =
-                    media_clips_for_item(project, &item_id, placement.probed.has_audio, new_id)
+                    media_clips_for_item(project, item_id, placement.probed.has_audio, new_id)
                         .map_err(project_error(&name))?;
                 let placed =
                     place_media_at_drop(project, clips.primary, clips.linked_audio, track, start)
@@ -349,17 +324,37 @@ impl Session {
         })
     }
 
-    /// 削除すると一緒に消える timeline の clip の数（確認の文に使う）。
-    pub fn media_removal_clip_count(&self, entry_ids: &[String]) -> Result<usize, AppError> {
-        plan_media_bin_removal(&self.project, entry_ids)
-            .map(|plan| plan.clip_ids.len())
-            .map_err(|error| AppError::new(error.to_string()))
+    /// 削除の計画。一緒に消える timeline の clip の数を確認の文に出し、確認した計画を
+    /// [`Session::remove_media_entries`] へ渡す。
+    pub fn plan_media_removal(&self, entry_ids: &[String]) -> Result<RemovalPlan, AppError> {
+        let plan = plan_media_bin_removal(&self.project, entry_ids)
+            .map_err(|error| AppError::new(error.to_string()))?;
+        Ok(RemovalPlan {
+            entry_ids: entry_ids.to_vec(),
+            clip_count: plan.clip_ids.len(),
+            revision: self.edit_revision,
+        })
     }
 
-    /// 素材とフォルダを消す。使っている timeline の clip も一緒に消す（1 つの undo）。
-    pub fn remove_media_entries(&mut self, entry_ids: &[String]) -> Result<(), AppError> {
-        self.transact(|project| remove_media_bin_entries(project, entry_ids).map(|_| None))
+    /// 確認した計画どおりに素材とフォルダを消す。使っている timeline の clip も一緒に消す（1 つの undo）。
+    /// 確認の後で Project が変わっていれば、消える clip が確認と違い得るので何もせずに失敗する。
+    pub fn remove_media_entries(&mut self, plan: &RemovalPlan) -> Result<(), AppError> {
+        if plan.revision != self.edit_revision {
+            return Err(AppError::new(
+                "確認の後で Project が変わりました。もう一度確認してください",
+            ));
+        }
+        self.transact(|project| remove_media_bin_entries(project, &plan.entry_ids).map(|_| None))
     }
+}
+
+/// 確認した素材の削除。確認したときの Project の revision を持つ。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemovalPlan {
+    pub entry_ids: Vec<String>,
+    /// 一緒に消える timeline の clip の数。
+    pub clip_count: usize,
+    revision: u64,
 }
 
 /// 素材を登録し、その ID を返す。実体が同じファイルの素材が既にあれば、それを使う。
@@ -508,18 +503,33 @@ mod tests {
     fn removing_a_folder_counts_and_removes_its_contents() {
         let mut session = Session::new();
         let folder = session.create_media_folder("").expect("フォルダ");
-        assert_eq!(
-            session
-                .media_removal_clip_count(std::slice::from_ref(&folder))
-                .expect("数"),
-            0
-        );
-        session.remove_media_entries(&[folder]).expect("削除");
+        let plan = session
+            .plan_media_removal(std::slice::from_ref(&folder))
+            .expect("計画");
+        assert_eq!(plan.clip_count, 0);
+        session.remove_media_entries(&plan).expect("削除");
         assert!(session.project().media_folders.is_empty());
-        assert!(
-            session
-                .media_removal_clip_count(&["無い".to_owned()])
-                .is_err()
-        );
+        assert!(session.plan_media_removal(&["無い".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn a_removal_confirmed_before_a_change_is_refused() {
+        let mut session = Session::new();
+        let folder = session.create_media_folder("").expect("フォルダ");
+        let plan = session
+            .plan_media_removal(std::slice::from_ref(&folder))
+            .expect("計画");
+        // 確認の間に別の編集が入る。
+        session.create_media_folder("").expect("別のフォルダ");
+        let before = session.project().clone();
+        assert!(session.remove_media_entries(&plan).is_err());
+        assert_eq!(session.project(), &before);
+        let again = session
+            .plan_media_removal(std::slice::from_ref(&folder))
+            .expect("計画し直す");
+        session
+            .remove_media_entries(&again)
+            .expect("確認し直して削除");
+        assert_eq!(session.project().media_folders.len(), 1);
     }
 }

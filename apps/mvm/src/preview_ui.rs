@@ -20,6 +20,9 @@ pub struct TransformDrag {
     origin: Pos2,
     /// 掴んだときの矩形（出力画素の x, y, 幅, 高さ）。
     start: [f64; 4],
+    /// 掴んだときの clip 内 frame と Project。確定はこの frame へ書き、Project が変わったら取り消す。
+    frame: i64,
+    revision: u64,
 }
 
 pub fn show(
@@ -121,7 +124,7 @@ fn image_size(image: &PreviewImage) -> Option<[usize; 2]> {
 const HANDLE: f32 = 5.0;
 
 /// 選んだ動画・画像 clip の見えている枠。中を掴むと移動、角を掴むと縦横比を保って拡縮する（Shift で縦横別）。
-/// 回転した clip は枠と画像が一致しないので出さない。
+/// 回転した clip は枠と画像が一致しないので出さない。ドラッグ中に Project が変わったら（undo など）掴み直させる。
 fn transform_overlay(
     ui: &mut egui::Ui,
     session: &mut Session,
@@ -152,6 +155,11 @@ fn transform_overlay(
             egui::vec2((rect[2] * scale) as f32, (rect[3] * scale) as f32),
         )
     };
+    if drag.as_ref().is_some_and(|active| {
+        active.clip_id != clip_id || active.revision != session.edit_revision()
+    }) {
+        *drag = None;
+    }
     let start = [geometry.x, geometry.y, geometry.width, geometry.height];
     let response = ui.interact(image_rect, ui.id().with("preview_transform"), Sense::drag());
     if response.drag_started()
@@ -161,21 +169,23 @@ fn transform_overlay(
         let corner = corners(screen)
             .iter()
             .position(|point| point.distance(origin) <= HANDLE * 2.0);
-        if corner.is_some() || screen.contains(origin) {
+        if (corner.is_some() || screen.contains(origin))
+            && let Ok(frame) = session.effect_frame(&clip_id)
+        {
             *drag = Some(TransformDrag {
                 clip_id: clip_id.clone(),
                 corner,
                 origin,
                 start,
+                frame,
+                revision: session.edit_revision(),
             });
         }
     }
     let free = ui.input(|input| input.modifiers.shift);
     let pointer = ui.input(|input| input.pointer.latest_pos());
     let current = match (drag.as_ref(), pointer) {
-        (Some(active), Some(pointer)) if active.clip_id == clip_id => {
-            dragged_rect(active, pointer, scale, free)
-        }
+        (Some(active), Some(pointer)) => dragged_rect(active, pointer, scale, free),
         _ => start,
     };
     let painter = ui.painter_at(image_rect);
@@ -196,9 +206,9 @@ fn transform_overlay(
     }
     if response.drag_stopped()
         && let Some(active) = drag.take()
-        && active.clip_id == clip_id
         && current != active.start
-        && let Err(error) = session.place_clip_visual_rect(&clip_id, current)
+        && let Err(error) =
+            session.place_clip_visual_rect(&clip_id, active.frame, active.revision, current)
     {
         session.set_alert(error.message());
     }
@@ -214,7 +224,8 @@ fn corners(rect: Rect) -> [Pos2; 4] {
     ]
 }
 
-/// ドラッグ中の矩形（出力画素）。角の拡縮は向かいの角を固定する。
+/// ドラッグ中の矩形（出力画素）。角の拡縮は向かいの角を固定する。縦横比を保つときは、掴んだ角の行き先を
+/// 向かいの角からの対角線へ射影する（pointer が対角線の上なら角は pointer に一致する）。
 fn dragged_rect(active: &TransformDrag, pointer: Pos2, scale: f64, free: bool) -> [f64; 4] {
     let [x, y, width, height] = active.start;
     let dx = f64::from(pointer.x - active.origin.x) / scale;
@@ -229,13 +240,14 @@ fn dragged_rect(active: &TransformDrag, pointer: Pos2, scale: f64, free: bool) -
         2 => (1.0, 1.0),
         _ => (-1.0, 1.0),
     };
-    let mut new_width = (width + sx * dx).max(1.0);
-    let mut new_height = (height + sy * dy).max(1.0);
+    let (mut new_width, mut new_height) = (width + sx * dx, height + sy * dy);
     if !free && width > 0.0 && height > 0.0 {
-        let factor = ((new_width / width) + (new_height / height)) / 2.0;
-        new_width = (width * factor).max(1.0);
-        new_height = (height * factor).max(1.0);
+        // 向かいの角から見た、掴んだ角の行き先を対角線 (width, height) へ射影する。
+        let factor = (new_width * width + new_height * height) / (width * width + height * height);
+        new_width = width * factor;
+        new_height = height * factor;
     }
+    let (new_width, new_height) = (new_width.max(1.0), new_height.max(1.0));
     let new_x = if sx < 0.0 { x + width - new_width } else { x };
     let new_y = if sy < 0.0 { y + height - new_height } else { y };
     [new_x, new_y, new_width, new_height]
@@ -251,6 +263,8 @@ mod tests {
             corner,
             origin: Pos2::new(100.0, 100.0),
             start: [100.0, 50.0, 400.0, 200.0],
+            frame: 0,
+            revision: 0,
         }
     }
 
@@ -262,10 +276,30 @@ mod tests {
     }
 
     #[test]
+    fn a_corner_on_the_diagonal_follows_the_pointer_exactly() {
+        // 右下の角を対角線（2:1）に沿って (+100, +50) 動かすと、角は pointer に一致する。
+        let rect = dragged_rect(&active(Some(2)), Pos2::new(200.0, 150.0), 1.0, false);
+        assert_eq!(rect, [100.0, 50.0, 500.0, 250.0]);
+        // 左上の角を対角線に沿って (-40, -20): 右下 (500, 250) を固定して角が pointer に来る。
+        let rect = dragged_rect(&active(Some(0)), Pos2::new(60.0, 80.0), 1.0, false);
+        assert_near(rect, [60.0, 30.0, 440.0, 220.0]);
+    }
+
+    fn assert_near(actual: [f64; 4], expected: [f64; 4]) {
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| (actual - expected).abs() < 1e-9),
+            "{actual:?} != {expected:?}"
+        );
+    }
+
+    #[test]
     fn a_corner_keeps_the_aspect_and_pins_the_opposite_corner() {
-        // 右下の角を右へ 100: 幅は 1.25 倍・高さは 1.0 倍なので、平均の 1.125 倍。
+        // 右下の角を右へ 100: 行き先 (500, 200) を対角線 (400, 200) へ射影すると 1.2 倍。
         let rect = dragged_rect(&active(Some(2)), Pos2::new(200.0, 100.0), 1.0, false);
-        assert_eq!(rect, [100.0, 50.0, 450.0, 225.0]);
+        assert_eq!(rect, [100.0, 50.0, 480.0, 240.0]);
         // Shift の左上は縦横別に縮め、右下（500, 250）を固定する。
         let rect = dragged_rect(&active(Some(0)), Pos2::new(140.0, 120.0), 1.0, true);
         assert_eq!(rect, [140.0, 70.0, 360.0, 180.0]);

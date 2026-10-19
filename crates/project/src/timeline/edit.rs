@@ -20,6 +20,7 @@ use super::common::{
 };
 use super::mapping::{
     clip_interval, clip_source_boundary_to_timeline, clip_timeline_boundary_to_source,
+    timeline_clip_duration,
 };
 use super::settings::add_track;
 
@@ -524,7 +525,29 @@ pub fn place_audio_clip_at(
     })
 }
 
-/// 動画素材を再生ヘッドの位置へ置く。timeline に映像系の clip が無ければ V1、あれば新しい video track へ置く。
+/// track の [start, start + length) に clip が無いか。
+fn track_is_free(
+    project: &Project,
+    track: TrackRef,
+    start: i64,
+    length: i64,
+) -> ProjectResult<bool> {
+    let end = start.saturating_add(length);
+    for clip in project
+        .timeline_clips
+        .iter()
+        .filter(|clip| clip.track == track)
+    {
+        let (clip_start, clip_end) = clip_interval(project, clip)?;
+        if clip_start < end && start < clip_end {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// 動画素材を再生ヘッドの位置へ置く。timeline に映像系の clip が無ければ V1、あれば新しい video track へ置く
+/// （C++ 版 `addVideoClip` と同じ。空いた track を探さず、既存の重ねの上に必ず新しい層として足す）。
 /// リンク音声は A1 へ置き、A1 が使用中なら既存 clip を壊さず新しい audio track の同じ位置へ置く。
 pub fn place_video_media_at(
     project: &mut Project,
@@ -552,35 +575,22 @@ pub fn place_video_media_at(
             if candidate.audio_tracks.is_empty() {
                 add_track(&mut candidate, TrackKind::Audio)?;
             }
-            let mut first = candidate.clone();
-            match place_linked_av_pair_at(
-                &mut first,
-                primary.clone(),
+            // A1 が置く区間で使われているときだけ、新しい audio track へ回す。それ以外の失敗は原因のまま返す。
+            let length = timeline_clip_duration(&candidate, &audio)?;
+            let audio_index =
+                if track_is_free(&candidate, TrackRef::audio(0), timeline_start_frame, length)? {
+                    0
+                } else {
+                    add_track(&mut candidate, TrackKind::Audio)?.unwrap_or_default()
+                };
+            place_linked_av_pair_at(
+                &mut candidate,
+                primary,
                 video_track,
-                audio.clone(),
-                TrackRef::audio(0),
+                audio,
+                TrackRef::audio(audio_index),
                 timeline_start_frame,
-            ) {
-                Ok(selected) => {
-                    candidate = first;
-                    selected
-                }
-                Err(_) => {
-                    let audio_index =
-                        add_track(&mut candidate, TrackKind::Audio)?.unwrap_or_default();
-                    place_linked_av_pair_at(
-                        &mut candidate,
-                        primary,
-                        video_track,
-                        audio,
-                        TrackRef::audio(audio_index),
-                        timeline_start_frame,
-                    )
-                    .map_err(|error| {
-                        crate::ProjectError::new(format!("リンク音声を配置できません: {error}"))
-                    })?
-                }
-            }
+            )?
         }
     };
     *project = candidate;

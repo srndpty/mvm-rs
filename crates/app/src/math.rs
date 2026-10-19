@@ -111,9 +111,20 @@ impl Session {
             self.math = None;
         }
         if self.math.is_none() {
-            let manim = Preferences::load()
-                .ok()
-                .map(|preferences| preferences.manim_executable)
+            if self.math_blocked.is_some() {
+                return false;
+            }
+            // 設定を読めなければ始めない（PATH の別の manim.exe へ黙って切り替えない）。
+            let preferences = match Preferences::load() {
+                Ok(preferences) => preferences,
+                Err(error) => {
+                    let reason = format!("端末の設定を読めないので数式を描けません: {error}");
+                    self.alert = reason.clone();
+                    self.math_blocked = Some(reason);
+                    return true;
+                }
+            };
+            let manim = Some(preferences.manim_executable)
                 .filter(|path| !path.trim().is_empty())
                 .map(PathBuf::from);
             match MathService::start(cache.clone(), manim) {
@@ -174,6 +185,8 @@ impl Session {
 
     /// 描画環境を確かめ直し、失敗を忘れて描き直す（MiKTeX の導入後など）。
     pub fn retry_math(&mut self) {
+        // 設定を直した後は、次の poll で読み直して描画を始める。
+        self.math_blocked = None;
         if let Some(state) = &self.math {
             state.service.retry();
         }
@@ -186,6 +199,9 @@ impl Session {
         }
         if let Err(reason) = self.math_authority() {
             return MathClipStatus::Unavailable(reason);
+        }
+        if let Some(reason) = &self.math_blocked {
+            return MathClipStatus::Unavailable(reason.clone());
         }
         let mut jobs = match clip_jobs(&self.project, clip) {
             Ok(jobs) => jobs,
@@ -260,6 +276,22 @@ mod tests {
             summarize([MathStatus::Rendering, failed, MathStatus::Checking].into_iter()),
             MathClipStatus::Failed { .. }
         ));
+    }
+
+    #[test]
+    fn a_broken_preferences_file_blocks_the_service_until_retry() {
+        let mut session = Session::new();
+        session.math_blocked = Some("端末の設定を読めないので数式を描けません".to_owned());
+        session.add_math_clip().unwrap();
+        assert!(!session.poll_math());
+        assert!(session.math.is_none(), "設定を読めないのに描画を始めました");
+        let clip = session.project().timeline_clips[0].clone();
+        assert!(matches!(
+            session.math_status(&clip),
+            MathClipStatus::Unavailable(reason) if reason.contains("設定")
+        ));
+        session.retry_math();
+        assert!(session.math_blocked.is_none());
     }
 
     #[test]

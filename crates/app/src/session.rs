@@ -86,6 +86,8 @@ pub struct Session {
     pub(crate) math: Option<crate::math::MathState>,
     /// Project を読み込む・保存先を変えるたびに増える。背景の作業の結果が同じ Project のものか確かめる。
     pub(crate) load_serial: u64,
+    /// 端末の設定を読めないので数式の描画を始められない理由。「再試行」で読み直す。
+    pub(crate) math_blocked: Option<String>,
 }
 
 #[derive(Clone)]
@@ -166,6 +168,7 @@ impl Session {
             subtitle_clipboard: None,
             math: None,
             load_serial: 1,
+            math_blocked: None,
         }
     }
 
@@ -628,6 +631,7 @@ impl Session {
         self.dirty = dirty;
         self.history.clear();
         self.selection.clear();
+        self.subtitle_selection.clear();
         self.selected_edge = None;
         self.selected_marker = None;
         self.canonical_sha256 = hash;

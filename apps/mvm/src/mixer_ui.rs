@@ -32,12 +32,24 @@ struct StripDraft {
     name: String,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct MeterDisplay {
     level_db: f32,
     peak_db: f32,
     peak_time: f64,
     clipped: bool,
+}
+
+/// 何も鳴っていないメーター（目盛りの下端）。0 dB から始めると、開いた直後に満量を表示してしまう。
+impl Default for MeterDisplay {
+    fn default() -> Self {
+        Self {
+            level_db: METER_FLOOR_DB,
+            peak_db: METER_FLOOR_DB,
+            peak_time: 0.0,
+            clipped: false,
+        }
+    }
 }
 
 impl MeterDisplay {
@@ -329,6 +341,15 @@ mod tests {
         assert_eq!(parse_gain(" 3.5 dB"), Some(3.5));
         assert_eq!(parse_gain("16"), None);
         assert_eq!(parse_gain("abc"), None);
+    }
+
+    #[test]
+    fn a_fresh_meter_shows_silence_until_something_plays() {
+        let mut meter = MeterDisplay::default();
+        meter.feed(0.0, 0.0, 0.0);
+        assert_eq!(meter.level_db, METER_FLOOR_DB);
+        assert_eq!(meter.peak_db, METER_FLOOR_DB);
+        assert!(!meter.clipped);
     }
 
     #[test]

@@ -1246,8 +1246,9 @@ mod tests {
         harness.state_mut().subtitle_panel_draft("最初の字幕");
         harness.run();
         harness.get_by_label("追加").click();
-        harness.run();
-        harness.run();
+        // 字幕を足すと preview の描き直しが非同期に届いて画面を起こす。その到着は待たないので、決まった回数
+        // だけ進める（run は repaint が止むまで待ち、届く時機しだいで上限を超える）。
+        harness.run_steps(3);
         let cues = harness
             .state()
             .session
@@ -1281,8 +1282,9 @@ mod tests {
         harness.get_by_label("挿入").click();
         harness.run();
         harness.get_by_label("数式").click();
-        harness.run();
-        harness.run();
+        // 数式を置くと描画の service が動き、確認・描画のたびに画面を起こす。描画の完了は待たないので、
+        // 決まった回数だけ進める（run は repaint が止むまで待つ）。
+        harness.run_steps(3);
         let session = &harness.state().session;
         let clip = &session.project().timeline_clips[0];
         assert_eq!(clip.kind, TimelineClipKind::Math);

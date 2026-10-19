@@ -452,6 +452,25 @@ mod tests {
     }
 
     #[test]
+    fn opening_another_project_clears_the_subtitle_selection() {
+        let directory = std::env::temp_dir().join(format!("mvm-sub-switch-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut session = Session::from_project(Project::default());
+        session.add_subtitle(0, 10, "a").unwrap();
+        assert_eq!(session.subtitle_selection().len(), 1);
+        session
+            .create_project(&directory.join("other.mvm"))
+            .unwrap();
+        assert!(
+            session.subtitle_selection().is_empty(),
+            "前の Project の字幕が選ばれたまま"
+        );
+        assert!(session.delete_selection().is_err());
+        drop(session);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
     fn selecting_a_clip_clears_the_subtitle_selection() {
         let mut session = Session::from_project(Project::default());
         let id = session.add_subtitle(0, 10, "a").unwrap();

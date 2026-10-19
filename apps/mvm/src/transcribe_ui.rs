@@ -32,6 +32,8 @@ pub struct TranscribeDialog {
     prompt: String,
     replace: bool,
     error: String,
+    /// 端末の設定を読めたか。読めなければ「既定に戻す」まで保存（と認識）をさせない。
+    preferences_loaded: bool,
     drafts: Vec<CandidateDraft>,
     drafts_loaded: bool,
 }
@@ -41,8 +43,14 @@ impl TranscribeDialog {
     pub fn open(&mut self, session: &Session, clip_id: Option<String>) {
         self.error.clear();
         match Preferences::load() {
-            Ok(preferences) => self.preferences = preferences,
-            Err(error) => self.error = error.message().to_owned(),
+            Ok(preferences) => {
+                self.preferences = preferences;
+                self.preferences_loaded = true;
+            }
+            Err(error) => {
+                self.error = error.message().to_owned();
+                self.preferences_loaded = false;
+            }
         }
         self.choice = clip_id.map(Choice::Clip).or_else(|| self.choice.take());
         self.place_frame = session.playhead_frame();
@@ -185,7 +193,18 @@ fn show_settings(ui: &mut egui::Ui, session: &mut Session, dialog: &mut Transcri
     if !dialog.error.is_empty() {
         ui.colored_label(egui::Color32::from_rgb(240, 120, 110), &dialog.error);
     }
-    let ready = dialog.choice.is_some() && !session.is_exporting();
+    if !dialog.preferences_loaded {
+        ui.colored_label(
+            egui::Color32::from_rgb(240, 120, 110),
+            "端末の設定を読めません。file を直して開き直すか、既定に戻してください（他の設定も既定に戻ります）",
+        );
+        if ui.button("設定を既定に戻す").clicked() {
+            dialog.preferences = Preferences::default();
+            dialog.preferences_loaded = true;
+            dialog.error.clear();
+        }
+    }
+    let ready = dialog.choice.is_some() && !session.is_exporting() && dialog.preferences_loaded;
     if ui
         .add_enabled(ready, egui::Button::new("認識開始"))
         .clicked()

@@ -25,7 +25,7 @@ pub fn output_timebase(project: &Project) -> Result<OutputTimebase, PreviewError
         .map_err(|error| PreviewError::new(error.to_string()))
 }
 
-/// mute / solo を外した音声 clip。ピッチ保持はまだ鳴らせないので、あれば失敗する。
+/// mute / solo を外した音声 clip。ピッチ保持の clip は mix が time stretch を通す。
 pub fn audio_spans(project: &Project) -> Result<Vec<AudioSpan>, PreviewError> {
     let timebase = output_timebase(project)?;
     let segments = mvm_project::render::timeline_render_segments(project, TrackKind::Audio)
@@ -34,9 +34,6 @@ pub fn audio_spans(project: &Project) -> Result<Vec<AudioSpan>, PreviewError> {
     for segment in segments {
         if !project.is_track_output_enabled(segment.clip.track) {
             continue;
-        }
-        if segment.original.preserve_pitch {
-            return Err(PreviewError::new("ピッチ保持の clip はまだ鳴らせません"));
         }
         if segment.original.speed.den <= 0 || segment.original.speed.num <= 0 {
             return Err(PreviewError::new("clip の速度が不正です"));
@@ -128,9 +125,6 @@ mod tests {
             .audio_tracks
             .push(Track::named(TrackKind::Audio.default_track_name(1)));
         project.audio_tracks[1].solo = true;
-        let mut pitched = audio("pitched", 1, 0);
-        pitched.preserve_pitch = true;
-        pitched.id = "pitched".to_owned();
         project.timeline_clips = vec![audio("quiet", 0, 0), audio("solo", 1, 0)];
         let spans = audio_spans(&project).expect("区間");
         assert_eq!(spans.len(), 1, "solo 以外が残っています");
@@ -150,10 +144,6 @@ mod tests {
             ..spans[0].clone()
         };
         assert_eq!(source_sample(&half, 800).unwrap(), Some(100 + 400));
-
-        project.timeline_clips.push(pitched);
-        let error = audio_spans(&project).unwrap_err();
-        assert!(error.to_string().contains("ピッチ保持"), "{error}");
     }
 
     #[test]

@@ -4,10 +4,17 @@ use mvm_project::clip_effects::{ClipEffects, evaluate_clip_keys};
 use mvm_project::render::{
     TimelineRenderSegment, render_segment_opacity, timeline_render_segments,
 };
-use mvm_project::timeline::{clip_duration_at, clip_interval, clip_source_frame_at};
+use std::sync::Arc;
+
+use mvm_math::graph::graph_label_texts;
+use mvm_math::{Mask, MathLibrary, MathPaint, math_paint};
+use mvm_project::graph_clip::GraphClipData;
+use mvm_project::timeline::{
+    clip_duration_at, clip_interval, clip_source_frame_at, evaluate_graph_clip,
+};
 use mvm_project::{
-    Project, TextClipData, TimelineClipKind, TrackKind, is_valid_project_output_size,
-    parse_argb_color,
+    ManimGenerationState, Project, TextClipData, TimelineClip, TimelineClipKind, TrackKind,
+    is_valid_project_output_size, parse_argb_color,
 };
 use mvm_text::{Align, GlyphRun, SubtitlePaint};
 
@@ -26,17 +33,33 @@ pub struct PlannedLayer {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlannedSource {
-    Video { frame: i64 },
+    Video {
+        frame: i64,
+    },
     Image,
     Text(GlyphRun),
     Subtitle(SubtitlePaint),
+    /// 数式・数式列の、描けた mask と色。
+    Math(MathPaint),
+    Graph(GraphSource),
+}
+
+/// Graph の 1 frame。`frame` は Draw の途中なら素材 frame、描き終えていれば None。
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphSource {
+    pub data: GraphClipData,
+    pub length: i64,
+    pub frame: Option<i64>,
+    pub labels: Vec<(String, Arc<Mask>)>,
 }
 
 #[derive(Clone, Debug)]
 pub struct FramePlan {
     pub layers: Vec<PlannedLayer>,
-    /// この frame にあるが、数式・グラフ・Manim なので描かない clip の数。
+    /// この frame にあるが、描画がまだ済んでいない・描けないので描かない clip の数。
     pub skipped_clips: usize,
+    /// 描かない理由（clip ごと）。
+    pub notes: Vec<String>,
 }
 
 /// Project の出力寸法。偶数かつ 2..=16384 でなければ失敗する。
@@ -82,8 +105,21 @@ pub fn black_image(frame: i64, project: &Project) -> Result<PreviewImage, Previe
     })
 }
 
-/// `frame` に重なる映像・静止画。mute と無効な clip は含めない。
-pub fn plan_frame(project: &Project, frame: i64) -> Result<FramePlan, PreviewError> {
+/// Manim clip の生成済みの動画。生成していなければ None。
+fn manim_video_ready(project: &Project, clip: &TimelineClip) -> bool {
+    project.manim_assets.iter().any(|asset| {
+        asset.generated_video_path == clip.media_path
+            && asset.generation_state == ManimGenerationState::Ready
+    })
+}
+
+/// `frame` に重なる映像・静止画。mute と無効な clip は含めない。数式・Graph のラベルは `math` の描画を使い、
+/// まだ描けていない clip は描かずに数える（書き出しはそれを失敗にする）。
+pub fn plan_frame(
+    project: &Project,
+    frame: i64,
+    math: &MathLibrary,
+) -> Result<FramePlan, PreviewError> {
     if frame < 0 {
         return Err(PreviewError::new("frame 番号が不正です"));
     }
@@ -91,6 +127,11 @@ pub fn plan_frame(project: &Project, frame: i64) -> Result<FramePlan, PreviewErr
         .map_err(|error| PreviewError::new(error.to_string()))?;
     let mut layers = Vec::new();
     let mut skipped_clips = 0usize;
+    let mut notes = Vec::new();
+    let mut skip = |note: String| {
+        skipped_clips += 1;
+        notes.push(note);
+    };
     for segment in &segments {
         let (start, end) = clip_interval(project, &segment.clip)
             .map_err(|error| PreviewError::new(error.to_string()))?;
@@ -101,7 +142,16 @@ pub fn plan_frame(project: &Project, frame: i64) -> Result<FramePlan, PreviewErr
             continue;
         }
         let source = match segment.clip.kind {
-            TimelineClipKind::Video => {
+            TimelineClipKind::Video | TimelineClipKind::Manim => {
+                if segment.clip.kind == TimelineClipKind::Manim
+                    && !manim_video_ready(project, &segment.original)
+                {
+                    skip(format!(
+                        "{}: Manim の動画が生成されていません",
+                        segment.clip.name
+                    ));
+                    continue;
+                }
                 let local = frame
                     .checked_sub(start)
                     .ok_or_else(|| PreviewError::new("frame 番号が overflow しました"))?;
@@ -116,14 +166,29 @@ pub fn plan_frame(project: &Project, frame: i64) -> Result<FramePlan, PreviewErr
                 };
                 PlannedSource::Text(text)
             }
-            TimelineClipKind::Math
-            | TimelineClipKind::EquationSequence
-            | TimelineClipKind::Graph
-            | TimelineClipKind::Manim
-            | TimelineClipKind::Audio => {
-                skipped_clips += 1;
-                continue;
+            TimelineClipKind::Math | TimelineClipKind::EquationSequence => {
+                match math_paint(project, math, &segment.original, frame) {
+                    Ok(Some(paint)) => PlannedSource::Math(paint),
+                    Ok(None) => {
+                        skip(format!("{}: 数式を描画中です", segment.clip.name));
+                        continue;
+                    }
+                    Err(error) => {
+                        skip(format!("{}: {error}", segment.clip.name));
+                        continue;
+                    }
+                }
             }
+            TimelineClipKind::Graph => {
+                match graph_source(project, math, &segment.original, frame) {
+                    Ok(source) => PlannedSource::Graph(source),
+                    Err(note) => {
+                        skip(format!("{}: {note}", segment.clip.name));
+                        continue;
+                    }
+                }
+            }
+            TimelineClipKind::Audio => continue,
         };
         let Some(opacity) = opacity_at(project, segment, frame)? else {
             continue;
@@ -165,6 +230,33 @@ pub fn plan_frame(project: &Project, frame: i64) -> Result<FramePlan, PreviewErr
     Ok(FramePlan {
         layers,
         skipped_clips,
+        notes,
+    })
+}
+
+fn graph_source(
+    project: &Project,
+    math: &MathLibrary,
+    clip: &TimelineClip,
+    frame: i64,
+) -> Result<GraphSource, String> {
+    let local = frame - clip.timeline_start_frame;
+    let evaluated = evaluate_graph_clip(clip, project.timeline_fps, local)
+        .map_err(|error| error.to_string())?;
+    let drawing = evaluated.progress_denominator > 1
+        && evaluated.progress_numerator < evaluated.progress_denominator;
+    let mut labels = Vec::new();
+    for text in graph_label_texts(&clip.graph) {
+        let mask = math
+            .graph_label(&text)
+            .ok_or_else(|| format!("ラベル「{text}」を描画中です"))?;
+        labels.push((text, mask));
+    }
+    Ok(GraphSource {
+        data: clip.graph.clone(),
+        length: clip.source_frame_count,
+        frame: drawing.then_some(evaluated.source_frame),
+        labels,
     })
 }
 
@@ -361,7 +453,7 @@ mod tests {
             },
         ];
 
-        let plan = plan_frame(&project, 5).expect("plan");
+        let plan = plan_frame(&project, 5, &MathLibrary::default()).expect("plan");
         let described: Vec<_> = plan
             .layers
             .iter()
@@ -376,6 +468,8 @@ mod tests {
                             -2
                         }
                         PlannedSource::Subtitle(_) => -3,
+                        PlannedSource::Math(_) => -4,
+                        PlannedSource::Graph(_) => -5,
                     },
                 )
             })
@@ -399,7 +493,7 @@ mod tests {
 
         project.video_tracks[0].muted = true;
         project.video_tracks[1].muted = true;
-        let muted = plan_frame(&project, 5).expect("mute");
+        let muted = plan_frame(&project, 5, &MathLibrary::default()).expect("mute");
         assert!(
             muted.layers.is_empty(),
             "mute した track を描いています: {:?}",
@@ -444,7 +538,7 @@ mod tests {
             kind: mvm_project::TransitionKind::Blend,
         }];
 
-        let middle = plan_frame(&project, 300).expect("トランジション");
+        let middle = plan_frame(&project, 300, &MathLibrary::default()).expect("トランジション");
         assert_eq!(middle.layers.len(), 2);
         let progress = (30.5_f32) / 60.0;
         assert!(
@@ -458,7 +552,7 @@ mod tests {
             middle.layers[1].opacity
         );
 
-        let before = plan_frame(&project, 10).expect("トランジションの前");
+        let before = plan_frame(&project, 10, &MathLibrary::default()).expect("トランジションの前");
         assert_eq!(before.layers.len(), 1);
         assert!((before.layers[0].opacity - 1.0).abs() < 1e-5);
     }
@@ -480,12 +574,12 @@ mod tests {
             }),
             ..Project::default()
         };
-        let shown = plan_frame(&project, 5).expect("字幕");
+        let shown = plan_frame(&project, 5, &MathLibrary::default()).expect("字幕");
         assert!(matches!(
             shown.layers.last().map(|layer| &layer.source),
             Some(PlannedSource::Subtitle(paint)) if paint.content == "せりふ"
         ));
-        let later = plan_frame(&project, 10).expect("字幕の外");
+        let later = plan_frame(&project, 10, &MathLibrary::default()).expect("字幕の外");
         assert!(
             later
                 .layers
@@ -493,7 +587,7 @@ mod tests {
                 .all(|layer| !matches!(layer.source, PlannedSource::Subtitle(_)))
         );
         project.subtitles.as_mut().unwrap().visible = false;
-        let hidden = plan_frame(&project, 5).expect("非表示");
+        let hidden = plan_frame(&project, 5, &MathLibrary::default()).expect("非表示");
         assert!(
             hidden
                 .layers

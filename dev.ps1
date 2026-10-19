@@ -92,6 +92,11 @@ function Invoke-Tests {
                 $harness += @('--skip', 'reads_cpp_project_corpus')
                 $skipped += 'reads_cpp_project_corpus（MVM_CPP_PROJECT_CORPUS が未指定）'
             }
+            # 認識 model は数 GB あり手元にしか無い。tool・model・音声の指定が無ければ実行しない。
+            if (-not ($env:MVM_WHISPER_CLI -and $env:MVM_WHISPER_MODEL -and $env:MVM_TRANSCRIBE_AUDIO)) {
+                $harness += @('--skip', 'recognizes_speech_with_the_real_whisper')
+                $skipped += 'recognizes_speech_with_the_real_whisper（MVM_WHISPER_CLI・MVM_WHISPER_MODEL・MVM_TRANSCRIBE_AUDIO が未指定）'
+            }
         }
         & cargo test --workspace --locked @ExtraArguments @harness 2>&1 |
             Tee-Object -Variable output | Out-Host

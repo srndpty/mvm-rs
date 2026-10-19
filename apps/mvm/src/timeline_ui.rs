@@ -16,6 +16,8 @@ use mvm_project::timeline::{
 };
 use mvm_project::{Project, TrackKind, TrackRef};
 
+use crate::subtitle_lane::{self, SubtitleGesture};
+
 macro_rules! report {
     ($session:ident, $call:expr $(,)?) => {{
         let result = $call;
@@ -27,8 +29,17 @@ macro_rules! report {
 
 const HEADER_WIDTH: f32 = 210.0;
 const RULER_HEIGHT: f32 = 28.0;
-const ROW_HEIGHT: f32 = 40.0;
-const EDGE_PIXELS: f32 = 8.0;
+pub(crate) const ROW_HEIGHT: f32 = 40.0;
+pub(crate) const EDGE_PIXELS: f32 = 8.0;
+
+/// timeline の UI 状態。ドラッグ中の操作と、shell へ渡す依頼。
+#[derive(Default)]
+pub struct TimelineState {
+    pub gesture: Option<TimelineGesture>,
+    pub subtitle_gesture: Option<SubtitleGesture>,
+    /// 右クリックの「自動字幕を生成」で選んだ clip。shell が文字起こしの dialog を開く。
+    pub transcribe_clip: Option<String>,
+}
 
 pub struct TimelineGesture {
     clip_id: String,
@@ -42,7 +53,7 @@ pub struct TimelineGesture {
     pen: Option<PenPress>,
 }
 
-pub fn show(ui: &mut egui::Ui, session: &mut Session, gesture: &mut Option<TimelineGesture>) {
+pub fn show(ui: &mut egui::Ui, session: &mut Session, state: &mut TimelineState) {
     ui.horizontal_wrapped(|ui| {
         ui.label("タイムライン");
         if ui.button("縮小").clicked() {
@@ -66,16 +77,6 @@ pub fn show(ui: &mut egui::Ui, session: &mut Session, gesture: &mut Option<Timel
             }
         }
     });
-    if let Some(track) = session.project().subtitles.as_ref() {
-        let label = if track.visible {
-            "字幕 表示"
-        } else {
-            "字幕 非表示"
-        };
-        if ui.button(label).clicked() {
-            report!(session, session.toggle_subtitle_visible());
-        }
-    }
 
     let rows = track_rows(session.project());
     let ppf = session.pixels_per_frame();
@@ -97,13 +98,31 @@ pub fn show(ui: &mut egui::Ui, session: &mut Session, gesture: &mut Option<Timel
                     },
                 );
             }
+            if let Some(visible) = session
+                .project()
+                .subtitles
+                .as_ref()
+                .map(|track| track.visible)
+            {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(HEADER_WIDTH, ROW_HEIGHT),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.label("S1");
+                        let label = if visible { "S1 表示" } else { "S1 非表示" };
+                        if ui.button(label).clicked() {
+                            report!(session, session.toggle_subtitle_visible());
+                        }
+                    },
+                );
+            }
         });
 
         egui::ScrollArea::horizontal()
             .id_salt("timeline_scroll")
             .show_viewport(ui, |ui, viewport| {
                 let window = visible_window(viewport.min.x, viewport.width(), ppf);
-                draw_contents(ui, session, gesture, &rows, content_width, window, ppf);
+                draw_contents(ui, session, state, &rows, content_width, window, ppf);
             });
     });
 }
@@ -149,13 +168,14 @@ fn track_buttons(ui: &mut egui::Ui, session: &mut Session, track: TrackRef, name
 fn draw_contents(
     ui: &mut egui::Ui,
     session: &mut Session,
-    gesture: &mut Option<TimelineGesture>,
+    state: &mut TimelineState,
     rows: &[(TrackKind, usize, String)],
     content_width: f32,
     window: TimeWindow,
     ppf: f32,
 ) {
-    let height = RULER_HEIGHT + rows.len() as f32 * ROW_HEIGHT;
+    let lanes = rows.len() + usize::from(session.project().subtitles.is_some());
+    let height = RULER_HEIGHT + lanes as f32 * ROW_HEIGHT;
     let (rect, response) = ui.allocate_exact_size(
         Vec2::new(content_width, height.max(1.0)),
         Sense::click_and_drag(),
@@ -199,7 +219,15 @@ fn draw_contents(
         }
     }
     for clip in visible {
-        draw_clip(ui, session, gesture, &clip, rect.min.x, ppf, rows);
+        draw_clip(ui, session, state, &clip, rect.min.x, ppf, rows);
+    }
+    if session.project().subtitles.is_some() {
+        let y = rect.min.y + RULER_HEIGHT + rows.len() as f32 * ROW_HEIGHT;
+        let lane = Rect::from_min_size(
+            Pos2::new(rect.min.x, y),
+            Vec2::new(rect.width(), ROW_HEIGHT),
+        );
+        subtitle_lane::draw(ui, session, &mut state.subtitle_gesture, lane, window, ppf);
     }
     draw_playhead(ui, rect, session.playhead_frame(), ppf);
     if interval_failed {
@@ -330,7 +358,7 @@ struct VisibleClip {
 fn draw_clip(
     ui: &mut egui::Ui,
     session: &mut Session,
-    gesture: &mut Option<TimelineGesture>,
+    state: &mut TimelineState,
     clip: &VisibleClip,
     origin_x: f32,
     ppf: f32,
@@ -351,6 +379,13 @@ fn draw_clip(
             .truncate()
             .sense(Sense::click_and_drag()),
     );
+    response.context_menu(|ui| {
+        if ui.button("自動字幕を生成").clicked() {
+            state.transcribe_clip = Some(clip.id.clone());
+            ui.close();
+        }
+    });
+    let gesture = &mut state.gesture;
     draw_transitions(ui, session, clip, origin_x, ppf);
     draw_keys(ui, session, clip, rect, ppf);
     if let Some((id, edge)) = session.selected_edge()

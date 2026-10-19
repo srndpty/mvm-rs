@@ -2,12 +2,19 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod audio_adjust_ui;
 mod export_ui;
 mod inspector;
+mod math_ui;
+mod mixer_ui;
 mod preview_ui;
 mod project_panel;
 mod shell;
+mod subtitle_lane;
+mod subtitle_panel;
 mod timeline_ui;
+mod transcribe_ui;
+mod widgets;
 
 use std::path::Path;
 use std::sync::Arc;

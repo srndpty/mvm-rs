@@ -62,6 +62,47 @@ pub fn append_manim_timeline_clip_at(
     commit_candidate(project, candidate, Some(selected))
 }
 
+/// 生成した Manim の動画を asset にする。同じ script・Scene の asset があれば置き換え、その動画を使っていた
+/// Manim clip を新しい動画へ付け替える（素材範囲は新しい動画の長さに収める）。
+pub fn install_manim_asset(
+    project: &mut Project,
+    asset: ManimAsset,
+    source_fps: Rational,
+    source_frame_count: i64,
+) -> EditResult {
+    if !is_canonical_frame_rate(source_fps) || source_frame_count <= 0 {
+        return fail("生成した Manim の動画の fps または長さが不正です");
+    }
+    let mut candidate = project.clone();
+    let previous = candidate.manim_assets.iter().position(|existing| {
+        existing.scene_name == asset.scene_name && existing.script_path == asset.script_path
+    });
+    let old_video =
+        previous.map(|index| candidate.manim_assets[index].generated_video_path.clone());
+    let new_video = asset.generated_video_path.clone();
+    match previous {
+        Some(index) => candidate.manim_assets[index] = asset,
+        None => candidate.manim_assets.push(asset),
+    }
+    let mut selected = None;
+    if let Some(old_video) = old_video {
+        for (index, clip) in candidate.timeline_clips.iter_mut().enumerate() {
+            if clip.kind != TimelineClipKind::Manim || clip.media_path != old_video {
+                continue;
+            }
+            clip.media_path = new_video.clone();
+            clip.source_fps = source_fps;
+            clip.source_frame_count = source_frame_count;
+            clip.source_out_frame = clip.source_out_frame.min(source_frame_count);
+            clip.source_in_frame = clip.source_in_frame.min(clip.source_out_frame - 1).max(0);
+            selected = Some(index);
+        }
+    }
+    finalize_timeline_candidate(&mut candidate)?;
+    *project = candidate;
+    Ok(selected)
+}
+
 /// 解像度と timeline fps を 1 つの transaction で変更する。既存 clip の素材 domain は変えず、timeline 上の位置
 /// （開始・マーカー・イン/アウト・トランジションの長さ・字幕・clip 内の effect key）だけを、秒の位置が保たれるよう
 /// 新 fps へ換算する。key は新しい clip 尺の末尾 frame へ寄せ、同じ frame に重なったものは先の 1 つを残す。
@@ -262,6 +303,32 @@ pub fn set_track_solo(project: &mut Project, track: TrackRef, solo: bool) -> Edi
     }
     project.audio_tracks[track.index].solo = solo;
     Ok(Some(track.index))
+}
+
+/// audio track のミキサー（音量 dB・定位・ミキサーでの名前）を変える。範囲外の値は何も変えずに失敗する。
+/// 名前は前後の空白を除き、空なら track 名で表示する。
+pub fn set_audio_track_mix(
+    project: &mut Project,
+    index: usize,
+    gain_db: f64,
+    pan: f64,
+    mixer_name: &str,
+) -> EditResult {
+    if index >= project.audio_tracks.len() {
+        return fail("track が存在しません");
+    }
+    if !crate::model::is_valid_audio_mix(gain_db, pan) {
+        return fail("トラック音量は -96〜+15 dB、パンは -100〜100 で指定してください");
+    }
+    let name = mixer_name.trim();
+    if name.contains(['\r', '\n']) {
+        return fail("ミキサーの名前に改行は使えません");
+    }
+    let track = &mut project.audio_tracks[index];
+    track.mixer_gain_db = gain_db;
+    track.mixer_pan = pan;
+    track.mixer_name = name.to_owned();
+    Ok(None)
 }
 
 /// track 上の空白 [start, end)。

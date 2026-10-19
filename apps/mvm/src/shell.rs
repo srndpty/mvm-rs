@@ -7,10 +7,22 @@ use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, TextureHandle};
 use mvm_app::{AppError, RecoveryPrompt, Session};
 use mvm_project::timeline::TimelineTool;
 
-use crate::{export_ui, inspector, preview_ui, project_panel, timeline_ui};
+use crate::{
+    audio_adjust_ui, export_ui, inspector, math_ui, mixer_ui, preview_ui, project_panel,
+    subtitle_panel, timeline_ui, transcribe_ui,
+};
 
 /// 自動保存と外部変更の検査は入力が無くても進める。egui は入力が無いと描き直さないので、この間隔で起こす。
 const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// 左パネルの表示。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LeftTab {
+    #[default]
+    Project,
+    Subtitles,
+    Mixer,
+}
 
 #[derive(Clone, Copy)]
 enum FileAction {
@@ -25,9 +37,15 @@ pub struct MvmApp {
     notice: String,
     preview_texture: Option<(u64, TextureHandle)>,
     shown_title: Option<String>,
-    gesture: Option<timeline_ui::TimelineGesture>,
+    timeline: timeline_ui::TimelineState,
+    subtitle_panel: subtitle_panel::SubtitlePanel,
+    transcribe: transcribe_ui::TranscribeDialog,
     inspector: inspector::InspectorState,
     export: export_ui::ExportDialog,
+    audio_adjust: audio_adjust_ui::AudioAdjustDialog,
+    manim: math_ui::ManimDialog,
+    mixer: mixer_ui::MixerState,
+    left_tab: LeftTab,
     text_draft: String,
     recovery_closed: bool,
     external_closed: bool,
@@ -44,15 +62,27 @@ impl MvmApp {
             notice: String::new(),
             preview_texture: None,
             shown_title: None,
-            gesture: None,
+            timeline: timeline_ui::TimelineState::default(),
+            subtitle_panel: subtitle_panel::SubtitlePanel::default(),
+            transcribe: transcribe_ui::TranscribeDialog::default(),
             inspector: inspector::InspectorState::default(),
             export: export_ui::ExportDialog::default(),
+            audio_adjust: audio_adjust_ui::AudioAdjustDialog::default(),
+            manim: math_ui::ManimDialog::default(),
+            mixer: mixer_ui::MixerState::default(),
+            left_tab: LeftTab::default(),
             text_draft: String::new(),
             recovery_closed: false,
             external_closed: false,
             close_approved: false,
             close_now: false,
         }
+    }
+
+    /// 試験が、字幕パネルの本文へ入力する。
+    #[cfg(test)]
+    pub fn subtitle_panel_draft(&mut self, text: &str) {
+        self.subtitle_panel.set_content(text);
     }
 
     /// 試験が、未保存の確認を出す操作を始めるときに使う。
@@ -433,6 +463,40 @@ impl MvmApp {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
+            ui.menu_button("挿入", |ui| {
+                if ui.button("数式").clicked() {
+                    self.perform_edit(Session::add_math_clip);
+                    ui.close();
+                }
+                if ui.button("数式列").clicked() {
+                    self.perform_edit(Session::add_equation_sequence_clip);
+                    ui.close();
+                }
+                if ui.button("グラフ").clicked() {
+                    self.perform_edit(Session::add_graph_clip);
+                    ui.close();
+                }
+                if ui.button("Manim clip").clicked() {
+                    self.manim.open();
+                    ui.close();
+                }
+            });
+            ui.menu_button("音声", |ui| {
+                if ui
+                    .add_enabled(
+                        !self.audio_adjust.is_open(),
+                        egui::Button::new("自動音量調整"),
+                    )
+                    .clicked()
+                {
+                    self.audio_adjust.open(&self.session);
+                    ui.close();
+                }
+                if ui.button("オーディオミキサー").clicked() {
+                    self.left_tab = LeftTab::Mixer;
+                    ui.close();
+                }
+            });
             ui.menu_button("編集", |ui| {
                 if ui
                     .add_enabled(self.session.can_undo(), egui::Button::new("元に戻す"))
@@ -714,6 +778,9 @@ impl MvmApp {
             self.handle_close_request(ui.ctx());
         }
         self.session.poll_maintenance(now_ms);
+        if self.session.poll_math() {
+            ui.ctx().request_repaint();
+        }
         if self.session.recovery_prompt().is_none() {
             self.recovery_closed = false;
         }
@@ -738,12 +805,29 @@ impl MvmApp {
             .resizable(true)
             .default_size(280.0)
             .show(ui, |ui| {
-                timeline_ui::show(ui, &mut self.session, &mut self.gesture);
+                timeline_ui::show(ui, &mut self.session, &mut self.timeline);
             });
         egui::Panel::left("project")
             .resizable(true)
             .default_size(260.0)
-            .show(ui, |ui| project_panel::show(ui, self.session.project()));
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.left_tab, LeftTab::Project, "プロジェクト");
+                    ui.selectable_value(&mut self.left_tab, LeftTab::Subtitles, "字幕");
+                    ui.selectable_value(&mut self.left_tab, LeftTab::Mixer, "ミキサー");
+                });
+                ui.separator();
+                match self.left_tab {
+                    LeftTab::Project => project_panel::show(ui, self.session.project()),
+                    LeftTab::Subtitles => subtitle_panel::show(
+                        ui,
+                        &mut self.session,
+                        &mut self.subtitle_panel,
+                        &mut self.transcribe,
+                    ),
+                    LeftTab::Mixer => mixer_ui::show(ui, &mut self.session, &mut self.mixer),
+                }
+            });
         egui::Panel::right("inspector")
             .resizable(true)
             .default_size(280.0)
@@ -763,6 +847,12 @@ impl MvmApp {
         self.confirm_recovery(ui);
         self.confirm_external(ui);
         export_ui::show(ui, &mut self.session, &mut self.export, &mut self.notice);
+        audio_adjust_ui::show(ui, &mut self.session, &mut self.audio_adjust);
+        if let Some(clip_id) = self.timeline.transcribe_clip.take() {
+            self.transcribe.open(&self.session, Some(clip_id));
+        }
+        transcribe_ui::show(ui, &mut self.session, &mut self.transcribe);
+        math_ui::show_manim_dialog(ui, &mut self.session, &mut self.manim);
         if std::mem::take(&mut self.close_now) {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -1142,5 +1232,75 @@ mod tests {
             "元に戻すで文字 clip が消えません"
         );
         assert!(harness.state().session.project().timeline_clips.is_empty());
+    }
+
+    #[test]
+    fn the_subtitle_panel_adds_a_cue_that_shows_on_the_s1_lane() {
+        let mut harness = harness(MvmApp::new());
+        harness.get_by_label("字幕").click();
+        harness.run();
+        harness.get_by_label("字幕がありません");
+        harness.get_by_label("自動文字起こし");
+        harness.get_by_label("SRT 読み込み");
+        // 本文を入れて「追加」すると、一覧と S1 レーンに出る。
+        harness.state_mut().subtitle_panel_draft("最初の字幕");
+        harness.run();
+        harness.get_by_label("追加").click();
+        // 字幕を足すと preview の描き直しが非同期に届いて画面を起こす。その到着は待たないので、決まった回数
+        // だけ進める（run は repaint が止むまで待ち、届く時機しだいで上限を超える）。
+        harness.run_steps(3);
+        let cues = harness
+            .state()
+            .session
+            .project()
+            .subtitles
+            .as_ref()
+            .map(|track| track.cues.len());
+        assert_eq!(cues, Some(1), "{:?}", harness.state().session.alert());
+        harness.get_by_label("S1 表示");
+        assert!(
+            harness.query_all_by_label("最初の字幕").count() >= 1,
+            "S1 レーンに字幕が出ません"
+        );
+    }
+
+    #[test]
+    fn the_mixer_tab_shows_one_strip_per_audio_track_and_the_master() {
+        let mut harness = harness(MvmApp::new());
+        harness.get_by_label("ミキサー").click();
+        harness.run();
+        // A1 はタイムラインの行名にも出るので、ミキサー側の名前を 1 つ以上あることで数える。
+        assert!(harness.query_all_by_label("A1").count() >= 2);
+        harness.get_by_label("マスター");
+        harness.get_by_label("モニター");
+        assert!(harness.query_all_by_label("消音").count() >= 1);
+    }
+
+    #[test]
+    fn the_insert_menu_places_a_math_clip_and_the_inspector_edits_it() {
+        let mut harness = harness(MvmApp::new());
+        harness.get_by_label("挿入").click();
+        harness.run();
+        harness.get_by_label("数式").click();
+        // 数式を置くと描画の service が動き、確認・描画のたびに画面を起こす。描画の完了は待たないので、
+        // 決まった回数だけ進める（run は repaint が止むまで待つ）。
+        harness.run_steps(3);
+        let session = &harness.state().session;
+        let clip = &session.project().timeline_clips[0];
+        assert_eq!(clip.kind, TimelineClipKind::Math);
+        assert_eq!(session.selected_clip(), Some(clip.id.as_str()));
+        harness.get_by_label("式（LaTeX）");
+        harness.get_by_label("先頭で書いていく（Write）");
+    }
+
+    #[test]
+    fn the_audio_menu_opens_the_automatic_adjustment_dialog() {
+        let mut harness = harness(MvmApp::new());
+        harness.get_by_label("音声").click();
+        harness.run();
+        harness.get_by_label("自動音量調整").click();
+        harness.run();
+        harness.get_by_label("ラウドネスを揃える");
+        harness.get_by_label("解析する");
     }
 }

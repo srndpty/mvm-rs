@@ -5,13 +5,15 @@
 //! preview では「描かない」で済ませている clip を書き出しでは失敗にする検査だけ。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use mvm_core::Rational;
 use mvm_core::output_timebase::OutputTimebase;
+use mvm_math::require_ready;
 use mvm_media::Mp4Settings;
-use mvm_preview::{AudioSpan, audio_spans, output_size, output_timebase};
+use mvm_preview::{AudioSpan, MathLibrary, audio_spans, output_size, output_timebase};
 use mvm_project::timeline::validate_timeline;
-use mvm_project::{Project, TimelineClipKind};
+use mvm_project::{ManimGenerationState, Project, TimelineClipKind};
 
 use crate::error::ExportError;
 
@@ -80,6 +82,8 @@ pub struct ExportPlan {
     pub timebase: OutputTimebase,
     /// 鳴らす音声区間。空なら音声の stream を作らない。
     pub audio_spans: Vec<AudioSpan>,
+    /// 描けた数式。出力する数式・数式列・Graph のラベルは全てここにある（計画の時点で確かめる）。
+    pub math: Arc<MathLibrary>,
 }
 
 impl ExportPlan {
@@ -99,7 +103,11 @@ impl ExportPlan {
 }
 
 /// 書き出しを計画する。書き出せない clip が出力に含まれていれば、始める前に失敗させる。
-pub fn plan_export(project: &Project, request: &ExportRequest) -> Result<ExportPlan, ExportError> {
+pub fn plan_export(
+    project: &Project,
+    request: &ExportRequest,
+    math: Arc<MathLibrary>,
+) -> Result<ExportPlan, ExportError> {
     let output_path = check_output_path(&request.output_path)?;
     let validation =
         validate_timeline(project).map_err(|error| ExportError::failed(error.to_string()))?;
@@ -109,7 +117,7 @@ pub fn plan_export(project: &Project, request: &ExportRequest) -> Result<ExportP
         .timeline_fps
         .reduced()
         .ok_or_else(|| ExportError::failed("timeline の fps が不正です"))?;
-    reject_unsupported_clips(project)?;
+    reject_unrendered_clips(project, &math)?;
     if !has_output(project) {
         return Err(ExportError::failed(
             "書き出す有効な clip または字幕がありません",
@@ -141,6 +149,7 @@ pub fn plan_export(project: &Project, request: &ExportRequest) -> Result<ExportP
         total_samples,
         timebase,
         audio_spans: spans,
+        math,
     })
 }
 
@@ -179,22 +188,25 @@ pub fn temporary_path(output: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// 数式・グラフ・Manim はまだ合成できない。preview は描かずに済ませるが、書き出しで黙って
-/// 抜くと見た目の違う動画ができるので失敗させる。出力しない clip（無効・非表示の track）は問わない。
-fn reject_unsupported_clips(project: &Project) -> Result<(), ExportError> {
+/// 数式・数式列・Graph のラベルの描画が済んでいない、または Manim の動画を生成していない clip が出力に
+/// 含まれていれば失敗させる。preview は描かずに済ませるが、書き出しで黙って抜くと見た目の違う動画ができる。
+/// 出力しない clip（無効・非表示の track）は問わない。
+fn reject_unrendered_clips(project: &Project, math: &MathLibrary) -> Result<(), ExportError> {
+    require_ready(project, math).map_err(|error| ExportError::failed(error.to_string()))?;
     for clip in &project.timeline_clips {
-        if !clip.enabled || !project.is_track_output_enabled(clip.track) {
+        if !clip.enabled
+            || !project.is_track_output_enabled(clip.track)
+            || clip.kind != TimelineClipKind::Manim
+        {
             continue;
         }
-        if matches!(
-            clip.kind,
-            TimelineClipKind::Math
-                | TimelineClipKind::EquationSequence
-                | TimelineClipKind::Graph
-                | TimelineClipKind::Manim
-        ) {
+        let ready = project.manim_assets.iter().any(|asset| {
+            asset.generated_video_path == clip.media_path
+                && asset.generation_state == ManimGenerationState::Ready
+        });
+        if !ready {
             return Err(ExportError::failed(format!(
-                "数式・グラフ・Manim の clip はまだ書き出せません: {}",
+                "Manim の動画が生成されていません: {}",
                 clip.name
             )));
         }
@@ -250,7 +262,7 @@ mod tests {
     }
 
     fn error_of(project: &Project, request: &ExportRequest) -> String {
-        match plan_export(project, request) {
+        match plan_export(project, request, Arc::new(MathLibrary::default())) {
             Ok(plan) => panic!("計画できてしまいました: {} frame", plan.total_frames),
             Err(error) => error.to_string(),
         }
@@ -276,7 +288,12 @@ mod tests {
             ..Project::default()
         };
         project.timeline_clips[1].media_path = PathBuf::from("a.wav");
-        let plan = plan_export(&project, &request("out.mp4")).expect("計画");
+        let plan = plan_export(
+            &project,
+            &request("out.mp4"),
+            Arc::new(MathLibrary::default()),
+        )
+        .expect("計画");
         assert_eq!(plan.total_frames, 120);
         // 60 fps の 1 frame は 48 kHz の 800 sample。
         assert_eq!(plan.total_samples, 120 * 800);
@@ -292,7 +309,12 @@ mod tests {
         );
 
         project.audio_tracks[0].muted = true;
-        let silent = plan_export(&project, &request("out.mp4")).expect("無音");
+        let silent = plan_export(
+            &project,
+            &request("out.mp4"),
+            Arc::new(MathLibrary::default()),
+        )
+        .expect("無音");
         assert!(!silent.has_audio(), "mute した track の音を書き出します");
         assert_eq!(silent.total_samples, 0);
         assert!(!silent.mp4_settings().audio);
@@ -307,7 +329,14 @@ mod tests {
         assert!(error_of(&project, &request("")).contains("指定されていません"));
         assert!(error_of(&project, &request("out.mov")).contains(".mp4"));
         assert!(error_of(&project, &request("out")).contains(".mp4"));
-        assert!(plan_export(&project, &request("OUT.MP4")).is_ok());
+        assert!(
+            plan_export(
+                &project,
+                &request("OUT.MP4"),
+                Arc::new(MathLibrary::default())
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -347,7 +376,8 @@ mod tests {
         };
         let mut unburned = request("out.mp4");
         unburned.burn_subtitles = false;
-        let plan = plan_export(&project, &unburned).expect("字幕だけ");
+        let plan =
+            plan_export(&project, &unburned, Arc::new(MathLibrary::default())).expect("字幕だけ");
         assert_eq!(plan.total_frames, 20);
         assert!(!plan.burn_subtitles);
         assert!(!plan.has_audio());
@@ -364,32 +394,67 @@ mod tests {
         };
         let shown = error_of(&project, &request("out.mp4"));
         assert!(
-            shown.contains("まだ書き出せません") && shown.contains("式"),
+            shown.contains("描画が済んでいません") && shown.contains("式"),
             "{shown}"
         );
 
         project.video_tracks[1].muted = true;
         assert!(
-            plan_export(&project, &request("out.mp4")).is_ok(),
+            plan_export(
+                &project,
+                &request("out.mp4"),
+                Arc::new(MathLibrary::default())
+            )
+            .is_ok(),
             "非表示の track の数式で失敗しました"
         );
         project.video_tracks[1].muted = false;
         project.timeline_clips[1].enabled = false;
         assert!(
-            plan_export(&project, &request("out.mp4")).is_ok(),
+            plan_export(
+                &project,
+                &request("out.mp4"),
+                Arc::new(MathLibrary::default())
+            )
+            .is_ok(),
             "無効にした数式で失敗しました"
         );
+
+        // 描画が済んでいれば計画できる。
+        project.timeline_clips[1].enabled = true;
+        let mut artifact = mvm_math::MathArtifact::default();
+        artifact.sequences.insert(
+            "static".to_owned(),
+            vec![Arc::new(mvm_math::Mask::new(4, 2, vec![255; 8]).unwrap())],
+        );
+        let library = MathLibrary::new(std::collections::HashMap::from([(
+            mvm_math::MathJob::Static(mvm_math::TexSpec {
+                source: "x^2".to_owned(),
+                font_size: project.timeline_clips[1].math.font_size,
+            }),
+            Arc::new(artifact),
+        )]));
+        assert!(plan_export(&project, &request("out.mp4"), Arc::new(library)).is_ok());
     }
 
     #[test]
-    fn pitch_preserved_audio_fails_before_encoding() {
-        let mut audio = clip(TimelineClipKind::Audio, "a", TrackRef::audio(0), 30);
+    fn pitch_preserved_audio_is_planned_like_other_audio() {
+        // 60 frame の素材を 200% で 30 frame にする（等速の clip はピッチ保持を持てない）。
+        let mut audio = clip(TimelineClipKind::Audio, "a", TrackRef::audio(0), 60);
+        audio.speed = Rational::new(2, 1);
         audio.preserve_pitch = true;
         let project = Project {
             timeline_clips: vec![audio],
             ..Project::default()
         };
-        assert!(error_of(&project, &request("out.mp4")).contains("ピッチ保持"));
+        let plan = plan_export(
+            &project,
+            &request("out.mp4"),
+            Arc::new(MathLibrary::default()),
+        )
+        .expect("ピッチ保持の音声");
+        assert!(plan.has_audio());
+        assert_eq!(plan.total_frames, 30);
     }
 
     #[test]

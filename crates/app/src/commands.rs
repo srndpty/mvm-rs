@@ -21,13 +21,13 @@ use mvm_project::{MediaItem, Project, ProjectResult, TimelineClip, TrackKind, Tr
 use crate::error::AppError;
 use crate::session::{Clipboard, Session};
 
-struct IdFactory {
-    serial: u64,
+pub(crate) struct IdFactory {
+    pub(crate) serial: u64,
     used: HashSet<String>,
 }
 
 impl IdFactory {
-    fn next(&mut self) -> String {
+    pub(crate) fn next(&mut self) -> String {
         for _ in 0..1_000_000 {
             let id = format!("c{}", self.serial);
             self.serial = self.serial.saturating_add(1);
@@ -61,12 +61,14 @@ impl Session {
     }
 
     pub fn select_only(&mut self, id: String) {
+        self.subtitle_selection.clear();
         self.selection = vec![id];
         self.selected_edge = None;
         self.selected_marker = None;
     }
 
     pub fn toggle_selected(&mut self, id: String) {
+        self.subtitle_selection.clear();
         if let Some(index) = self.selection.iter().position(|item| item == &id) {
             self.selection.remove(index);
         } else {
@@ -77,12 +79,16 @@ impl Session {
     }
 
     pub fn select_ids(&mut self, ids: Vec<String>) {
+        if !ids.is_empty() {
+            self.subtitle_selection.clear();
+        }
         self.selection = ids;
         self.selected_edge = None;
         self.selected_marker = None;
     }
 
     pub fn select_all(&mut self) {
+        self.subtitle_selection.clear();
         self.selection = self
             .project
             .timeline_clips
@@ -119,9 +125,16 @@ impl Session {
         self.clipboard
             .as_ref()
             .is_some_and(|clipboard| !clipboard.clips.is_empty())
+            || self
+                .subtitle_clipboard
+                .as_ref()
+                .is_some_and(|cues| !cues.is_empty())
     }
 
     pub fn copy_selection(&mut self) -> Result<(), AppError> {
+        if !self.subtitle_selection.is_empty() {
+            return self.copy_subtitles();
+        }
         let clips = self.ordered_selection()?;
         let media = self.media_for(&clips);
         self.clipboard = Some(Clipboard {
@@ -129,6 +142,7 @@ impl Session {
             media,
             fps: self.project.timeline_fps,
         });
+        self.subtitle_clipboard = None;
         Ok(())
     }
 
@@ -138,6 +152,9 @@ impl Session {
     }
 
     pub fn paste(&mut self) -> Result<(), AppError> {
+        if self.subtitle_clipboard.is_some() {
+            return self.paste_subtitles();
+        }
         let Some(clipboard) = self.clipboard.clone() else {
             return Err(AppError::new("貼り付ける clip がありません"));
         };
@@ -157,6 +174,9 @@ impl Session {
     }
 
     pub fn duplicate_selection(&mut self) -> Result<(), AppError> {
+        if !self.subtitle_selection.is_empty() {
+            return self.duplicate_subtitles();
+        }
         let clips = self.ordered_selection()?;
         let media = self.media_for(&clips);
         self.ensure_media_files(&media, &clips)?;
@@ -230,6 +250,10 @@ impl Session {
     }
 
     pub fn delete_selection(&mut self) -> Result<(), AppError> {
+        if !self.subtitle_selection.is_empty() {
+            let ids = self.subtitle_selection.clone();
+            return self.delete_subtitles(&ids);
+        }
         if self.selection.is_empty() {
             let Some(frame) = self.selected_marker else {
                 return Err(AppError::new("削除する clip がありません"));
@@ -646,6 +670,7 @@ impl Session {
         if let Some(index) = selected
             && let Some(clip) = self.project.timeline_clips.get(index)
         {
+            self.subtitle_selection.clear();
             self.selection = vec![clip.id.clone()];
             self.selected_edge = None;
             self.selected_marker = None;
@@ -654,7 +679,7 @@ impl Session {
         Ok(())
     }
 
-    fn edit_with_ids(
+    pub(crate) fn edit_with_ids(
         &mut self,
         edit: impl FnOnce(&mut Project, &mut dyn FnMut() -> String) -> ProjectResult<Option<usize>>,
     ) -> Result<(), AppError> {
@@ -667,7 +692,7 @@ impl Session {
         result
     }
 
-    fn id_factory(&self) -> IdFactory {
+    pub(crate) fn id_factory(&self) -> IdFactory {
         let mut used = HashSet::new();
         for clip in &self.project.timeline_clips {
             used.insert(clip.id.clone());
@@ -680,6 +705,11 @@ impl Session {
         }
         for folder in &self.project.media_folders {
             used.insert(folder.id.clone());
+        }
+        if let Some(track) = &self.project.subtitles {
+            for cue in &track.cues {
+                used.insert(cue.id.clone());
+            }
         }
         IdFactory {
             serial: self.id_serial,

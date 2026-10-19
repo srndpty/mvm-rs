@@ -13,6 +13,7 @@ publish = false
 mvm-core = { path = "crates/core" }
 mvm-export = { path = "crates/export" }
 mvm-gpu = { path = "crates/gpu" }
+mvm-math = { path = "crates/math" }
 mvm-media = { path = "crates/media" }
 mvm-platform = { path = "crates/platform" }
 mvm-preview = { path = "crates/preview" }

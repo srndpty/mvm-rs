@@ -2,21 +2,37 @@
 //!
 //! 編集の判定は project、画素の合成は preview が行う。ここは command と、その結果の状態だけを持つ。
 
+mod audio_adjust;
 mod autosave;
+mod background;
 mod commands;
 mod error;
 mod export;
 mod files;
 mod history;
+mod manim_clip;
+mod math;
+mod math_commands;
+mod mixer;
+mod preferences;
 mod recovery_pump;
 mod session;
+mod subtitles;
 mod timeline_view;
+mod transcribe;
 
+pub use audio_adjust::{AudioAdjustmentClipReport, AudioAdjustmentOutcome};
 pub use error::AppError;
+pub use math::MathClipStatus;
 pub use mvm_export::{ExportError, ExportProgress, ExportQuality, ExportRequest, ExportSummary};
-pub use mvm_preview::PreviewImage;
+pub use mvm_preview::{MeterPeaks, PreviewImage};
+pub use mvm_project::audio_adjustment::AudioAdjustmentSettings;
+pub use preferences::Preferences;
 pub use session::{RecoveryPrompt, Session};
 pub use timeline_view::{
     MAX_PIXELS_PER_FRAME, MIN_PIXELS_PER_FRAME, TimeWindow, clamp_pixels_per_frame,
     display_span_frames, ranges_overlap, ruler_step, visible_window,
+};
+pub use transcribe::{
+    MAXIMUM_PROMPT_CHARS, TranscriptionOutcome, TranscriptionRequest, TranscriptionSource,
 };

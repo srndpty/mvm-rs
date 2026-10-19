@@ -32,7 +32,7 @@ fn stopped_preview_shows_the_requested_frame() {
     };
     let mut preview = StillPreview::new().expect("DX12 device がありません");
     for frame in [0_i64, 17, 2, 17] {
-        let plan = plan_frame(&project, frame).expect("計画");
+        let plan = plan_frame(&project, frame, &mvm_preview::MathLibrary::default()).expect("計画");
         let image = preview.render(&project, frame, &plan).expect("合成");
         assert_eq!((image.width, image.height), (1920, 1080));
         let stride = usize::try_from(image.width).expect("幅") * 4;

@@ -82,6 +82,59 @@ impl AudioAdjustmentSettings {
     pub fn targets_track(&self, track: i32) -> bool {
         track == self.bgm_track || self.voice_tracks.contains(&track)
     }
+
+    /// Project の `last_audio_adjustment_settings` に書く JSON（C++ 版と同じ key）。
+    pub fn to_json(&self) -> String {
+        serde_json::json!({
+            "voiceTracks": self.voice_tracks,
+            "bgmTrack": self.bgm_track,
+            "normalize": self.normalize,
+            "duck": self.duck,
+            "voiceLufs": self.voice_lufs,
+            "bgmLufs": self.bgm_lufs,
+            "reductionDb": self.reduction_db,
+            "thresholdDb": self.threshold_db,
+            "attackMs": self.attack_ms,
+            "holdMs": self.hold_ms,
+            "releaseMs": self.release_ms,
+        })
+        .to_string()
+    }
+
+    /// `to_json` の逆。形が違う・値が欠けたものは失敗する（既定値で埋めない）。
+    pub fn from_json(text: &str) -> ProjectResult<Self> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Dto {
+            voice_tracks: Vec<i32>,
+            bgm_track: i32,
+            normalize: bool,
+            duck: bool,
+            voice_lufs: f64,
+            bgm_lufs: f64,
+            reduction_db: f64,
+            threshold_db: f64,
+            attack_ms: i32,
+            hold_ms: i32,
+            release_ms: i32,
+        }
+        let dto: Dto = serde_json::from_str(text).map_err(|error| {
+            crate::error::ProjectError::new(format!("自動音量調整の設定を読めません: {error}"))
+        })?;
+        Ok(Self {
+            voice_tracks: dto.voice_tracks,
+            bgm_track: dto.bgm_track,
+            normalize: dto.normalize,
+            duck: dto.duck,
+            voice_lufs: dto.voice_lufs,
+            bgm_lufs: dto.bgm_lufs,
+            reduction_db: dto.reduction_db,
+            threshold_db: dto.threshold_db,
+            attack_ms: dto.attack_ms,
+            hold_ms: dto.hold_ms,
+            release_ms: dto.release_ms,
+        })
+    }
 }
 
 /// 重なり・接する区間をまとめる。空の区間は捨てる。
@@ -350,6 +403,24 @@ mod tests {
             start_sample: start,
             end_sample: end,
         }
+    }
+
+    #[test]
+    fn settings_round_trip_through_the_cpp_keys() {
+        let settings = AudioAdjustmentSettings {
+            voice_tracks: vec![0, 2],
+            bgm_track: 1,
+            reduction_db: 9.5,
+            ..AudioAdjustmentSettings::default()
+        };
+        let text = settings.to_json();
+        assert!(text.contains("\"voiceTracks\":[0,2]"), "{text}");
+        assert!(text.contains("\"bgmTrack\":1"), "{text}");
+        assert_eq!(AudioAdjustmentSettings::from_json(&text).unwrap(), settings);
+        // 欠けた key・未知の key は既定値で埋めずに失敗する。
+        assert!(AudioAdjustmentSettings::from_json("{\"bgmTrack\":1}").is_err());
+        let extra = text.replacen('{', "{\"other\":1,", 1);
+        assert!(AudioAdjustmentSettings::from_json(&extra).is_err());
     }
 
     #[test]

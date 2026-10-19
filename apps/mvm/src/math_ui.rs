@@ -296,9 +296,10 @@ fn equation(
                 && let Some((begin, end)) = selection
             {
                 let label = std::mem::take(&mut state.part_label);
+                let selected = state.sources.get(index).cloned().unwrap_or_default();
                 report!(
                     session,
-                    session.add_equation_part(&clip.id, &item.id, begin, end, &label)
+                    session.add_equation_part(&clip.id, &item.id, &selected, (begin, end), &label)
                 );
             }
         });

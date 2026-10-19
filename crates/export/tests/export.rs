@@ -22,6 +22,15 @@ use mvm_project::{
 };
 use mvm_testkit::{read_frame_marker, smoke_dir};
 
+/// この file の試験は実 GPU の device と D3D12VA の decoder を作る。並行に作ると D3D12VA の初期化が
+/// 時々 `Invalid argument` で失敗する（[事実] 2026-10-20、6 本を並行に走らせて 3 回中 2 回）ので、
+/// 1 本ずつ走らせる。
+static GPU: Mutex<()> = Mutex::new(());
+
+fn gpu() -> std::sync::MutexGuard<'static, ()> {
+    GPU.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
 /// 画素の平均差（0..=255）の上限。CRF 18 の H.264 と YUV420 の往復で生じる差だけを許す。
 const PARITY_MEAN_LIMIT: f64 = 3.0;
 
@@ -136,6 +145,7 @@ fn mean_difference(left: &PreviewImage, right: &PreviewImage) -> f64 {
 #[test]
 #[ignore = "workstation"]
 fn export_matches_the_preview_and_the_hand_computed_source_frames() {
+    let _gpu = gpu();
     let media = smoke("v1080p60_h264.mp4");
     let dir = work_dir("parity");
     let output = dir.join("parity.mp4");
@@ -213,6 +223,7 @@ fn export_matches_the_preview_and_the_hand_computed_source_frames() {
 #[test]
 #[ignore = "workstation"]
 fn exported_audio_follows_the_clip_volume_and_the_track_pan() {
+    let _gpu = gpu();
     let media = smoke("wav_48k.wav");
     let dir = work_dir("audio");
     let output = dir.join("audio.mp4");
@@ -274,6 +285,7 @@ fn exported_audio_follows_the_clip_volume_and_the_track_pan() {
 #[test]
 #[ignore = "workstation"]
 fn burned_subtitles_appear_only_inside_the_cue() {
+    let _gpu = gpu();
     let dir = work_dir("subtitle");
     let project = Project {
         subtitles: Some(SubtitleTrack {
@@ -333,6 +345,7 @@ fn burned_subtitles_appear_only_inside_the_cue() {
 #[test]
 #[ignore = "workstation"]
 fn cancelling_or_failing_leaves_no_file_behind() {
+    let _gpu = gpu();
     let media = smoke("v1080p60_h264.mp4");
     let dir = work_dir("cancel");
     let output = dir.join("cancelled.mp4");
@@ -431,6 +444,7 @@ fn render_with(project: &Project, frames: i64, math: &MathLibrary) -> Vec<Previe
 #[test]
 #[ignore = "workstation"]
 fn math_clips_are_exported_with_the_rendered_masks() {
+    let _gpu = gpu();
     use mvm_math::{MathService, MathStatus, wanted_jobs};
     use mvm_project::math_clip::{MathClipAnimation, MathClipData, MathIntroKind};
 
@@ -533,6 +547,7 @@ fn math_clips_are_exported_with_the_rendered_masks() {
 #[test]
 #[ignore = "workstation"]
 fn graph_clips_are_exported_like_the_preview() {
+    let _gpu = gpu();
     use mvm_project::graph_clip::{GraphClipData, GraphFunction, GraphFunctionId};
 
     let dir = work_dir("graph");

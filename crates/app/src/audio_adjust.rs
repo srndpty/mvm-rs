@@ -136,8 +136,10 @@ impl Session {
     }
 
     /// 解析の結果を 1 回の undo で適用する。解析の後に Project を変えていたら拒否する。
+    /// 結果は適用に成功したときだけ消費する。拒否・失敗では残し（UI が結果を見せ続けられる）、古い結果は
+    /// 何度でも拒否する。
     pub fn apply_audio_adjustment(&mut self) -> Result<(), AppError> {
-        let Some(outcome) = self.background.audio_adjust_result.take() else {
+        let Some(outcome) = self.background.audio_adjust_result.as_ref() else {
             return Err(AppError::new("適用する解析の結果がありません"));
         };
         if outcome.base_revision != self.edit_revision {
@@ -145,11 +147,13 @@ impl Session {
                 "解析の後に Project が変わりました。もう一度解析してください",
             ));
         }
-        let candidate = outcome.candidate;
+        let candidate = outcome.candidate.clone();
         self.transact(move |project| {
             *project = candidate;
             Ok(None)
-        })
+        })?;
+        self.background.audio_adjust_result = None;
+        Ok(())
     }
 }
 
@@ -620,12 +624,19 @@ mod tests {
             session.apply_audio_adjustment().is_err(),
             "編集後の適用を通しました"
         );
+        // 拒否しても結果は残り（UI が見せ続けられる）、何度でも拒否する。
+        assert!(session.audio_adjustment_result().is_some());
+        assert!(session.apply_audio_adjustment().is_err());
 
         session.background.audio_adjust_result = Some(AudioAdjustmentOutcome {
             base_revision: session.edit_revision,
             ..outcome
         });
         session.apply_audio_adjustment().unwrap();
+        assert!(
+            session.audio_adjustment_result().is_none(),
+            "適用した結果が残りました"
+        );
         assert!(
             session
                 .project

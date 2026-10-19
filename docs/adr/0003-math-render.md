@@ -37,9 +37,20 @@ frame の絵を決める。
 
 ### Manim clip
 
-利用者の script の Scene を Project の寸法・fps の mp4 にし（`manim render --format mp4`）、
-`<Project の directory>/cache/manim/<hash>.mp4` に置いて動画の clip として扱う。同じ script・Scene を
-生成し直すと asset と clip の動画を置き換える。
+利用者の script の Scene を Project の寸法・fps の mp4 にし（`manim render --format mp4`）、動画の clip として扱う。
+
+- 描く前に script を同じ directory の一時 file（`.mvm-snapshot-*.py`）へ写し、写しの SHA-256 を fingerprint に
+  して Manim にも写しを渡す。hash を取った後に script を書き換えても、fingerprint と描いた動画は食い違わない。
+  同じ directory なので隣の module の import は動くが、import する module・画像などの依存 file は fingerprint に
+  入らない（追跡しない）。
+- 生成した動画は `<Project の directory>/cache/manim/<動画の中身の SHA-256>.mp4` に公開し、公開した file は
+  上書きしない（一時名へ書き切ってから、既存の file を置き換えない hard link で公開する）。同じ中身なら既存の
+  file を使い、違う中身なら別の file になる。生成し直すと asset と clip の参照を新しい file へ切り替える
+  （1 回の undo）。undo で前の参照へ戻ると、前の動画がそのまま使われる。公開した動画は消さない
+  （undo の履歴や保存した Project が参照し得るため。掃除は手で行う）。
+- 生成を始めたときの Project（読み込みの番号・保存先・寸法・fps）と置く位置（開始時の再生ヘッド）を覚え、
+  適用の直前に照合する。生成中に別の Project を開いた・保存先を変えた・寸法や fps を変えた場合は適用しない。
+  Project を開く・作るときは、走っている生成（と文字起こし・自動音量の解析）を取り消して捨てる。
 
 ### 書き出し
 
@@ -53,7 +64,12 @@ frame の絵を決める。
 - workstation 試験（`#[ignore = "workstation"]`、Manim と MiKTeX が要る）:
   - `mvm-math` の `renders_with_the_real_manim_and_reads_the_cache_back`（静止・Write・TeX の誤りの分類・
     cache の読み直し）、`renders_transforms_and_equation_sequences_with_the_real_manim`（変形の 0 枚目が
-    静止と同じ位置、数式列の全連番）、`renders_a_scene_to_an_mp4_with_the_real_manim`。
+    静止と同じ位置、数式列の全連番）、`renders_a_scene_to_an_mp4_with_the_real_manim`、
+    `the_rendered_video_matches_the_fingerprinted_script_even_if_it_changes`（生成の開始直後に script を
+    書き換えても、0.5 秒の元の Scene が描かれ fingerprint も元の内容。書き換えた script は別の file になり、
+    前の動画の bytes は変わらない）。
+- 通常の試験: 公開した動画を上書きしない（同じ中身の再利用・違う中身の別 file・名前と中身の食い違いの拒否）、
+  再生成 → undo → redo で参照が戻る・進む、別の Project・寸法・fps の生成結果を適用しない。
   - `mvm-export` の `math_clips_are_exported_with_the_rendered_masks`（Write の進みと静止の式が MP4 に出る、
     preview との平均差、描画が無ければ計画で拒否）と `graph_clips_are_exported_like_the_preview`。
 - [事実] 2026-10-19、Manim Community v0.21.0・MiKTeX-pdfTeX 4.27（MiKTeX 26.5）・dvisvgm 3.6 で上の

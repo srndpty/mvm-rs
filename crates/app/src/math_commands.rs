@@ -173,21 +173,28 @@ impl Session {
         })
     }
 
-    /// 式の byte 範囲 [begin, end) を部分式にする。
+    /// 式の byte 範囲 [begin, end) を部分式にする。`selected_source` は範囲を選んだ式（編集欄の文字列）で、
+    /// 確定済みの式と一致するときだけ受け付ける（未確定の式の位置で別の文字へ結び付けない）。
     pub fn add_equation_part(
         &mut self,
         clip_id: &str,
         state: &StateId,
-        begin: usize,
-        end: usize,
+        selected_source: &str,
+        (begin, end): (usize, usize),
         label: &str,
     ) -> Result<(), AppError> {
         let state = state.clone();
         let label = label.trim().to_owned();
+        let selected_source = selected_source.to_owned();
         self.edit_equation(clip_id, move |data, new_id, height| {
             let Some(target) = data.states.iter().find(|item| item.id == state) else {
                 return Err(mvm_project::ProjectError::new("状態が存在しません"));
             };
+            if target.equation.source != selected_source {
+                return Err(mvm_project::ProjectError::new(
+                    "式が確定していません。式を確定してから範囲を選んでください",
+                ));
+            }
             let Some(text) = target.equation.source.get(begin..end) else {
                 return Err(mvm_project::ProjectError::new("部分式の範囲が式の外です"));
             };
@@ -400,9 +407,14 @@ mod tests {
         session
             .set_equation_source(&clip.id, &second, "x + x + x = 3x")
             .unwrap();
-        // "3x" は byte 12..14。
+        // "3x" は byte 12..14。未確定の式（編集欄だけ書き換えた式）で選んだ範囲は受け付けない。
+        assert!(
+            session
+                .add_equation_part(&clip.id, &second, "x + x + x = 4x", (12, 14), "")
+                .is_err()
+        );
         session
-            .add_equation_part(&clip.id, &second, 12, 14, "")
+            .add_equation_part(&clip.id, &second, "x + x + x = 3x", (12, 14), "")
             .unwrap();
         let data = selected_clip(&session).equation_sequence;
         let part = data.states[1].parts[0].clone();
@@ -416,7 +428,7 @@ mod tests {
         // 範囲外の部分式は拒否する。
         assert!(
             session
-                .add_equation_part(&clip.id, &second, 12, 99, "")
+                .add_equation_part(&clip.id, &second, "x + x + x = 3x", (12, 99), "")
                 .is_err()
         );
         session.delete_equation_action(&clip.id, &action).unwrap();

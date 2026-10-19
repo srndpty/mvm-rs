@@ -27,6 +27,8 @@ use crate::session::Session;
 static JOB_SERIAL: AtomicU64 = AtomicU64::new(1);
 /// 語彙ヒントの上限（文字）。
 pub const MAXIMUM_PROMPT_CHARS: usize = 200;
+/// 区間の終端が音声の末尾を越えてよい量。Whisper の窓の無音の分を末尾へ丸める範囲。
+pub const TAIL_TOLERANCE_MS: i64 = 1_000;
 /// 1 回の認識の上限時間。
 const RECOGNITION_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 
@@ -290,8 +292,12 @@ struct WhisperOffsets {
     to: i64,
 }
 
-/// whisper-cli の JSON から区間を読む。最後の区間の終端だけは音声の長さへ丸める（30 秒の窓へ足した無音の分）。
-/// 開始が音声の外・重なり・空の結果は失敗にする。
+/// whisper-cli の JSON から区間を読む。
+///
+/// Whisper は 30 秒の窓へ無音を足して処理するので、最後の区間の終端が音声の末尾を少し越えることがある
+/// （[事実] C++ 版の実測で 7850 ms の音声に 8360 ms）。終端の超過が [`TAIL_TOLERANCE_MS`] 以内なら末尾へ
+/// 丸め、それより大きい超過は誤った時刻として拒否する。開始が音声の外・終端が開始以前・前の区間との重なり・
+/// 空の結果も失敗にする。
 fn parse_whisper_json(
     text: &str,
     audio_ms: i64,
@@ -311,14 +317,20 @@ fn parse_whisper_json(
             continue;
         }
         let start = segment.offsets.from;
-        let mut end = segment.offsets.to;
-        if start < audio_ms {
-            end = end.min(audio_ms);
-        }
+        let reported_end = segment.offsets.to;
         let overlaps = segments.last().is_some_and(|last| start < last.end_ms);
-        if start < 0 || end <= start || end > audio_ms || overlaps {
-            return Err(AppError::new("認識結果の時刻区間が不正です"));
+        if start < 0 || start >= audio_ms || reported_end <= start || overlaps {
+            return Err(AppError::new(format!(
+                "認識結果の時刻区間が不正です（{start}〜{reported_end} ms、音声は {audio_ms} ms）"
+            )));
         }
+        if reported_end > audio_ms + TAIL_TOLERANCE_MS {
+            return Err(AppError::new(format!(
+                "認識結果の終端が音声の末尾を {} ms 越えています（{start}〜{reported_end} ms、音声は {audio_ms} ms）",
+                reported_end - audio_ms
+            )));
+        }
+        let end = reported_end.min(audio_ms);
         segments.push(SubtitleTimedText {
             start_ms: start,
             end_ms: end,
@@ -507,7 +519,7 @@ fn run_whisper(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use mvm_project::{MediaItem, MediaKind, Project, TimelineClip, TrackRef};
+    use mvm_project::{MediaItem, MediaKind, Project, SubtitleCue, TimelineClip, TrackRef};
 
     use super::*;
 
@@ -539,11 +551,62 @@ mod tests {
         assert!(parse_whisper_json(&overlap, 7850, "ja").is_err());
         let outside = json(&[(8000, 9000, "a")], true);
         assert!(parse_whisper_json(&outside, 7850, "ja").is_err());
+        // 末尾の超過は 1000 ms まで丸め、それより大きい超過は誤りとして拒否する。
+        let edge = json(&[(9000, 11000, "a")], true);
+        assert_eq!(
+            parse_whisper_json(&edge, 10000, "ja").unwrap()[0].end_ms,
+            10000
+        );
+        let runaway = json(&[(9000, 90000, "a")], true);
+        let error = parse_whisper_json(&runaway, 10000, "ja").unwrap_err();
+        assert!(error.message().contains("越えています"), "{error}");
+        let starts_at_end = json(&[(10000, 10500, "a")], true);
+        assert!(parse_whisper_json(&starts_at_end, 10000, "ja").is_err());
         let blank = json(&[(0, 1000, "  ")], true);
         assert!(parse_whisper_json(&blank, 7850, "ja").is_err());
         let english_only = json(&[(0, 1000, "a")], false);
         assert!(parse_whisper_json(&english_only, 7850, "ja").is_err());
         assert!(parse_whisper_json(&english_only, 7850, "en").is_ok());
+    }
+
+    #[test]
+    fn candidates_are_refused_after_an_edit_or_a_replaced_source() {
+        let directory =
+            std::env::temp_dir().join(format!("mvm-transcribe-swap-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let media = directory.join("voice.wav");
+        std::fs::write(&media, b"first").unwrap();
+        let mut session = Session::from_project(Project::default());
+        let outcome = |session: &Session| TranscriptionOutcome {
+            cues: vec![SubtitleCue {
+                id: "candidate-1".to_owned(),
+                start_frame: 0,
+                end_frame: 30,
+                content: "候補".to_owned(),
+                link_clip_id: String::new(),
+            }],
+            base_revision: session.edit_revision,
+            media: media.clone(),
+            media_probe: probe_file(&media),
+        };
+        // 認識の後に素材を差し替えた（大きさが変わった）。
+        session.background.transcription_result = Some(outcome(&session));
+        std::fs::write(&media, b"replaced").unwrap();
+        let error = session.apply_transcription(true).unwrap_err();
+        assert!(error.message().contains("素材が変わりました"), "{error}");
+        assert!(session.project().subtitles.is_none());
+        // 認識の後に Project を編集した。
+        session.background.transcription_result = Some(outcome(&session));
+        session.add_marker().unwrap();
+        assert!(session.apply_transcription(true).is_err());
+        assert!(session.project().subtitles.is_none());
+        // どちらも変わっていなければ適用できる（候補の仮の ID は発行し直す）。
+        session.background.transcription_result = Some(outcome(&session));
+        session.apply_transcription(true).unwrap();
+        let cues = &session.project().subtitles.as_ref().unwrap().cues;
+        assert_eq!(cues.len(), 1);
+        assert_ne!(cues[0].id, "candidate-1");
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

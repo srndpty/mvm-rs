@@ -30,6 +30,9 @@
 - 数式列の editor は、状態の式・表示時間・変形の尺・部分式（式の欄の選択から）・対応・強調の追加と削除だけを
   持つ。状態の並べ替え・部分式の名前の変更・外れた部分式の付け直しは project の関数はあるが UI が無い。
 - Manim clip の script が変わったか（fingerprint）を開いたときに確かめていない。「再生成」で描き直す。
+- Manim clip の fingerprint は script の 1 file だけで、import する module や画像などの依存 file を追跡しない。
+- 公開した Manim の動画（`cache/manim/`）を消す手段が無い。どの Project・undo の履歴からも参照されない file を
+  見つけて消す掃除を足す。
 
 ## 字幕・文字起こし
 

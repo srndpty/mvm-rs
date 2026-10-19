@@ -9,7 +9,7 @@ use std::thread::JoinHandle;
 
 use crate::audio_adjust::AudioAdjustmentOutcome;
 use crate::error::AppError;
-use crate::manim_clip::ManimClipOutcome;
+use crate::manim_clip::{ManimClipOutcome, ManimTarget};
 use crate::transcribe::TranscriptionOutcome;
 
 /// session が持つ背景の作業と、その結果のうち UI がまだ確かめていないもの。
@@ -19,7 +19,10 @@ pub(crate) struct BackgroundWork {
     pub audio_adjust_result: Option<AudioAdjustmentOutcome>,
     pub transcription: Option<BackgroundJob<Result<TranscriptionOutcome, AppError>>>,
     pub transcription_result: Option<TranscriptionOutcome>,
-    pub manim: Option<BackgroundJob<Result<ManimClipOutcome, AppError>>>,
+    pub manim: Option<(
+        BackgroundJob<Result<ManimClipOutcome, AppError>>,
+        ManimTarget,
+    )>,
 }
 
 /// 作業の側から見た取消と進捗。

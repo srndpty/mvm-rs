@@ -19,6 +19,8 @@ use crate::error::PreviewError;
 const STRETCH_CHUNK: usize = 4800;
 
 /// 再生中の音量の表示。mix が書き、UI が読んで空にする。値は直前の読み出しから後の絶対値の最大。
+/// track は clip の音量・定位・track の gain を掛けた寄与の最大、master はそれらを足した mix の最大で、
+/// どちらもモニター音量を掛ける前の値（書き出しと同じ音）。
 #[derive(Debug, Default)]
 pub struct AudioMeters {
     peaks: Mutex<MeterPeaks>,
@@ -102,13 +104,14 @@ pub fn start_audio(
             mixer
                 .mix(start, samples)
                 .map_err(|error| error.to_string())?;
+            // メーターは track も master も mix の値（モニター音量を掛ける前）で測る。
+            mixer.record_master(samples);
             let gain = monitor.get();
             if gain != 1.0 {
                 for sample in samples.iter_mut() {
                     *sample *= gain;
                 }
             }
-            mixer.record_master(samples);
             Ok(())
         });
         if let Err(error) = result {
@@ -122,6 +125,8 @@ pub fn start_audio(
 struct Stretch {
     next_timeline: i64,
     source_cursor: i64,
+    /// clip の素材範囲の終わり（含まない）。ここから先の素材は入れない。
+    source_end: i64,
     stretcher: TimeStretcher,
     pending: Vec<f32>,
     finished: bool,
@@ -275,9 +280,14 @@ impl AudioMixer {
                 return Err(PreviewError::new("clip の速度が不正です"));
             }
             let tempo = span.speed_num as f64 / span.speed_den as f64;
+            // clip の最後の timeline sample が使う素材 sample の次まで（素材範囲の外を混ぜない）。
+            let source_end = source_sample(span, span.timeline_end_sample - 1)?
+                .map_or(cursor, |last| last + 1)
+                .max(cursor);
             self.stretches[index] = Some(Stretch {
                 next_timeline: from,
                 source_cursor: cursor,
+                source_end,
                 stretcher: TimeStretcher::new(tempo)
                     .map_err(|error| PreviewError::new(error.to_string()))?,
                 pending: Vec::new(),
@@ -291,38 +301,51 @@ impl AudioMixer {
         let state = self.stretches[index]
             .as_mut()
             .ok_or_else(|| PreviewError::new("time stretch の状態がありません"))?;
-        // 素材の終端より先は無音を入れる。出力が要る長さに届かない stretcher は壊れているので、
-        // 入れた量に上限を設けて止める（無限に待たない）。
+        // 素材は clip の素材範囲の終わりまでだけ入れ、そこで stretcher を閉じて残りを出し切る（範囲の外の
+        // 音を混ぜない）。出し切っても足りない分は無音。出力が要る長さに届かない stretcher は壊れているので、
+        // 繰り返しに上限を設けて止める（無限に待たない）。
         let tempo = span.speed_num as f64 / span.speed_den as f64;
-        let budget = (length as f64 * tempo) as usize + 48_000 * 4;
-        let mut fed = 0usize;
+        let budget = (length as f64 * tempo) as usize / STRETCH_CHUNK + 64;
+        let mut rounds = 0usize;
         let mut left = vec![0f32; STRETCH_CHUNK];
         let mut right = vec![0f32; STRETCH_CHUNK];
-        let mut interleaved = vec![0f32; STRETCH_CHUNK * 2];
+        let mut interleaved = Vec::with_capacity(STRETCH_CHUNK * 2);
         while state.pending.len() < length * 2 && !state.finished {
-            if fed > budget {
+            rounds += 1;
+            if rounds > budget {
                 return Err(PreviewError::new("ピッチ保持の音声が出力されません"));
             }
-            stream
-                .copy_from(state.source_cursor, &mut left, &mut right)
-                .map_err(|error| PreviewError::new(error.to_string()))?;
-            for (at, (l, r)) in left.iter().zip(&right).enumerate() {
-                interleaved[at * 2] = *l;
-                interleaved[at * 2 + 1] = *r;
+            let remaining = state.source_end.saturating_sub(state.source_cursor).max(0);
+            let count = usize::try_from(remaining)
+                .unwrap_or(usize::MAX)
+                .min(STRETCH_CHUNK);
+            if count == 0 {
+                state
+                    .stretcher
+                    .finish()
+                    .map_err(|error| PreviewError::new(error.to_string()))?;
+            } else {
+                stream
+                    .copy_from(state.source_cursor, &mut left[..count], &mut right[..count])
+                    .map_err(|error| PreviewError::new(error.to_string()))?;
+                interleaved.clear();
+                for (l, r) in left[..count].iter().zip(&right[..count]) {
+                    interleaved.push(*l);
+                    interleaved.push(*r);
+                }
+                state
+                    .stretcher
+                    .push(&interleaved)
+                    .map_err(|error| PreviewError::new(error.to_string()))?;
+                state.source_cursor = state
+                    .source_cursor
+                    .checked_add(count as i64)
+                    .ok_or_else(|| PreviewError::new("素材 sample が overflow しました"))?;
             }
-            state
-                .stretcher
-                .push(&interleaved)
-                .map_err(|error| PreviewError::new(error.to_string()))?;
             state.finished = state
                 .stretcher
                 .pull(&mut state.pending)
                 .map_err(|error| PreviewError::new(error.to_string()))?;
-            state.source_cursor = state
-                .source_cursor
-                .checked_add(STRETCH_CHUNK as i64)
-                .ok_or_else(|| PreviewError::new("素材 sample が overflow しました"))?;
-            fed += STRETCH_CHUNK;
         }
         let take = (length * 2).min(state.pending.len());
         let mut out: Vec<f32> = state.pending.drain(..take).collect();
@@ -486,6 +509,67 @@ mod tests {
             .filter(|(left, right)| (*left - *right).abs() > 1e-6)
             .count();
         assert_eq!(differing, 0, "区切りの違いで出力が変わりました");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// 素材の 0.5〜1.5 秒を切り出した clip の直後（1.5〜1.6 秒）に大きな音を置き、ピッチ保持の 0.5 倍速・
+    /// 2 倍速で、出力に範囲の外の音が混ざらないことを確かめる。区切りの大きさにも依らない。
+    #[test]
+    fn pitch_preserved_trim_never_reads_past_the_source_range() {
+        let directory = std::env::temp_dir().join(format!("mvm-mix-trim-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let samples: Vec<f32> = (0..96_000)
+            .flat_map(|index| {
+                let value = if (72_000..76_800).contains(&index) {
+                    0.9
+                } else {
+                    ((index as f64 * 440.0 * std::f64::consts::TAU / 48_000.0).sin() * 0.1) as f32
+                };
+                [value, value]
+            })
+            .collect();
+        let path = directory.join("loud-after.wav");
+        mvm_media::write_pcm16_wav(&path, 48_000, 2, &samples).unwrap();
+        for (num, den) in [(1, 2), (2, 1)] {
+            // 素材 frame 30..90（60 fps で 0.5〜1.5 秒）。
+            let clip = TimelineClip {
+                kind: TimelineClipKind::Audio,
+                media_path: path.clone(),
+                name: "trim".to_owned(),
+                id: "trim".to_owned(),
+                media_item_id: "item".to_owned(),
+                source_fps: Rational::new(60, 1),
+                source_frame_count: 120,
+                source_in_frame: 30,
+                source_out_frame: 90,
+                track: TrackRef::audio(0),
+                speed: Rational::new(num, den),
+                preserve_pitch: true,
+                ..TimelineClip::default()
+            };
+            let project = Project {
+                timeline_clips: vec![clip],
+                ..Project::default()
+            };
+            let spans = audio_spans(&project).unwrap();
+            let end = spans[0].timeline_end_sample;
+            let timebase = output_timebase(&project).unwrap();
+            for block in [480usize, 4096, 96_000] {
+                let mut mixer =
+                    AudioMixer::open(spans.clone(), timebase, project.timeline_fps).unwrap();
+                let mut out = vec![0f32; usize::try_from(end).unwrap() * 2];
+                for (index, chunk) in out.chunks_mut(block * 2).enumerate() {
+                    mixer.mix((index * block) as i64, chunk).unwrap();
+                }
+                let peak = out.iter().fold(0f32, |peak, value| peak.max(value.abs()));
+                assert!(
+                    peak < 0.3,
+                    "速度 {num}/{den}・区切り {block}: 範囲の外の音が混ざりました（peak {peak}）"
+                );
+                let energy: f32 = out.iter().map(|value| value * value).sum();
+                assert!(energy > 1.0, "速度 {num}/{den}: 音が出ていません");
+            }
+        }
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

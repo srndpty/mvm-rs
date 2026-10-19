@@ -84,6 +84,8 @@ pub struct Session {
     pub(crate) subtitle_clipboard: Option<Vec<mvm_project::SubtitleCue>>,
     /// 数式の描画。数式の clip が現れたときに起こす。
     pub(crate) math: Option<crate::math::MathState>,
+    /// Project を読み込む・保存先を変えるたびに増える。背景の作業の結果が同じ Project のものか確かめる。
+    pub(crate) load_serial: u64,
 }
 
 #[derive(Clone)]
@@ -163,6 +165,7 @@ impl Session {
             subtitle_selection: Vec::new(),
             subtitle_clipboard: None,
             math: None,
+            load_serial: 1,
         }
     }
 
@@ -370,6 +373,8 @@ impl Session {
             self.restore_unused_lock(lock);
             return Err(AppError::new(error.to_string()));
         }
+        // 前の Project の文字起こし・自動音量・Manim の作業は取り消して捨てる（別の Project へ適用しない）。
+        self.background = BackgroundWork::default();
         self.install(project, path, false, lock, sha256_hex(&bytes));
         Ok(())
     }
@@ -392,6 +397,7 @@ impl Session {
         let project =
             parse_project_json(&text, &path).map_err(|error| AppError::new(error.to_string()))?;
         let lock = self.acquire_lock(&path)?;
+        self.background = BackgroundWork::default();
         self.install(project, path, false, lock, sha256_hex(&bytes));
         Ok(())
     }
@@ -613,6 +619,7 @@ impl Session {
             self.delete_recovery(&old);
         }
         let flushed = self.pump.flush();
+        self.load_serial = self.load_serial.saturating_add(1);
         let recovery = inspect_recovery(&path, &project, &hash);
         self.lock = Some(lock);
         self.project = project.clone();

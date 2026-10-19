@@ -708,3 +708,149 @@ fn effect_channels_follow_key_kind_order() {
         assert_eq!(ClipKeyKind::from_name(channel.name), Some(channel.kind));
     }
 }
+
+/// 60fps・300 frame の映像 clip を 100 frame から置いた Project。
+fn motion_project() -> Project {
+    let mut project = Project::default();
+    let mut placed = clip("v");
+    placed.timeline_start_frame = 100;
+    project.timeline_clips = vec![placed];
+    project
+}
+
+#[test]
+fn the_edit_frame_is_the_playhead_inside_the_clip_and_its_start_outside() {
+    let project = motion_project();
+    assert_eq!(effect_edit_frame(&project, "id-v", 130).unwrap(), 30);
+    assert_eq!(effect_edit_frame(&project, "id-v", 100).unwrap(), 0);
+    assert_eq!(effect_edit_frame(&project, "id-v", 399).unwrap(), 299);
+    assert_eq!(effect_edit_frame(&project, "id-v", 400).unwrap(), 0);
+    assert_eq!(effect_edit_frame(&project, "id-v", 50).unwrap(), 0);
+    assert!(effect_edit_frame(&project, "無い", 0).is_err());
+}
+
+#[test]
+fn an_unanimated_value_changes_the_fixed_value() {
+    let mut project = motion_project();
+    set_clip_effect_at(&mut project, "id-v", ClipKeyKind::PositionX, 30, 25.0).unwrap();
+    let effects = &project.clip("id-v").unwrap().effects;
+    assert_eq!(effects.position_x_percent, 25.0);
+    assert!(effects.position_x_keys.is_empty());
+}
+
+#[test]
+fn an_animated_value_sets_the_key_at_the_edit_frame() {
+    let mut project = motion_project();
+    project.timeline_clips[0].effects.scale_x_keys = vec![key(0, 100.0), key(60, 200.0)];
+    // 既存のキーの位置なら値だけを変える。
+    set_clip_effect_at(&mut project, "id-v", ClipKeyKind::ScaleX, 60, 150.0).unwrap();
+    // キーの無い位置ならキーを足す。固定値は変えない。
+    set_clip_effect_at(&mut project, "id-v", ClipKeyKind::ScaleX, 30, 120.0).unwrap();
+    let effects = &project.clip("id-v").unwrap().effects;
+    let keys: Vec<_> = effects
+        .scale_x_keys
+        .iter()
+        .map(|key| (key.frame, key.value))
+        .collect();
+    assert_eq!(keys, [(0, 100.0), (30, 120.0), (60, 150.0)]);
+    assert_eq!(effects.scale_x_percent, 100.0);
+}
+
+#[test]
+fn effect_values_outside_the_channel_or_the_clip_kind_are_rejected() {
+    let mut project = motion_project();
+    let before = project.clone();
+    assert!(set_clip_effect_at(&mut project, "id-v", ClipKeyKind::ScaleX, 0, 0.5).is_err());
+    assert!(set_clip_effect_at(&mut project, "id-v", ClipKeyKind::Rotation, 0, f64::NAN).is_err());
+    assert!(set_clip_effect_at(&mut project, "id-v", ClipKeyKind::Volume, 0, 50.0).is_err());
+    // 左右のクロップの合計が 100% 以上の映像は残らないので、検証で断る。
+    set_clip_effect_at(&mut project, "id-v", ClipKeyKind::CropLeft, 0, 60.0).unwrap();
+    assert!(set_clip_effect_at(&mut project, "id-v", ClipKeyKind::CropRight, 0, 50.0).is_err());
+    assert_eq!(
+        project.clip("id-v").unwrap().effects.crop_right_percent,
+        0.0
+    );
+    assert_ne!(project, before);
+}
+
+#[test]
+fn toggling_a_key_adds_the_current_value_and_removing_the_last_keeps_it() {
+    let mut project = motion_project();
+    project.timeline_clips[0].effects.rotation_keys = vec![key(0, 0.0), key(100, 90.0)];
+    toggle_clip_key(&mut project, "id-v", ClipKeyKind::Rotation, 50).unwrap();
+    let keys = &project.clip("id-v").unwrap().effects.rotation_keys;
+    assert_eq!(keys.len(), 3);
+    assert_eq!(keys[1].frame, 50);
+    assert_eq!(keys[1].value, 45.0);
+    toggle_clip_key(&mut project, "id-v", ClipKeyKind::Rotation, 50).unwrap();
+    toggle_clip_key(&mut project, "id-v", ClipKeyKind::Rotation, 0).unwrap();
+    toggle_clip_key(&mut project, "id-v", ClipKeyKind::Rotation, 100).unwrap();
+    let effects = &project.clip("id-v").unwrap().effects;
+    assert!(effects.rotation_keys.is_empty());
+    assert_eq!(effects.rotation_degrees, 90.0);
+}
+
+#[test]
+fn animation_on_starts_from_the_current_value_and_off_freezes_it() {
+    let mut project = motion_project();
+    project.timeline_clips[0].effects.position_y_percent = -10.0;
+    set_clip_key_animation(&mut project, "id-v", ClipKeyKind::PositionY, 20, true).unwrap();
+    let keys = &project.clip("id-v").unwrap().effects.position_y_keys;
+    assert_eq!(keys.len(), 1);
+    assert_eq!((keys[0].frame, keys[0].value), (20, -10.0));
+    project.timeline_clips[0].effects.position_y_keys = vec![key(0, 0.0), key(100, 50.0)];
+    set_clip_key_animation(&mut project, "id-v", ClipKeyKind::PositionY, 40, false).unwrap();
+    let effects = &project.clip("id-v").unwrap().effects;
+    assert!(effects.position_y_keys.is_empty());
+    assert_eq!(effects.position_y_percent, 20.0);
+}
+
+#[test]
+fn fades_are_limited_by_the_source_range() {
+    let mut project = motion_project();
+    set_clip_fades(&mut project, "id-v", 30, 60).unwrap();
+    let effects = &project.clip("id-v").unwrap().effects;
+    assert_eq!((effects.fade_in_frames, effects.fade_out_frames), (30, 60));
+    assert!(set_clip_fades(&mut project, "id-v", 200, 200).is_err());
+    assert!(set_clip_fades(&mut project, "id-v", -1, 0).is_err());
+    assert_eq!(project.clip("id-v").unwrap().effects.fade_in_frames, 30);
+}
+
+#[test]
+fn changing_the_interpolation_resets_the_partial_curve_once() {
+    let mut project = motion_project();
+    let first = shaped(0, 0.0, KeyInterpolation::Linear, 0.25, 0.75, 0.0, 0.0);
+    project.timeline_clips[0].effects.opacity_keys = vec![first, key(100, 100.0)];
+    // 同じ補間なら部分曲線を残す。
+    set_clip_key_interpolation(
+        &mut project,
+        "id-v",
+        ClipKeyKind::Opacity,
+        0,
+        KeyInterpolation::Linear,
+    )
+    .unwrap();
+    let key0 = project.clip("id-v").unwrap().effects.opacity_keys[0];
+    assert_eq!((key0.curve_start, key0.curve_end), (0.25, 0.75));
+    set_clip_key_interpolation(
+        &mut project,
+        "id-v",
+        ClipKeyKind::Opacity,
+        0,
+        KeyInterpolation::EaseIn,
+    )
+    .unwrap();
+    let key0 = project.clip("id-v").unwrap().effects.opacity_keys[0];
+    assert_eq!(key0.interpolation, KeyInterpolation::EaseIn);
+    assert_eq!((key0.curve_start, key0.curve_end), (0.0, 1.0));
+    assert!(
+        set_clip_key_interpolation(
+            &mut project,
+            "id-v",
+            ClipKeyKind::Opacity,
+            50,
+            KeyInterpolation::Spline
+        )
+        .is_err()
+    );
+}

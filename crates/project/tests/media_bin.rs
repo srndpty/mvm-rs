@@ -434,3 +434,86 @@ fn media_references() {
         .is_err()
     );
 }
+
+fn counter_ids() -> impl FnMut() -> String {
+    let mut serial = 0;
+    move || {
+        serial += 1;
+        format!("n{serial}")
+    }
+}
+
+#[test]
+fn audio_frame_count_rounds_up_to_the_next_timeline_frame() {
+    assert_eq!(
+        audio_source_frame_count(48_000, 48_000, fps(30, 1)).unwrap(),
+        30
+    );
+    // 1 sample でも次の frame へ食い込めば、その frame を含める。
+    assert_eq!(
+        audio_source_frame_count(48_001, 48_000, fps(30, 1)).unwrap(),
+        31
+    );
+    // 29.97 fps の 1 秒は 29.97 frame なので 30 frame。
+    assert_eq!(
+        audio_source_frame_count(48_000, 48_000, fps(30_000, 1001)).unwrap(),
+        30
+    );
+    // 1 frame に満たない音声も 1 frame を持つ。
+    assert_eq!(audio_source_frame_count(1, 48_000, fps(60, 1)).unwrap(), 1);
+}
+
+#[test]
+fn audio_frame_count_rejects_empty_or_unknown_rates() {
+    assert!(audio_source_frame_count(0, 48_000, fps(30, 1)).is_err());
+    assert!(audio_source_frame_count(48_000, 0, fps(30, 1)).is_err());
+    assert!(audio_source_frame_count(48_000, 48_000, fps(0, 1)).is_err());
+}
+
+#[test]
+fn a_video_with_sound_becomes_a_linked_pair_named_after_the_file() {
+    let project = nested_project();
+    let mut new_id = counter_ids();
+    let clips = media_clips_for_item(&project, "v", true, &mut new_id).unwrap();
+    let audio = clips.linked_audio.expect("リンク音声");
+    assert_eq!(clips.primary.kind, TimelineClipKind::Video);
+    assert_eq!(audio.kind, TimelineClipKind::Audio);
+    assert_eq!(clips.primary.name, "v.mp4");
+    assert_eq!(clips.primary.media_item_id, "v");
+    assert_eq!(clips.primary.source_fps, fps(24000, 1001));
+    assert_eq!(clips.primary.source_out_frame, 598);
+    assert_eq!(audio.source_out_frame, 598);
+    assert!(clips.primary.is_linked());
+    assert_eq!(clips.primary.link_group_id, audio.link_group_id);
+    assert_ne!(clips.primary.id, audio.id);
+}
+
+#[test]
+fn a_silent_video_has_no_linked_audio() {
+    let project = nested_project();
+    let clips = media_clips_for_item(&project, "v", false, &mut counter_ids()).unwrap();
+    assert!(clips.linked_audio.is_none());
+    assert!(!clips.primary.is_linked());
+}
+
+#[test]
+fn audio_and_image_items_use_the_timeline_frame_rate() {
+    let mut project = nested_project();
+    project.timeline_fps = fps(30, 1);
+    project.media_items.push(image_item("i", "C:/media/i.png"));
+    let audio = media_clips_for_item(&project, "a", false, &mut counter_ids()).unwrap();
+    assert_eq!(audio.primary.kind, TimelineClipKind::Audio);
+    assert_eq!(audio.primary.source_fps, fps(30, 1));
+    // 10 秒の音声は 300 frame。
+    assert_eq!(audio.primary.source_out_frame, 300);
+    let image = media_clips_for_item(&project, "i", false, &mut counter_ids()).unwrap();
+    assert_eq!(image.primary.kind, TimelineClipKind::Image);
+    // 静止画は 5 秒。
+    assert_eq!(image.primary.source_out_frame, 150);
+}
+
+#[test]
+fn a_missing_item_makes_no_clip() {
+    let project = nested_project();
+    assert!(media_clips_for_item(&project, "nothing", false, &mut counter_ids()).is_err());
+}

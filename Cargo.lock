@@ -1944,6 +1944,7 @@ dependencies = [
  "mvm-platform",
  "mvm-preview",
  "mvm-project",
+ "mvm-testkit",
  "serde",
  "serde_json",
  "sha2",

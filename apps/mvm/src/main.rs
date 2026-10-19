@@ -3,10 +3,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio_adjust_ui;
+mod clip_dialogs;
 mod export_ui;
 mod inspector;
 mod math_ui;
 mod mixer_ui;
+mod motion_ui;
 mod preview_ui;
 mod project_panel;
 mod shell;

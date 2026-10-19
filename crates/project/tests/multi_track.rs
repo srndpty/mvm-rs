@@ -285,3 +285,166 @@ fn video_solo_is_rejected_before_saving() {
     assert!(validate_timeline(&project).is_err());
     assert!(serialize_project_json(&project, &root.join("multi-track.mvm")).is_err());
 }
+
+fn linked_pair(id: &str) -> (TimelineClip, TimelineClip) {
+    let mut video = clip(id, V1, 0);
+    let mut audio = clip(&format!("{id}-a"), A1, 0);
+    video.link_group_id = format!("g-{id}");
+    audio.link_group_id = format!("g-{id}");
+    (video, audio)
+}
+
+#[test]
+fn the_first_video_goes_to_v1_with_its_sound_on_a1() {
+    let mut project = Project::default();
+    let (video, audio) = linked_pair("v");
+    place_video_media_at(&mut project, video, Some(audio), 30).unwrap();
+    let placed = project.clip("v").unwrap();
+    assert_eq!(placed.track, V1);
+    assert_eq!(placed.timeline_start_frame, 30);
+    let sound = project.clip("v-a").unwrap();
+    assert_eq!(sound.track, A1);
+    assert_eq!(sound.timeline_start_frame, 30);
+    assert_eq!(project.video_tracks.len(), 2);
+}
+
+#[test]
+fn a_later_video_gets_a_new_video_track_and_a_new_audio_track_when_a1_is_busy() {
+    let mut project = Project::default();
+    let (first, first_audio) = linked_pair("v");
+    place_video_media_at(&mut project, first, Some(first_audio), 0).unwrap();
+    let (second, second_audio) = linked_pair("w");
+    place_video_media_at(&mut project, second, Some(second_audio), 10).unwrap();
+    // 既定の V1・V2 に続く V3 へ置く（空いた V2 は使わない）。
+    assert_eq!(project.clip("w").unwrap().track, TrackRef::video(2));
+    assert_eq!(project.clip("w-a").unwrap().track, A2);
+    assert_eq!(project.clip("v-a").unwrap().track, A1);
+}
+
+#[test]
+fn a_silent_video_does_not_add_an_audio_track() {
+    let mut project = Project::default();
+    project.audio_tracks.clear();
+    place_video_media_at(&mut project, clip("v", V1, 0), None, 0).unwrap();
+    assert!(project.audio_tracks.is_empty());
+}
+
+#[test]
+fn only_video_clips_are_placed_as_video_media() {
+    let mut project = Project::default();
+    let before = project.clone();
+    assert!(place_video_media_at(&mut project, clip("a", A1, 0), None, 0).is_err());
+    assert!(place_video_media_at(&mut project, clip("v", V1, 0), None, -1).is_err());
+    assert_eq!(project, before);
+}
+
+#[test]
+fn ripple_delete_closes_the_selected_span_on_every_track() {
+    let mut project = Project::default();
+    project.timeline_clips = vec![
+        clip("a", V1, 0),
+        clip("b", V1, 100),
+        clip("c", V1, 200),
+        clip("s", A1, 150),
+    ];
+    ripple_delete_clips(&mut project, &["b".to_owned()]).unwrap();
+    assert!(project.clip("b").is_none());
+    assert_eq!(project.clip("c").unwrap().timeline_start_frame, 100);
+    // 別の track の clip も同じ時間だけ詰める（[150, 200) は消えた区間に入るので削られる）。
+    let sound = project.clip("s").unwrap();
+    assert_eq!(sound.timeline_start_frame, 100);
+    assert_eq!(sound.source_duration(), 50);
+}
+
+#[test]
+fn ripple_delete_merges_touching_spans() {
+    let mut project = Project::default();
+    project.timeline_clips = vec![clip("a", V1, 0), clip("b", V1, 100), clip("c", V1, 200)];
+    ripple_delete_clips(&mut project, &["a".to_owned(), "b".to_owned()]).unwrap();
+    assert_eq!(project.timeline_clips.len(), 1);
+    assert_eq!(project.clip("c").unwrap().timeline_start_frame, 0);
+}
+
+#[test]
+fn ripple_delete_without_a_selection_changes_nothing() {
+    let mut project = Project::default();
+    project.timeline_clips = vec![clip("a", V1, 0)];
+    let before = project.clone();
+    assert!(ripple_delete_clips(&mut project, &["無い".to_owned()]).is_err());
+    assert_eq!(project, before);
+}
+
+#[test]
+fn project_settings_follow_the_media_with_square_pixels() {
+    assert_eq!(
+        video_settings_for_media(1920, 1080, fps(1, 1), fps(60, 1)).unwrap(),
+        (1920, 1080, fps(60, 1))
+    );
+    // 4:3 の SAR を持つ 1440×1080 は 1920 幅。
+    assert_eq!(
+        video_settings_for_media(1440, 1080, fps(4, 3), fps(30000, 1001)).unwrap(),
+        (1920, 1080, fps(30000, 1001))
+    );
+    // 720 × 10/11 = 654.5… は最も近い偶数の 654、奇数の高さは切り上げる。
+    assert_eq!(
+        video_settings_for_media(720, 481, fps(10, 11), fps(48, 2)).unwrap(),
+        (654, 482, fps(24, 1))
+    );
+}
+
+#[test]
+fn project_settings_reject_unsupported_media() {
+    assert!(video_settings_for_media(1920, 1080, fps(1, 1), fps(15, 1)).is_err());
+    assert!(video_settings_for_media(0, 1080, fps(1, 1), fps(30, 1)).is_err());
+    assert!(video_settings_for_media(40_000, 1080, fps(1, 1), fps(30, 1)).is_err());
+    assert!(video_settings_for_media(1920, 1080, fps(0, 1), fps(30, 1)).is_err());
+}
+
+fn text_project() -> Project {
+    let mut project = Project::default();
+    place_text_clip(&mut project, V1, 0, "最初の文字", &mut || {
+        "t".to_owned()
+    })
+    .unwrap();
+    project
+}
+
+#[test]
+fn editing_a_text_clip_renames_it_from_the_first_line() {
+    let mut project = text_project();
+    let mut text = project.clip("t").unwrap().text.clone();
+    text.content = "一行目がとても長い見出しの文字列で二十四文字を超えています\n二行目".to_owned();
+    text.font_size = 96;
+    text.color = "#FFFF0000".to_owned();
+    edit_text_clip(&mut project, "t", text).unwrap();
+    let clip = project.clip("t").unwrap();
+    assert_eq!(clip.text.font_size, 96);
+    assert_eq!(
+        clip.name,
+        "一行目がとても長い見出しの文字列で二十四文字を超…"
+    );
+}
+
+#[test]
+fn a_text_clip_keeps_a_body_and_valid_style() {
+    let mut project = text_project();
+    let before = project.clone();
+    let text = project.clip("t").unwrap().text.clone();
+    let empty = TextClipData {
+        content: "  ".to_owned(),
+        ..text.clone()
+    };
+    assert!(edit_text_clip(&mut project, "t", empty).is_err());
+    let bad_color = TextClipData {
+        color: "red".to_owned(),
+        ..text.clone()
+    };
+    assert!(edit_text_clip(&mut project, "t", bad_color).is_err());
+    let off_screen = TextClipData {
+        x: project.output_width,
+        ..text.clone()
+    };
+    assert!(edit_text_clip(&mut project, "t", off_screen).is_err());
+    assert!(edit_text_clip(&mut project, "無い", text).is_err());
+    assert_eq!(project, before);
+}

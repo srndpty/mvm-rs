@@ -7,8 +7,11 @@ C++/Qt 版 (`C:\dev\soft\mvm`) から Rust への全面移行中。
 
 **P7 残りの機能。** 純粋ロジック（P1）と、FFmpeg で probe・静止画・音声・映像を読む経路（P2）、
 メニュー・プロジェクトパネル・timeline の GUI（P3）、preview の再生（P4）に加え、timeline で編集できる。
-全 tool（V A C B N R Y U P H Z T）・inspector・keyframe（Pen）・transition の長さ・track の表示 / 消音 / ソロ・
-copy / paste・undo / redo を持つ。編集中は自動復旧データ（`.mvm.recovery`）を書き、`.mvm.lock` で
+素材はプロジェクトパネルの「読み込み…」・「ファイル > メディアを追加」・ファイルのドロップで取り込み、
+パネルからのドラッグかダブルクリックで timeline へ置く。全 tool（V A C B N R Y U P H Z T）・inspector
+（位置・拡大率・回転・クロップ・不透明度・音量とそのキー、フェード、文字の本文と書式）・preview の枠での移動と拡縮・
+keyframe（Pen）・transition の長さ・track の追加 / 削除 / 表示 / 消音 / ソロ・速度とデュレーション・フレーム保持・
+リップル削除・プロジェクト設定・音声の波形・J / K / L のシャトル・copy / paste・undo / redo を持つ。編集中は自動復旧データ（`.mvm.recovery`）を書き、`.mvm.lock` で
 同じ Project の二重起動を止め、外部で書き換えられた file には上書きの前に確認を出す。
 preview の decode と合成は worker thread が行い、音声があれば WASAPI の IAudioClock を正にして映像を進める
 （[docs/adr/0001-gpu-path.md](docs/adr/0001-gpu-path.md)）。

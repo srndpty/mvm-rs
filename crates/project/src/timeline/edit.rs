@@ -371,6 +371,43 @@ pub fn delete_timeline_clips(project: &mut Project, clip_ids: &[String]) -> Edit
 }
 
 /// 文字 clip を指定位置へ置く。中身が空、または既存 clip と重なるときは Project を変えない。
+/// 文字 clip の表示名。本文の 1 行目を 24 文字までにする。
+fn text_clip_name(content: &str) -> String {
+    let line = content.trim().lines().next().unwrap_or_default();
+    if line.chars().count() > 24 {
+        let mut short: String = line.chars().take(24).collect();
+        short.push('…');
+        short
+    } else {
+        line.to_owned()
+    }
+}
+
+/// 文字 clip の本文と書式を置き換える。表示名は本文から作り直す。値の範囲は timeline の検証が決める。
+pub fn edit_text_clip(
+    project: &mut Project,
+    clip_id: &str,
+    text: crate::model::TextClipData,
+) -> EditResult {
+    let Some(index) = project.clip_index(clip_id) else {
+        return fail("編集する文字 clip がありません");
+    };
+    if project.timeline_clips[index].kind != TimelineClipKind::Text {
+        return fail("編集する文字 clip がありません");
+    }
+    if text.content.trim().is_empty() {
+        return fail("文字 clip の本文を空にはできません");
+    }
+    let mut candidate = project.clone();
+    let clip = &mut candidate.timeline_clips[index];
+    clip.name = text_clip_name(&text.content);
+    clip.text = text;
+    if candidate == *project {
+        return Ok(None);
+    }
+    commit_candidate(project, candidate, Some(index))
+}
+
 pub fn place_text_clip(
     project: &mut Project,
     track: TrackRef,
@@ -390,17 +427,9 @@ pub fn place_text_clip(
     if id.is_empty() {
         return fail("文字 clip の ID を作れません");
     }
-    let name = content.lines().next().unwrap_or(content);
-    let name = if name.chars().count() > 24 {
-        let mut short: String = name.chars().take(24).collect();
-        short.push('…');
-        short
-    } else {
-        name.to_owned()
-    };
     let clip = TimelineClip {
         kind: TimelineClipKind::Text,
-        name,
+        name: text_clip_name(content),
         id,
         source_fps: project.timeline_fps,
         source_frame_count: length,
@@ -493,6 +522,69 @@ pub fn place_audio_clip_at(
             timeline_start_frame,
         )
     })
+}
+
+/// 動画素材を再生ヘッドの位置へ置く。timeline に映像系の clip が無ければ V1、あれば新しい video track へ置く。
+/// リンク音声は A1 へ置き、A1 が使用中なら既存 clip を壊さず新しい audio track の同じ位置へ置く。
+pub fn place_video_media_at(
+    project: &mut Project,
+    primary: TimelineClip,
+    linked_audio: Option<TimelineClip>,
+    timeline_start_frame: i64,
+) -> EditResult {
+    if primary.kind != TimelineClipKind::Video || timeline_start_frame < 0 {
+        return fail("配置する video clip または開始位置が不正です");
+    }
+    let mut candidate = project.clone();
+    let has_visual = candidate
+        .timeline_clips
+        .iter()
+        .any(|clip| clip.kind != TimelineClipKind::Audio);
+    let video_index = if has_visual {
+        add_track(&mut candidate, TrackKind::Video)?.unwrap_or(0)
+    } else {
+        0
+    };
+    let video_track = TrackRef::video(video_index);
+    let selected = match linked_audio {
+        None => place_timeline_clip_at(&mut candidate, primary, video_track, timeline_start_frame)?,
+        Some(audio) => {
+            if candidate.audio_tracks.is_empty() {
+                add_track(&mut candidate, TrackKind::Audio)?;
+            }
+            let mut first = candidate.clone();
+            match place_linked_av_pair_at(
+                &mut first,
+                primary.clone(),
+                video_track,
+                audio.clone(),
+                TrackRef::audio(0),
+                timeline_start_frame,
+            ) {
+                Ok(selected) => {
+                    candidate = first;
+                    selected
+                }
+                Err(_) => {
+                    let audio_index =
+                        add_track(&mut candidate, TrackKind::Audio)?.unwrap_or_default();
+                    place_linked_av_pair_at(
+                        &mut candidate,
+                        primary,
+                        video_track,
+                        audio,
+                        TrackRef::audio(audio_index),
+                        timeline_start_frame,
+                    )
+                    .map_err(|error| {
+                        crate::ProjectError::new(format!("リンク音声を配置できません: {error}"))
+                    })?
+                }
+            }
+        }
+    };
+    *project = candidate;
+    Ok(selected)
 }
 
 /// プロジェクトパネルや外部からのドロップで、指定した track・位置へ素材を置く。

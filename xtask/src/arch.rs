@@ -66,8 +66,19 @@ const RULES: &[Rule] = &[
         allows_unsafe: false,
     },
     Rule {
+        name: "mvm-export",
+        allowed_deps: &["mvm-core", "mvm-media", "mvm-preview", "mvm-project"],
+        allows_unsafe: false,
+    },
+    Rule {
         name: "mvm-app",
-        allowed_deps: &["mvm-core", "mvm-platform", "mvm-preview", "mvm-project"],
+        allowed_deps: &[
+            "mvm-core",
+            "mvm-export",
+            "mvm-platform",
+            "mvm-preview",
+            "mvm-project",
+        ],
         allows_unsafe: false,
     },
     Rule {

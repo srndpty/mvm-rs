@@ -10,12 +10,12 @@
 
 ## preview の再生
 
-- ピッチ保持（`preserve_pitch`）の clip を含むと再生は失敗する。time stretch を入れるときに鳴らす。
+- ピッチ保持（`preserve_pitch`）の clip を含むと再生と書き出しは失敗する。time stretch を入れるときに鳴らす。
 - 音声素材と再生デバイスは 48 kHz stereo だけを受け付け、それ以外は失敗させている。resample を入れるかは
   実素材で必要になった時点で決める。
 - 再生中の seek は WASAPI の端点を開き直す。体感で遅ければ、端点を保ったまま buffer を捨てる形にする。
-- 数式・グラフ・Manim の clip は preview に描かない（math crate を入れる段階で描く）。
+- 数式・グラフ・Manim の clip は preview に描かず、出力に含むと書き出しは失敗する（math crate を入れる段階で描く）。
 
-## 字幕
+## 書き出し
 
-- 書き出し計画の検査は export crate（P6）で移植する。raster 自体は text crate にある。
+- 書き出しの速度を release で測る。遅ければ、合成を GPU 上で YUV にしてから読み戻す形を検討する。

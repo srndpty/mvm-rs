@@ -47,7 +47,9 @@ pub struct Session {
     command_generation: u64,
     edit_epoch: u64,
     sent_epoch: u64,
-    preview_wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub(crate) preview_wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// 走っている書き出し。drop すると取り消して worker を待つ。
+    pub(crate) export: Option<mvm_export::ExportJob>,
     pub(crate) history: History,
     pub(crate) saved: Project,
     pub(crate) tool: TimelineTool,
@@ -122,6 +124,7 @@ impl Session {
             edit_epoch: 1,
             sent_epoch: 0,
             preview_wake: None,
+            export: None,
             history: History::default(),
             saved,
             tool: TimelineTool::Select,

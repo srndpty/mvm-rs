@@ -55,7 +55,7 @@ unsafe extern "C" {
 
 const EXIF_TIFF_HEADER: c_int = 0;
 
-fn ff_error(code: c_int) -> String {
+pub(crate) fn ff_error(code: c_int) -> String {
     let mut buffer = [0u8; 256];
     // SAFETY: buffer は 256 byte で、av_strerror はその範囲だけ書く。
     unsafe {
@@ -67,7 +67,7 @@ fn ff_error(code: c_int) -> String {
     }
 }
 
-fn path_cstring(path: &Path) -> Result<CString, MediaError> {
+pub(crate) fn path_cstring(path: &Path) -> Result<CString, MediaError> {
     let text = path
         .to_str()
         .ok_or_else(|| MediaError::new("パスを UTF-8 に変換できません"))?;

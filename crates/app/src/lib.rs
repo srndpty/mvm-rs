@@ -5,6 +5,7 @@
 mod autosave;
 mod commands;
 mod error;
+mod export;
 mod files;
 mod history;
 mod recovery_pump;
@@ -12,6 +13,7 @@ mod session;
 mod timeline_view;
 
 pub use error::AppError;
+pub use mvm_export::{ExportError, ExportProgress, ExportQuality, ExportRequest, ExportSummary};
 pub use mvm_preview::PreviewImage;
 pub use session::{RecoveryPrompt, Session};
 pub use timeline_view::{

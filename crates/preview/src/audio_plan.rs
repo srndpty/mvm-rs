@@ -36,7 +36,7 @@ pub fn audio_spans(project: &Project) -> Result<Vec<AudioSpan>, PreviewError> {
             continue;
         }
         if segment.original.preserve_pitch {
-            return Err(PreviewError::new("ピッチ保持の再生はまだできません"));
+            return Err(PreviewError::new("ピッチ保持の clip はまだ鳴らせません"));
         }
         if segment.original.speed.den <= 0 || segment.original.speed.num <= 0 {
             return Err(PreviewError::new("clip の速度が不正です"));

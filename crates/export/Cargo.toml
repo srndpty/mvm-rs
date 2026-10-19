@@ -1,0 +1,19 @@
+[package]
+name = "mvm-export"
+description = "書き出し。preview と同じ計画・compositor・mix で 1 frame ずつ作り、MP4 に encode する"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mvm-core = { workspace = true }
+mvm-media = { workspace = true }
+mvm-preview = { workspace = true }
+mvm-project = { workspace = true }
+
+[dev-dependencies]
+mvm-testkit = { workspace = true }

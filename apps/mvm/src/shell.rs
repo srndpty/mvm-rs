@@ -7,7 +7,7 @@ use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, TextureHandle};
 use mvm_app::{AppError, RecoveryPrompt, Session};
 use mvm_project::timeline::TimelineTool;
 
-use crate::{inspector, preview_ui, project_panel, timeline_ui};
+use crate::{export_ui, inspector, preview_ui, project_panel, timeline_ui};
 
 /// 自動保存と外部変更の検査は入力が無くても進める。egui は入力が無いと描き直さないので、この間隔で起こす。
 const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(250);
@@ -27,6 +27,7 @@ pub struct MvmApp {
     shown_title: Option<String>,
     gesture: Option<timeline_ui::TimelineGesture>,
     inspector: inspector::InspectorState,
+    export: export_ui::ExportDialog,
     text_draft: String,
     recovery_closed: bool,
     external_closed: bool,
@@ -45,6 +46,7 @@ impl MvmApp {
             shown_title: None,
             gesture: None,
             inspector: inspector::InspectorState::default(),
+            export: export_ui::ExportDialog::default(),
             text_draft: String::new(),
             recovery_closed: false,
             external_closed: false,
@@ -92,6 +94,12 @@ impl MvmApp {
     /// 窓の閉じるボタンと「終了」。未保存なら確認し、積んだ自動復旧の書き込みと削除を終えてから閉じる。
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         if self.close_approved {
+            return;
+        }
+        if self.session.is_exporting() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.notice =
+                "書き出し中は終了できません。取り消すか、終わってから閉じてください".to_owned();
             return;
         }
         if self.session.dirty() {
@@ -169,13 +177,19 @@ impl MvmApp {
     }
 
     fn handle_shortcuts(&mut self, ui: &mut egui::Ui) {
-        if self.confirm.is_some() || self.recovery_visible() || self.external_visible() {
+        if self.confirm.is_some()
+            || self.recovery_visible()
+            || self.external_visible()
+            || self.export.is_open()
+            || self.session.is_exporting()
+        {
             return;
         }
         let new_project = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
         let open = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
         let save = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
         let save_as = KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::S);
+        let export = KeyboardShortcut::new(Modifiers::COMMAND, Key::M);
         let action = ui.input_mut(|input| {
             if input.consume_shortcut(&new_project) {
                 Some(Command::New)
@@ -185,6 +199,8 @@ impl MvmApp {
                 Some(Command::SaveAs)
             } else if input.consume_shortcut(&save) {
                 Some(Command::Save)
+            } else if input.consume_shortcut(&export) {
+                Some(Command::Export)
             } else {
                 None
             }
@@ -194,6 +210,7 @@ impl MvmApp {
             Some(Command::Open) => self.request(FileAction::Open),
             Some(Command::Save) => self.save(),
             Some(Command::SaveAs) => self.save_as(),
+            Some(Command::Export) => self.export.open(&self.session),
             None => {}
         }
         if ui.ctx().egui_wants_keyboard_input() {
@@ -404,6 +421,14 @@ impl MvmApp {
                     ui.close();
                 }
                 ui.separator();
+                if ui
+                    .add_enabled(!self.session.is_exporting(), egui::Button::new("書き出し"))
+                    .clicked()
+                {
+                    self.export.open(&self.session);
+                    ui.close();
+                }
+                ui.separator();
                 if ui.button("終了").clicked() {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -439,6 +464,8 @@ impl MvmApp {
         });
         if !self.notice.is_empty() {
             ui.colored_label(egui::Color32::from_rgb(230, 120, 120), &self.notice);
+        } else if !self.export.finished.is_empty() {
+            ui.label(&self.export.finished);
         }
     }
 
@@ -640,6 +667,7 @@ enum Command {
     Open,
     Save,
     SaveAs,
+    Export,
 }
 
 fn pick_open() -> Option<PathBuf> {
@@ -734,6 +762,7 @@ impl MvmApp {
         self.confirm_unsaved(ui);
         self.confirm_recovery(ui);
         self.confirm_external(ui);
+        export_ui::show(ui, &mut self.session, &mut self.export, &mut self.notice);
         if std::mem::take(&mut self.close_now) {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -796,10 +825,60 @@ mod tests {
             "開く",
             "保存",
             "名前を付けて保存",
+            "書き出し",
             "終了",
         ] {
             harness.get_by_label(label);
         }
+    }
+
+    #[test]
+    fn export_dialog_offers_the_three_qualities_and_reports_an_empty_timeline() {
+        use egui_kittest::kittest::NodeT as _;
+
+        let mut harness = harness(MvmApp::new());
+        harness.get_by_label("ファイル").click();
+        harness.run();
+        harness.get_by_label("書き出し").click();
+        harness.run();
+        assert!(harness.state().export.is_open(), "dialog が開きません");
+        harness.get_by_label_contains("1920×1080・60 fps・0 frame（0.00 秒）");
+        for label in [
+            "高品質（CRF 18・容量大）",
+            "標準（CRF 23）",
+            "容量優先（CRF 28・画質低下）",
+        ] {
+            harness.get_by_label(label);
+        }
+        // 字幕の無い Project では焼き込みを選べない。
+        assert!(
+            harness
+                .get_by_label("字幕を焼き込む")
+                .accesskit_node()
+                .is_disabled()
+        );
+
+        harness.get_by_label("書き出す").click();
+        harness.run();
+        harness.get_by_label_contains("書き出し先が指定されていません");
+        assert!(!harness.state().session.is_exporting());
+        assert!(
+            harness.state().export.is_open(),
+            "失敗で dialog が閉じました"
+        );
+
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        assert!(!harness.state().export.is_open());
+    }
+
+    #[test]
+    fn ctrl_m_opens_the_export_dialog() {
+        let mut harness = harness(MvmApp::new());
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::M);
+        harness.run();
+        assert!(harness.state().export.is_open());
+        harness.get_by_label("書き出す");
     }
 
     #[test]

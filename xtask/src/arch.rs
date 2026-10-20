@@ -77,6 +77,7 @@ const RULES: &[Rule] = &[
             "mvm-core",
             "mvm-math",
             "mvm-media",
+            "mvm-platform",
             "mvm-preview",
             "mvm-project",
         ],

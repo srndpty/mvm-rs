@@ -229,11 +229,14 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::session::ExistingFile;
 
     fn saved_session(directory: &Path, name: &str) -> Session {
         std::fs::create_dir_all(directory).unwrap();
         let mut session = Session::new();
-        session.create_project(&directory.join(name)).unwrap();
+        session
+            .create_project(&directory.join(name), ExistingFile::Keep)
+            .unwrap();
         session
     }
 
@@ -352,7 +355,9 @@ mod tests {
             std::env::temp_dir().join(format!("mvm-manim-switch-{}", std::process::id()));
         let mut session = saved_session(&directory, "a.mvm");
         let stale = target_of(&session);
-        session.create_project(&directory.join("b.mvm")).unwrap();
+        session
+            .create_project(&directory.join("b.mvm"), ExistingFile::Keep)
+            .unwrap();
         let error = finish(&mut session, outcome("C:\\work\\one.mp4"), stale).unwrap_err();
         assert!(error.message().contains("Project が変わった"), "{error}");
         assert!(manim_videos(&session).is_empty());

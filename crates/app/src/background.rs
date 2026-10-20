@@ -2,6 +2,10 @@
 //!
 //! 作業は自分の入力（Project の snapshot など）を所有し、結果は終わったときに 1 回だけ渡す。
 //! `Drop` で取消を頼み、thread の終了を待つ。
+//!
+//! Project を切り替えるときは待たない（[`BackgroundWork::abandon`]）。取消を頼んだ thread を
+//! 結果ごと手放して [`RetiredThread`] として持ち、終わったものから UI の周回で回収する。
+//! 取消をすぐ確かめられない作業（FFmpeg の decode・外部 process）で UI を止めないため。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -23,6 +27,84 @@ pub(crate) struct BackgroundWork {
         BackgroundJob<Result<ManimClipOutcome, AppError>>,
         ManimTarget,
     )>,
+    /// 取消を頼んで手放した作業。結果は誰にも渡さない。drop で終了を待つ（detach しない）。
+    retired: Vec<RetiredThread>,
+}
+
+impl BackgroundWork {
+    /// 全ての作業に取消を頼み、結果を捨てる。終了は待たない（[`Self::reap`] と drop が回収する）。
+    /// 前の Project の作業の結果を、次の Project へ適用させない。
+    pub fn abandon(&mut self) {
+        let audio_adjust = self.audio_adjust.take().and_then(BackgroundJob::retire);
+        let transcription = self.transcription.take().and_then(BackgroundJob::retire);
+        let manim = self.manim.take().and_then(|(job, _)| job.retire());
+        self.retired
+            .extend([audio_adjust, transcription, manim].into_iter().flatten());
+        self.audio_adjust_result = None;
+        self.transcription_result = None;
+    }
+
+    /// 手放した作業のうち、終わったものの thread を join する。UI の周回ごとに呼ぶ。
+    pub fn reap(&mut self) {
+        self.retired = std::mem::take(&mut self.retired)
+            .into_iter()
+            .filter_map(RetiredThread::reap)
+            .collect();
+    }
+
+    /// 試験用: まだ終わっていない手放した作業の数。
+    #[cfg(test)]
+    pub fn retired_count(&self) -> usize {
+        self.retired.len()
+    }
+}
+
+/// 結果の型を問わずに、終わったかを調べて join する。
+trait Joinable: Send {
+    fn is_finished(&self) -> bool;
+    fn join_now(self: Box<Self>);
+}
+
+impl<T: Send + 'static> Joinable for JoinHandle<T> {
+    fn is_finished(&self) -> bool {
+        JoinHandle::is_finished(self)
+    }
+
+    fn join_now(self: Box<Self>) {
+        // 結果（panic を含む）は手放した時点で誰も待っていない。
+        let _ = (*self).join();
+    }
+}
+
+/// 取消を頼んだ後に手放した作業の thread。drop で終了を待つ。
+pub(crate) struct RetiredThread {
+    handle: Option<Box<dyn Joinable>>,
+}
+
+impl RetiredThread {
+    /// 終わっていれば join して `None`、まだなら自分を返す。
+    fn reap(mut self) -> Option<Self> {
+        let finished = self
+            .handle
+            .as_ref()
+            .is_none_or(|handle| handle.is_finished());
+        if finished {
+            if let Some(handle) = self.handle.take() {
+                handle.join_now();
+            }
+            None
+        } else {
+            Some(self)
+        }
+    }
+}
+
+impl Drop for RetiredThread {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.join_now();
+        }
+    }
 }
 
 /// 作業の側から見た取消と進捗。
@@ -98,6 +180,18 @@ impl<T: Send + 'static> BackgroundJob<T> {
 
     pub fn cancel(&self) {
         self.control.cancel();
+    }
+
+    /// 取消を頼み、終了を待たずに thread を手放す。もう終わっていれば `None`（ここで join する）。
+    fn retire(mut self) -> Option<RetiredThread> {
+        self.control.cancel();
+        RetiredThread {
+            handle: self
+                .handle
+                .take()
+                .map(|handle| Box::new(handle) as Box<dyn Joinable>),
+        }
+        .reap()
     }
 
     /// 終わっていれば結果を返す。作業が panic したら失敗として返す（黙って止まった作業を残さない）。
@@ -181,6 +275,61 @@ mod tests {
         .unwrap();
         drop(job);
         assert!(observed.load(Ordering::Acquire), "取消を見ずに終わりました");
+    }
+
+    #[test]
+    fn abandoning_does_not_wait_for_a_slow_worker_and_reaps_it_later() {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let job = BackgroundJob::start("試験", None, move |_control| {
+            // 取消を確かめない作業（外部 process の待ちなど）の代わり。
+            let _ = wait.recv();
+            Err(AppError::new("捨てる結果"))
+        })
+        .unwrap();
+        let mut work = BackgroundWork {
+            transcription: Some(job),
+            ..BackgroundWork::default()
+        };
+        // join で待つなら、ここで止まって release を送れない。
+        work.abandon();
+        assert!(work.transcription.is_none());
+        assert_eq!(work.retired_count(), 1);
+        work.reap();
+        assert_eq!(work.retired_count(), 1, "終わっていない作業を回収しました");
+        drop(release);
+        for _ in 0..500 {
+            work.reap();
+            if work.retired_count() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(work.retired_count(), 0, "終わった作業を回収しません");
+    }
+
+    #[test]
+    fn dropping_the_work_waits_for_abandoned_threads() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&finished);
+        let job = BackgroundJob::start("試験", None, move |control| {
+            while !control.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            seen.store(true, Ordering::Release);
+            Err(AppError::new("取消"))
+        })
+        .unwrap();
+        let mut work = BackgroundWork {
+            audio_adjust: Some(job),
+            ..BackgroundWork::default()
+        };
+        work.abandon();
+        drop(work);
+        assert!(
+            finished.load(Ordering::Acquire),
+            "手放した thread を待たずに drop しました"
+        );
     }
 
     #[test]

@@ -76,6 +76,7 @@ mod tests {
     use mvm_export::ExportQuality;
 
     use super::*;
+    use crate::session::ExistingFile;
 
     fn request(path: &str) -> ExportRequest {
         ExportRequest {
@@ -102,7 +103,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mvm-app-export-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut saved = Session::new();
-        saved.create_project(&dir.join("講義.mvm")).expect("保存");
+        saved
+            .create_project(&dir.join("講義.mvm"), ExistingFile::Keep)
+            .expect("保存");
         assert_eq!(saved.default_export_path(), dir.join("講義.mp4"));
         drop(saved);
         let _ = std::fs::remove_dir_all(&dir);

@@ -124,9 +124,8 @@ impl ExportJob {
                 let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                     run_export(&project, &plan, &*worker)
                 }))
+                // 一時 file は run_export が持つ guard が巻き戻しの間に消す。
                 .unwrap_or_else(|_| {
-                    // 一時 file は run_export の片付けを通らない。ここで消す。
-                    let _ = std::fs::remove_file(&plan.temporary_path);
                     Err(ExportError::failed("書き出しの worker が異常終了しました"))
                 });
                 worker.lock().result = Some(result);

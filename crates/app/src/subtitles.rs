@@ -294,6 +294,7 @@ mod tests {
     use mvm_project::Project;
 
     use super::*;
+    use crate::session::ExistingFile;
 
     fn cues(session: &Session) -> Vec<(i64, i64, String)> {
         session
@@ -459,7 +460,7 @@ mod tests {
         session.add_subtitle(0, 10, "a").unwrap();
         assert_eq!(session.subtitle_selection().len(), 1);
         session
-            .create_project(&directory.join("other.mvm"))
+            .create_project(&directory.join("other.mvm"), ExistingFile::Keep)
             .unwrap();
         assert!(
             session.subtitle_selection().is_empty(),

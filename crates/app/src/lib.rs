@@ -33,7 +33,7 @@ pub use mvm_export::{ExportError, ExportProgress, ExportQuality, ExportRequest, 
 pub use mvm_preview::{MeterPeaks, PreviewImage};
 pub use mvm_project::audio_adjustment::AudioAdjustmentSettings;
 pub use preferences::Preferences;
-pub use session::{RecoveryPrompt, Session};
+pub use session::{ExistingFile, RecoveryPrompt, Session};
 pub use timeline_commands::VideoSettings;
 pub use timeline_view::{
     MAX_PIXELS_PER_FRAME, MIN_PIXELS_PER_FRAME, TimeWindow, clamp_pixels_per_frame,

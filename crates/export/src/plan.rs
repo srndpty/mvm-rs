@@ -1,4 +1,5 @@
-//! 書き出しの計画。始める前に、書き出せない Project をここで全部落とす。GPU と file は触らない。
+//! 書き出しの計画。始める前に、書き出せない Project をここで全部落とす。GPU は触らない。
+//! file は、出力先が素材と同じ実体でないかを確かめるために識別子を読むだけで、書かない。
 //!
 //! 各 frame の layer と音声区間は preview と同じ関数（[`mvm_preview::plan_frame`]・
 //! [`mvm_preview::audio_spans`]）で決める。ここで持つのは、書き出し全体の尺・出力形式と、
@@ -11,6 +12,7 @@ use mvm_core::Rational;
 use mvm_core::output_timebase::OutputTimebase;
 use mvm_math::require_ready;
 use mvm_media::Mp4Settings;
+use mvm_platform::{FileProbeStatus, probe_file};
 use mvm_preview::{AudioSpan, MathLibrary, audio_spans, output_size, output_timebase};
 use mvm_project::timeline::validate_timeline;
 use mvm_project::{ManimGenerationState, Project, TimelineClipKind};
@@ -68,8 +70,6 @@ pub struct ExportRequest {
 #[derive(Clone, Debug)]
 pub struct ExportPlan {
     pub output_path: PathBuf,
-    /// encode 中に書く file。検証を通ってから `output_path` へ rename する。
-    pub temporary_path: PathBuf,
     pub width: u32,
     pub height: u32,
     pub fps: Rational,
@@ -109,6 +109,7 @@ pub fn plan_export(
     math: Arc<MathLibrary>,
 ) -> Result<ExportPlan, ExportError> {
     let output_path = check_output_path(&request.output_path)?;
+    reject_source_as_output(project, &output_path)?;
     let validation =
         validate_timeline(project).map_err(|error| ExportError::failed(error.to_string()))?;
     let (width, height) =
@@ -138,7 +139,6 @@ pub fn plan_export(
             .map_err(|error| ExportError::failed(error.to_string()))?
     };
     Ok(ExportPlan {
-        temporary_path: temporary_path(&output_path),
         output_path,
         width,
         height,
@@ -181,11 +181,53 @@ fn check_output_path(path: &Path) -> Result<PathBuf, ExportError> {
     })
 }
 
-/// 出力の正規名の隣に置く、encode 中の file。
-pub fn temporary_path(output: &Path) -> PathBuf {
-    let mut name = output.as_os_str().to_owned();
-    name.push(".mvmtmp");
-    PathBuf::from(name)
+/// 出力先が Project の参照する file（素材・Manim の script と生成物）と同じ実体なら失敗させる。
+/// 置き換えると元の素材を失う。パスの綴りではなく volume と file ID で比べるので、大文字小文字・
+/// 別の綴り・hard link でも同じ file を見分ける。出力先がまだ無ければ、どの素材とも同じではない。
+pub(crate) fn reject_source_as_output(project: &Project, output: &Path) -> Result<(), ExportError> {
+    let target = probe_file(output);
+    match target.status {
+        FileProbeStatus::Missing => return Ok(()),
+        FileProbeStatus::Unavailable => {
+            return Err(ExportError::failed(format!(
+                "書き出し先が素材と同じ file か確かめられません: {}",
+                output.display()
+            )));
+        }
+        FileProbeStatus::File => {}
+    }
+    let same = |path: &Path| {
+        let source = probe_file(path);
+        source.status == FileProbeStatus::File
+            && source.volume_serial == target.volume_serial
+            && source.file_id == target.file_id
+    };
+    let sources = project
+        .timeline_clips
+        .iter()
+        .map(|clip| clip.media_path.as_path())
+        .chain(
+            project
+                .media_items
+                .iter()
+                .map(|item| item.media_path.as_path()),
+        )
+        .chain(project.manim_assets.iter().flat_map(|asset| {
+            [
+                asset.script_path.as_path(),
+                asset.generated_video_path.as_path(),
+            ]
+        }))
+        .filter(|path| !path.as_os_str().is_empty());
+    for source in sources {
+        if same(source) {
+            return Err(ExportError::failed(format!(
+                "書き出し先が Project の素材と同じ file です（素材を上書きします）: {}",
+                source.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// 数式・数式列・Graph のラベルの描画が済んでいない、または Manim の動画を生成していない clip が出力に
@@ -303,10 +345,6 @@ mod tests {
         assert_eq!(plan.fps, Rational::new(60, 1));
         assert_eq!(plan.crf, 23);
         assert!(plan.output_path.is_absolute());
-        assert_eq!(
-            plan.temporary_path.file_name().unwrap().to_string_lossy(),
-            "out.mp4.mvmtmp"
-        );
 
         project.audio_tracks[0].muted = true;
         let silent = plan_export(
@@ -337,6 +375,76 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn rejects_an_output_that_is_a_source_file_under_any_spelling() {
+        let dir = std::env::temp_dir().join(format!("mvm-plan-source-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.mp4");
+        std::fs::write(&source, b"source").unwrap();
+        let linked = dir.join("linked.mp4");
+        std::fs::hard_link(&source, &linked).unwrap();
+        let other = dir.join("other.mp4");
+        std::fs::write(&other, b"other").unwrap();
+
+        let mut clip = video("v", 10);
+        clip.media_path = source.clone();
+        let project = Project {
+            timeline_clips: vec![clip],
+            ..Project::default()
+        };
+        let upper = PathBuf::from(source.to_string_lossy().to_uppercase());
+        for output in [&source, &upper, &linked] {
+            let message = error_of(&project, &request(&output.to_string_lossy()));
+            assert!(
+                message.contains("素材と同じ"),
+                "{}: {message}",
+                output.display()
+            );
+        }
+
+        // media bin だけにある素材と Manim の生成物も守る。
+        let bin = Project {
+            timeline_clips: vec![video("v", 10)],
+            media_items: vec![mvm_project::MediaItem {
+                media_path: other.clone(),
+                ..mvm_project::MediaItem::default()
+            }],
+            ..Project::default()
+        };
+        assert!(error_of(&bin, &request(&other.to_string_lossy())).contains("素材と同じ"));
+        let manim = Project {
+            timeline_clips: vec![video("v", 10)],
+            manim_assets: vec![mvm_project::ManimAsset {
+                script_path: dir.join("scene.py"),
+                scene_name: "Scene".to_owned(),
+                generated_video_path: other.clone(),
+                generation_state: ManimGenerationState::Ready,
+                source_fingerprint: String::new(),
+            }],
+            ..Project::default()
+        };
+        assert!(error_of(&manim, &request(&other.to_string_lossy())).contains("素材と同じ"));
+
+        // 素材でない既存 file と、まだ無い file へは書き出せる（負の対照）。
+        assert!(
+            plan_export(
+                &project,
+                &request(&other.to_string_lossy()),
+                Arc::new(MathLibrary::default())
+            )
+            .is_ok()
+        );
+        assert!(
+            plan_export(
+                &project,
+                &request(&dir.join("new.mp4").to_string_lossy()),
+                Arc::new(MathLibrary::default())
+            )
+            .is_ok()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

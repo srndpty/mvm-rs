@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use mvm_core::timecode::format_timecode;
-use mvm_platform::{ProjectLock, atomic_write, probe_file};
+use mvm_platform::{ProjectLock, atomic_create, atomic_write, probe_file};
 use mvm_preview::{PreviewEngine, PreviewImage, plan_frame};
 use mvm_project::Project;
 use mvm_project::json::{parse_project_json, serialize_project_json};
@@ -104,6 +104,25 @@ pub(crate) struct Clipboard {
 pub(crate) struct RecoveryOffer {
     project: Project,
     disposition: RecoveryDisposition,
+}
+
+/// 新しい保存先（新規作成・名前を付けて保存）に file が既にあるときの扱い。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExistingFile {
+    /// 置き換えない。既にあれば何も書かずに失敗する。
+    Keep,
+    /// 置き換える。利用者が上書きを承認したときだけ使う。
+    Replace,
+}
+
+impl ExistingFile {
+    fn write(self, path: &Path, bytes: &[u8]) -> Result<(), AppError> {
+        match self {
+            Self::Keep => atomic_create(path, bytes),
+            Self::Replace => atomic_write(path, bytes),
+        }
+        .map_err(|error| AppError::new(error.to_string()))
+    }
 }
 
 /// 開いたときに見つかった自動復旧データ。
@@ -373,17 +392,18 @@ impl Session {
     }
 
     /// 既定の Project を `path` へ書き、それを現在の session にする。失敗しても今の session は残す。
-    pub fn create_project(&mut self, path: &Path) -> Result<(), AppError> {
+    /// 既存の file は `existing` が [`ExistingFile::Replace`] のときだけ置き換える。
+    pub fn create_project(&mut self, path: &Path, existing: ExistingFile) -> Result<(), AppError> {
         let path = absolute_path(path)?;
         let project = Project::default();
         let bytes = project_bytes(&project, &path)?;
         let lock = self.acquire_lock(&path)?;
-        if let Err(error) = atomic_write(&path, &bytes) {
+        if let Err(error) = existing.write(&path, &bytes) {
             self.restore_unused_lock(lock);
-            return Err(AppError::new(error.to_string()));
+            return Err(error);
         }
         // 前の Project の文字起こし・自動音量・Manim の作業は取り消して捨てる（別の Project へ適用しない）。
-        self.background = BackgroundWork::default();
+        self.background.abandon();
         self.install(project, path, false, lock, sha256_hex(&bytes));
         Ok(())
     }
@@ -406,7 +426,7 @@ impl Session {
         let project =
             parse_project_json(&text, &path).map_err(|error| AppError::new(error.to_string()))?;
         let lock = self.acquire_lock(&path)?;
-        self.background = BackgroundWork::default();
+        self.background.abandon();
         self.install(project, path, false, lock, sha256_hex(&bytes));
         Ok(())
     }
@@ -420,7 +440,9 @@ impl Session {
         self.save_project_forcing(true)
     }
 
-    pub fn save_project_as(&mut self, path: &Path) -> Result<(), AppError> {
+    /// 別の file へ保存し、それを現在の保存先にする。既存の file は `existing` が
+    /// [`ExistingFile::Replace`] のときだけ置き換える（今の保存先へ書き直すときも同じ）。
+    pub fn save_project_as(&mut self, path: &Path, existing: ExistingFile) -> Result<(), AppError> {
         let path = absolute_path(path)?;
         let lock = self.acquire_lock(&path)?;
         let bytes = match project_bytes(&self.project, &path) {
@@ -430,9 +452,9 @@ impl Session {
                 return Err(error);
             }
         };
-        if let Err(error) = atomic_write(&path, &bytes) {
+        if let Err(error) = existing.write(&path, &bytes) {
             self.restore_unused_lock(lock);
-            return Err(AppError::new(error.to_string()));
+            return Err(error);
         }
         self.install(self.project.clone(), path, false, lock, sha256_hex(&bytes));
         Ok(())
@@ -751,6 +773,7 @@ impl Session {
         if let Some(event) = self.pump.poll() {
             self.finish_recovery(event, now_ms);
         }
+        self.background.reap();
         if self.autosave_note {
             self.autosave.note_edit(now_ms);
             self.autosave_note = false;
@@ -1135,7 +1158,9 @@ mod tests {
             ["V1", "V2"]
         );
         assert_eq!(session.project().audio_tracks[0].name, "A1");
-        session.create_project(&path).expect("作成");
+        session
+            .create_project(&path, ExistingFile::Keep)
+            .expect("作成");
         assert!(!session.dirty());
         assert_eq!(session.playhead_label(), "00:00:00:00  (0 frame)");
         drop(session);
@@ -1194,11 +1219,57 @@ mod tests {
     }
 
     #[test]
+    fn new_and_save_as_keep_an_existing_file_unless_replacing_is_approved() {
+        let dir = scratch_dir();
+        let path = dir.join("lecture.mvm");
+        let mut first = Session::new();
+        first
+            .create_project(&path, ExistingFile::Keep)
+            .expect("作成");
+        first.place_text("残す").expect("編集");
+        first.save_project().expect("保存");
+        drop(first);
+        let saved = fs::read(&path).expect("保存した file");
+
+        let mut session = Session::new();
+        let error = session
+            .create_project(&path, ExistingFile::Keep)
+            .expect_err("既存の Project を初期状態で置き換えました");
+        assert!(error.message().contains("既に"), "{error}");
+        assert_eq!(fs::read(&path).expect("file"), saved);
+        assert!(
+            session.path().is_none(),
+            "失敗した作成が session を切り替えました"
+        );
+
+        let other = dir.join("other.mvm");
+        session
+            .create_project(&other, ExistingFile::Keep)
+            .expect("別の file");
+        session
+            .save_project_as(&path, ExistingFile::Keep)
+            .expect_err("名前を付けて保存が既存を置き換えました");
+        assert_eq!(fs::read(&path).expect("file"), saved);
+        assert_eq!(session.path(), Some(other.as_path()));
+
+        // 承認すれば置き換える（負の対照）。
+        session
+            .save_project_as(&path, ExistingFile::Replace)
+            .expect("承認した上書き");
+        assert_ne!(fs::read(&path).expect("file"), saved);
+        assert_eq!(session.path(), Some(path.as_path()));
+        drop(session);
+        fs::remove_dir_all(&dir).expect("片付け");
+    }
+
+    #[test]
     fn a_second_session_cannot_open_a_locked_project() {
         let dir = scratch_dir();
         let path = dir.join("locked.mvm");
         let mut first = Session::new();
-        first.create_project(&path).expect("作成");
+        first
+            .create_project(&path, ExistingFile::Keep)
+            .expect("作成");
         let mut second = Session::new();
         let error = second.open_project(&path).expect_err("使用中");
         assert!(error.message().contains("他の mvm"), "{error}");
@@ -1214,7 +1285,9 @@ mod tests {
         let path = dir.join("auto.mvm");
         let recovery = recovery_path(&path);
         let mut session = Session::new();
-        session.create_project(&path).expect("作成");
+        session
+            .create_project(&path, ExistingFile::Keep)
+            .expect("作成");
         session.place_text("復旧").expect("編集");
         session.poll_maintenance(0);
         assert!(!recovery.exists(), "debounce 前に recovery を書いた");
@@ -1245,7 +1318,9 @@ mod tests {
         let dir = scratch_dir();
         let path = dir.join("external.mvm");
         let mut session = Session::new();
-        session.create_project(&path).expect("作成");
+        session
+            .create_project(&path, ExistingFile::Keep)
+            .expect("作成");
         session.place_text("手元").expect("編集");
         fs::write(&path, b"{}\n").expect("外部の書き換え");
         let error = session.save_project().expect_err("外部変更");
@@ -1264,8 +1339,12 @@ mod tests {
         let first = dir.join("first.mvm");
         let second = dir.join("second.mvm");
         let mut session = Session::new();
-        session.create_project(&second).expect("2 つ目を作る");
-        session.create_project(&first).expect("1 つ目を作る");
+        session
+            .create_project(&second, ExistingFile::Keep)
+            .expect("2 つ目を作る");
+        session
+            .create_project(&first, ExistingFile::Keep)
+            .expect("1 つ目を作る");
         session.place_text("捨てる").expect("編集");
         assert!(
             wait_for(&mut session, 2_000, |_| recovery_path(&first).exists()),
@@ -1306,7 +1385,9 @@ mod tests {
         let dir = scratch_dir();
         let path = dir.join("abandon.mvm");
         let mut session = Session::new();
-        session.create_project(&path).expect("作成");
+        session
+            .create_project(&path, ExistingFile::Keep)
+            .expect("作成");
         session.place_text("閉じる").expect("編集");
         assert!(
             wait_for(&mut session, 2_000, |_| recovery_path(&path).exists()),
@@ -1326,7 +1407,9 @@ mod tests {
         let dir = scratch_dir();
         let path = dir.join("poll.mvm");
         let mut session = Session::new();
-        session.create_project(&path).expect("作成");
+        session
+            .create_project(&path, ExistingFile::Keep)
+            .expect("作成");
         session.poll_maintenance(10_000);
         assert!(!session.external_change());
         fs::write(

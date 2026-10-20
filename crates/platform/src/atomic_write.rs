@@ -2,17 +2,21 @@
 //!
 //! C++ 版 `mvm_atomic_write_file` と同じ手順。置換先を他の process が開いている間は
 //! 短い間待ってやり直す。`ReplaceFileW` は使わない。
+//!
+//! [`atomic_create`] は既存の file を置換しない。有無の確認と書き込みの間に別の process が
+//! 作っても、最後の rename が失敗するので上書きしない。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, GENERIC_WRITE,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS,
+    ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, GENERIC_WRITE,
 };
 use windows::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateFileW, DeleteFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_WRITE_THROUGH,
-    FILE_SHARE_MODE, FlushFileBuffers, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    MoveFileExW, WriteFile,
+    FILE_SHARE_MODE, FlushFileBuffers, MOVE_FILE_FLAGS, MOVEFILE_REPLACE_EXISTING,
+    MOVEFILE_WRITE_THROUGH, MoveFileExW, WriteFile,
 };
 use windows::Win32::System::Threading::{GetCurrentProcessId, Sleep};
 use windows::core::{HRESULT, PCWSTR};
@@ -27,6 +31,15 @@ static TEMP_SERIAL: AtomicU32 = AtomicU32::new(1);
 
 /// `path` を `bytes` で置換する。失敗したときは元の file を残し、一時 file は消す。
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), PlatformError> {
+    write_and_move(path, bytes, true)
+}
+
+/// `path` に file が無いときだけ `bytes` で作る。既にあれば何も書かずに失敗する。
+pub fn atomic_create(path: &Path, bytes: &[u8]) -> Result<(), PlatformError> {
+    write_and_move(path, bytes, false)
+}
+
+fn write_and_move(path: &Path, bytes: &[u8], replace_existing: bool) -> Result<(), PlatformError> {
     if path.as_os_str().is_empty() {
         return Err(PlatformError::new("書き込み先のパスが空です"));
     }
@@ -42,7 +55,15 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), PlatformError> {
         return Err(error);
     }
     let target_wide = wide_path(path)?;
-    replace(&temporary_wide, &target_wide)
+    let result = if replace_existing {
+        replace(&temporary_wide, &target_wide)
+    } else {
+        move_to_new(&temporary_wide, &target_wide, path)
+    };
+    if result.is_err() {
+        file.delete();
+    }
+    result
 }
 
 fn temporary_path(target: &Path) -> Result<PathBuf, PlatformError> {
@@ -156,11 +177,29 @@ fn replace(temporary: &[u16], target: &[u16]) -> Result<(), PlatformError> {
             }
         }
     }
-    // SAFETY: 置換できなかった一時 file を消す。target には触れていない。
-    unsafe {
-        let _ = DeleteFileW(PCWSTR(temporary.as_ptr()));
-    }
     Err(last)
+}
+
+/// 置換しない rename。既存の target があれば失敗する（確認と rename の間に競合しない）。
+fn move_to_new(temporary: &[u16], target: &[u16], path: &Path) -> Result<(), PlatformError> {
+    // SAFETY: 両方とも NUL 終端の同じ directory 上のパス。REPLACE_EXISTING が無いので target は変えない。
+    unsafe {
+        MoveFileExW(
+            PCWSTR(temporary.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            MOVE_FILE_FLAGS(MOVEFILE_WRITE_THROUGH.0),
+        )
+    }
+    .map_err(|error| {
+        let code = error.code();
+        if code == HRESULT::from_win32(ERROR_ALREADY_EXISTS.0)
+            || code == HRESULT::from_win32(ERROR_FILE_EXISTS.0)
+        {
+            PlatformError::new(format!("既に file があります: {}", path.display()))
+        } else {
+            PlatformError::new(format!("file を作れません ({}): {error}", path.display()))
+        }
+    })
 }
 
 fn retryable(error: &windows::core::Error) -> bool {
@@ -200,6 +239,27 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().contains(".mvmtmp."))
             .count();
         assert_eq!(leftovers, 0);
+        fs::remove_dir_all(&dir).expect("片付け");
+    }
+
+    #[test]
+    fn create_refuses_an_existing_file_and_leaves_it_intact() {
+        let dir = scratch_dir();
+        let path = dir.join("project.mvm");
+        atomic_create(&path, b"first").expect("新規作成");
+        assert_eq!(fs::read(&path).expect("読み戻し"), b"first");
+        let error = atomic_create(&path, b"second").expect_err("既存を置換しました");
+        assert!(error.message().contains("既に"), "{error}");
+        assert_eq!(fs::read(&path).expect("読み戻し"), b"first");
+        // 置換する側は既存を置換できる（負の対照）。
+        atomic_write(&path, b"third").expect("置換");
+        assert_eq!(fs::read(&path).expect("読み戻し"), b"third");
+        let names: Vec<_> = fs::read_dir(&dir)
+            .expect("directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["project.mvm"], "一時 file が残っています");
         fs::remove_dir_all(&dir).expect("片付け");
     }
 

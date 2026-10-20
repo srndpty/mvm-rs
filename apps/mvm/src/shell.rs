@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, TextureHandle};
-use mvm_app::{AppError, RecoveryPrompt, Session};
+use mvm_app::{AppError, ExistingFile, RecoveryPrompt, Session};
 use mvm_project::timeline::TimelineTool;
 
 use crate::{
@@ -111,8 +111,8 @@ impl MvmApp {
         self.confirm = None;
         match action {
             FileAction::New => {
-                if let Some(path) = pick_save("新規プロジェクトの保存先") {
-                    let result = self.session.create_project(&ensure_mvm(path));
+                if let Some((path, existing)) = pick_save("新規プロジェクトの保存先") {
+                    let result = self.session.create_project(&path, existing);
                     self.note(result);
                 }
             }
@@ -166,15 +166,15 @@ impl MvmApp {
             let result = self.session.save_project();
             self.note(result);
             self.show_external_again_if_refused();
-        } else if let Some(path) = pick_save("プロジェクトの保存先") {
-            let result = self.session.save_project_as(&ensure_mvm(path));
+        } else if let Some((path, existing)) = pick_save("プロジェクトの保存先") {
+            let result = self.session.save_project_as(&path, existing);
             self.note(result);
         }
     }
 
     fn save_as(&mut self) {
-        if let Some(path) = pick_save("名前を付けて保存") {
-            let result = self.session.save_project_as(&ensure_mvm(path));
+        if let Some((path, existing)) = pick_save("名前を付けて保存") {
+            let result = self.session.save_project_as(&path, existing);
             self.note(result);
         }
     }
@@ -184,8 +184,8 @@ impl MvmApp {
         if self.session.path().is_some() {
             self.session.save_project()?;
             Ok(true)
-        } else if let Some(path) = pick_save("プロジェクトの保存先") {
-            self.session.save_project_as(&ensure_mvm(path))?;
+        } else if let Some((path, existing)) = pick_save("プロジェクトの保存先") {
+            self.session.save_project_as(&path, existing)?;
             Ok(true)
         } else {
             Ok(false)
@@ -884,11 +884,20 @@ fn pick_media_file() -> Option<PathBuf> {
         .pick_file()
 }
 
-fn pick_save(title: &str) -> Option<PathBuf> {
-    rfd::FileDialog::new()
+/// 保存先を選ぶ。dialog は選んだ名前の上書きを確認するので、その名前のままなら置き換えてよい。
+/// 拡張子を足した名前は確認を経ていないので、既にあれば置き換えずに失敗させる。
+fn pick_save(title: &str) -> Option<(PathBuf, ExistingFile)> {
+    let picked = rfd::FileDialog::new()
         .set_title(title)
         .add_filter("mvm project", &["mvm"])
-        .save_file()
+        .save_file()?;
+    let path = ensure_mvm(picked.clone());
+    let existing = if path == picked {
+        ExistingFile::Replace
+    } else {
+        ExistingFile::Keep
+    };
+    Some((path, existing))
 }
 
 fn ensure_mvm(path: PathBuf) -> PathBuf {

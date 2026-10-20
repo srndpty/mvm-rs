@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use mvm_core::Rational;
 use mvm_export::{
-    ExportControl, ExportError, ExportJob, ExportQuality, ExportRequest, plan_export, run_export,
-    temporary_path,
+    ExportControl, ExportError, ExportJob, ExportQuality, ExportRequest, TEMPORARY_MARKER,
+    plan_export, run_export,
 };
 use mvm_media::PcmStream;
 use mvm_preview::{MathLibrary, PreviewImage, StillPreview, plan_frame};
@@ -42,6 +42,20 @@ fn smoke(name: &str) -> PathBuf {
         path.display()
     );
     path
+}
+
+/// `output` の隣に残った encode 中の file。
+fn temporaries(output: &Path) -> Vec<PathBuf> {
+    let prefix = format!(
+        "{}{TEMPORARY_MARKER}",
+        output.file_name().unwrap().to_string_lossy()
+    );
+    std::fs::read_dir(output.parent().unwrap())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|entry| entry.path())
+        .collect()
 }
 
 fn work_dir(name: &str) -> PathBuf {
@@ -186,10 +200,7 @@ fn export_matches_the_preview_and_the_hand_computed_source_frames() {
     let summary = run_export(&project, &plan, &recorder).expect("書き出し");
     assert_eq!(summary.frames, total);
     assert_eq!(*recorder.last.lock().unwrap(), Some((total, total)));
-    assert!(
-        !temporary_path(&output).exists(),
-        "一時 file が残っています"
-    );
+    assert!(temporaries(&output).is_empty(), "一時 file が残っています");
     assert!(
         std::fs::metadata(&output).unwrap().len() > 1000,
         "古い file のままです"
@@ -366,7 +377,7 @@ fn cancelling_or_failing_leaves_no_file_behind() {
     let error = run_export(&project, &plan, &recorder).unwrap_err();
     assert_eq!(error, ExportError::Cancelled);
     assert!(
-        !output.exists() && !temporary_path(&output).exists(),
+        !output.exists() && temporaries(&output).is_empty(),
         "取消で file が残りました"
     );
 
@@ -376,7 +387,7 @@ fn cancelling_or_failing_leaves_no_file_behind() {
     job.cancel();
     assert!(job.wait().unwrap_err().is_cancelled());
     assert!(
-        !output.exists() && !temporary_path(&output).exists(),
+        !output.exists() && temporaries(&output).is_empty(),
         "job の取消で file が残りました"
     );
 
@@ -397,7 +408,7 @@ fn cancelling_or_failing_leaves_no_file_behind() {
         "{error}"
     );
     assert!(
-        !failed.exists() && !temporary_path(&failed).exists(),
+        !failed.exists() && temporaries(&failed).is_empty(),
         "失敗で file が残りました"
     );
     std::fs::remove_dir_all(&dir).expect("片付け");

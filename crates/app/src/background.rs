@@ -113,6 +113,12 @@ impl<T: Send + 'static> BackgroundJob<T> {
         )
     }
 
+    /// 試験用: 作業が終わったか（結果は受け取らない）。
+    #[cfg(test)]
+    pub fn is_finished(&self) -> bool {
+        self.handle.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
     /// 試験用: 終わるまで待って結果を返す。
     #[cfg(test)]
     pub fn wait(mut self) -> Result<T, AppError> {

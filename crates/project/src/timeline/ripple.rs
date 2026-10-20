@@ -162,6 +162,34 @@ pub(crate) fn time_edit_candidate(
     Ok(())
 }
 
+/// 選んだ clip の区間を全 track と字幕から取り除き、後ろを詰める（リップル削除・全トラック）。重なる区間は
+/// まとめ、後ろから順に削除する。
+pub fn ripple_delete_clips(project: &mut Project, clip_ids: &[String]) -> EditResult {
+    let mut spans = Vec::new();
+    for clip in &project.timeline_clips {
+        if clip_ids.contains(&clip.id) {
+            spans.push(clip_interval(project, clip)?);
+        }
+    }
+    if spans.is_empty() {
+        return fail("リップル削除するクリップがありません");
+    }
+    spans.sort_unstable();
+    let mut merged: Vec<(i64, i64)> = Vec::new();
+    for (start, end) in spans {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let mut candidate = project.clone();
+    for (start, end) in merged.into_iter().rev() {
+        edit_timeline_time(&mut candidate, start, end - start, 0)?;
+    }
+    *project = candidate;
+    Ok(None)
+}
+
 /// 全 track と字幕へ時間の挿入・削除を適用して確定する。
 pub fn edit_timeline_time(
     project: &mut Project,

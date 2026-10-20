@@ -146,6 +146,20 @@ xtask/       arch 検査（cargo metadata で crate 間の依存方向と unsafe
 - Math / EquationSequence / Graph / Manim clip（外部 process と cache）
 - 字幕、Whisper による文字起こし、自動音量調整、audio mixer、pitch 保持（Rubber Band）
 
+**P7 後の照合（C++ 版との差分の洗い出し）**
+- C++ 版の `MvmController` の Q_INVOKABLE・`Main.qml` のメニューとショートカット・右クリックメニュー・各 inspector を
+  Rust 版の command と UI に一つずつ当て、抜けていたものを足した。純粋な判定は project / core、command は app、
+  表示と操作の受け付けは apps/mvm に置いた
+- [事実] 足したもの: 素材の読み込み（「読み込み…」・「ファイル > メディアを追加」・OS からのドロップ）と
+  プロジェクトパネルの編集（フォルダ・名前の変更・移動・削除の確認）、パネルから timeline へのドラッグと
+  ダブルクリックでの配置、track の追加と削除、プロジェクト設定（幅・高さ・fps と「素材に合わせる」）、
+  clip の右クリック（速度・デュレーション〈Ctrl+R〉・フレーム保持・リンク解除・リップル削除〈全トラック〉・
+  コピー / カット / 複製）、空白とルーラーの右クリック（空白を詰める・ペースト・マーカーとイン / アウトの消去）、
+  inspector の effect（位置・拡大率・回転・クロップ・不透明度・音量・ダッキングのアニメーションとキー・補間、
+  フェード）と文字 clip の編集、preview の枠（移動と角の拡縮）、音声 clip の波形、J / K / L のシャトル、
+  「再生」メニュー
+- 照合で見つけ、まだ移していないものは [roadmap.md](roadmap.md) に書いた
+
 **P8 切り替え**
 - 日常の動画制作を Rust 版で一通り行う
 - C++ 版の README に移行済みと記載し、開発を止める

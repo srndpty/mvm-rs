@@ -9,12 +9,13 @@ use mvm_project::timeline::{
     add_timeline_marker, apply_default_clip_fades, apply_default_edit_transition,
     apply_math_transform_transition, clip_ids_from_frame, clip_ids_spanning_frame, clip_interval,
     default_transition_frames, delete_clip_key, delete_timeline_clips, delete_timeline_marker,
-    delete_timeline_transition, edit_clip_key, move_clips, place_copied_clips, place_text_clip,
-    rate_stretch_timeline_clip, ripple_trim_timeline_clip, roll_timeline_edit,
-    set_clip_effect_base, set_clip_speed_duration, set_mark_in, set_mark_out, set_subtitle_visible,
-    set_timeline_transition_span, set_track_muted, set_track_solo, slide_timeline_clip,
-    slip_timeline_clip, split_timeline_clips, step_clip_volume, toggle_clips_enabled,
-    touching_clip_id, trim_timeline_clip,
+    delete_timeline_transition, edit_clip_key, edit_text_clip, effect_edit_frame, move_clips,
+    place_copied_clips, place_text_clip, rate_stretch_timeline_clip, ripple_trim_timeline_clip,
+    roll_timeline_edit, set_clip_effect_at, set_clip_fades, set_clip_key_animation,
+    set_clip_key_interpolation, set_clip_speed_duration, set_mark_in, set_mark_out,
+    set_subtitle_visible, set_timeline_transition_span, set_track_muted, set_track_solo,
+    slide_timeline_clip, slip_timeline_clip, split_timeline_clips, step_clip_volume,
+    toggle_clip_key, toggle_clips_enabled, touching_clip_id, trim_timeline_clip,
 };
 use mvm_project::{MediaItem, Project, ProjectResult, TimelineClip, TrackKind, TrackRef};
 
@@ -452,14 +453,135 @@ impl Session {
         self.transact(move |project| delete_clip_key(project, &clip_id, kind, frame))
     }
 
+    /// effect を編集する clip 内の frame（再生ヘッドの位置。clip の外なら先頭）。
+    pub fn effect_frame(&self, clip_id: &str) -> Result<i64, AppError> {
+        effect_edit_frame(&self.project, clip_id, self.playhead_frame)
+            .map_err(|error| AppError::new(error.to_string()))
+    }
+
+    /// effect の値を変える。キーのある channel は再生ヘッドの位置のキーを置き換える（無ければ足す）。
     pub fn set_effect(
         &mut self,
         clip_id: &str,
         kind: ClipKeyKind,
         value: f64,
     ) -> Result<(), AppError> {
-        let clip_id = clip_id.to_owned();
-        self.transact(move |project| set_clip_effect_base(project, &clip_id, kind, value))
+        self.set_effects(clip_id, &[(kind, value)])
+    }
+
+    /// 複数の effect（縦横比を固定した拡大率など）を 1 つの undo で変える。どれかが失敗すれば何も変えない。
+    pub fn set_effects(
+        &mut self,
+        clip_id: &str,
+        values: &[(ClipKeyKind, f64)],
+    ) -> Result<(), AppError> {
+        let frame = self.effect_frame(clip_id)?;
+        self.set_effects_at(clip_id, frame, values)
+    }
+
+    /// ドラッグ・入力で編集した effect を、編集を始めたときの clip 内 `frame` へ確定する。編集の途中で Project が
+    /// 変わっていれば（undo・別の編集）、古い値を新しい Project へ書かずに失敗する。
+    pub fn commit_effects(
+        &mut self,
+        clip_id: &str,
+        frame: i64,
+        revision: u64,
+        values: &[(ClipKeyKind, f64)],
+    ) -> Result<(), AppError> {
+        self.expect_revision(revision)?;
+        self.set_effects_at(clip_id, frame, values)
+    }
+
+    /// 編集を始めたときの revision と今が違えば失敗する。
+    pub(crate) fn expect_revision(&self, revision: u64) -> Result<(), AppError> {
+        if revision == self.edit_revision {
+            Ok(())
+        } else {
+            Err(AppError::new(
+                "編集中に Project が変わったため、この変更は取り消しました",
+            ))
+        }
+    }
+
+    fn set_effects_at(
+        &mut self,
+        clip_id: &str,
+        frame: i64,
+        values: &[(ClipKeyKind, f64)],
+    ) -> Result<(), AppError> {
+        self.transact(|project| {
+            let mut selected = None;
+            for (kind, value) in values {
+                selected = set_clip_effect_at(project, clip_id, *kind, frame, *value)?.or(selected);
+            }
+            Ok(selected)
+        })
+    }
+
+    /// 文字 clip の本文と書式を置き換える。
+    pub fn edit_text(
+        &mut self,
+        clip_id: &str,
+        text: mvm_project::TextClipData,
+    ) -> Result<(), AppError> {
+        self.transact(|project| edit_text_clip(project, clip_id, text))
+    }
+
+    /// 再生ヘッドの位置のキーを足す・消す。
+    pub fn toggle_key(&mut self, clip_id: &str, kind: ClipKeyKind) -> Result<(), AppError> {
+        let frame = self.effect_frame(clip_id)?;
+        self.transact(|project| toggle_clip_key(project, clip_id, kind, frame))
+    }
+
+    pub fn set_key_animation(
+        &mut self,
+        clip_id: &str,
+        kind: ClipKeyKind,
+        enabled: bool,
+    ) -> Result<(), AppError> {
+        let frame = self.effect_frame(clip_id)?;
+        self.transact(|project| set_clip_key_animation(project, clip_id, kind, frame, enabled))
+    }
+
+    /// 再生ヘッドの位置のキーから始まる区間の補間を変える。
+    pub fn set_key_interpolation(
+        &mut self,
+        clip_id: &str,
+        kind: ClipKeyKind,
+        interpolation: mvm_project::clip_effects::KeyInterpolation,
+    ) -> Result<(), AppError> {
+        let frame = self.effect_frame(clip_id)?;
+        self.transact(|project| {
+            set_clip_key_interpolation(project, clip_id, kind, frame, interpolation)
+        })
+    }
+
+    /// キーへ再生ヘッドを動かす。`forward` なら次、そうでなければ前のキー。無ければ動かさない。
+    pub fn seek_key(&mut self, clip_id: &str, kind: ClipKeyKind, forward: bool) {
+        let Some(clip) = self.project.clip(clip_id) else {
+            return;
+        };
+        let start = clip.timeline_start_frame;
+        let local = self.playhead_frame.saturating_sub(start);
+        let keys = clip.effects.keys(kind);
+        let target = if forward {
+            keys.iter().find(|key| key.frame > local)
+        } else {
+            keys.iter().rev().find(|key| key.frame < local)
+        };
+        if let Some(key) = target {
+            let frame = start.saturating_add(key.frame);
+            self.seek(frame);
+        }
+    }
+
+    pub fn set_fades(
+        &mut self,
+        clip_id: &str,
+        fade_in_frames: i64,
+        fade_out_frames: i64,
+    ) -> Result<(), AppError> {
+        self.transact(|project| set_clip_fades(project, clip_id, fade_in_frames, fade_out_frames))
     }
 
     pub fn set_speed_percent(&mut self, clip_id: &str, percent: i64) -> Result<(), AppError> {
@@ -562,6 +684,14 @@ impl Session {
             set_mark_in(project, None)?;
             set_mark_out(project, None)
         })
+    }
+
+    pub fn clear_mark_in(&mut self) -> Result<(), AppError> {
+        self.transact(|project| set_mark_in(project, None))
+    }
+
+    pub fn clear_mark_out(&mut self) -> Result<(), AppError> {
+        self.transact(|project| set_mark_out(project, None))
     }
 
     pub fn jump_to_in(&mut self) {
@@ -800,5 +930,66 @@ fn link_mode(linked: bool) -> LinkMode {
         LinkMode::Linked
     } else {
         LinkMode::Single
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mvm_core::Rational;
+    use mvm_project::clip_effects::ClipKeyframe;
+    use mvm_project::{Project, TimelineClip, TimelineClipKind, TrackRef};
+
+    use super::*;
+
+    fn animated() -> Session {
+        let mut clip = TimelineClip {
+            kind: TimelineClipKind::Video,
+            media_path: "v.mp4".into(),
+            name: "v".to_owned(),
+            id: "v".to_owned(),
+            source_fps: Rational::new(60, 1),
+            source_frame_count: 120,
+            source_out_frame: 120,
+            track: TrackRef::video(0),
+            ..TimelineClip::default()
+        };
+        clip.effects.position_x_keys =
+            vec![ClipKeyframe::new(0, 0.0), ClipKeyframe::new(100, 50.0)];
+        Session::from_project(Project {
+            timeline_clips: vec![clip],
+            ..Project::default()
+        })
+    }
+
+    #[test]
+    fn an_effect_edit_lands_on_the_frame_where_it_started() {
+        let mut session = animated();
+        session.seek(30);
+        let revision = session.edit_revision();
+        // 編集の途中で再生ヘッドが動いても、始めた frame のキーへ書く。
+        session.seek(80);
+        session
+            .commit_effects("v", 30, revision, &[(ClipKeyKind::PositionX, 10.0)])
+            .expect("確定");
+        let keys = &session.project().timeline_clips[0].effects.position_x_keys;
+        let frames: Vec<_> = keys.iter().map(|key| (key.frame, key.value)).collect();
+        assert_eq!(frames, [(0, 0.0), (30, 10.0), (100, 50.0)]);
+    }
+
+    #[test]
+    fn an_effect_edit_started_before_an_undo_is_rejected() {
+        let mut session = animated();
+        session
+            .set_effect("v", ClipKeyKind::PositionY, 5.0)
+            .expect("編集");
+        let revision = session.edit_revision();
+        session.undo().expect("戻す");
+        let before = session.project().clone();
+        assert!(
+            session
+                .commit_effects("v", 0, revision, &[(ClipKeyKind::PositionX, 10.0)])
+                .is_err()
+        );
+        assert_eq!(session.project(), &before);
     }
 }

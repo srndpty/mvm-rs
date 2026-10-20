@@ -8,8 +8,8 @@ use mvm_app::{AppError, RecoveryPrompt, Session};
 use mvm_project::timeline::TimelineTool;
 
 use crate::{
-    audio_adjust_ui, export_ui, inspector, math_ui, mixer_ui, preview_ui, project_panel,
-    subtitle_panel, timeline_ui, transcribe_ui,
+    audio_adjust_ui, clip_dialogs, export_ui, inspector, math_ui, mixer_ui, preview_ui,
+    project_panel, subtitle_panel, timeline_ui, transcribe_ui,
 };
 
 /// 自動保存と外部変更の検査は入力が無くても進める。egui は入力が無いと描き直さないので、この間隔で起こす。
@@ -36,6 +36,7 @@ pub struct MvmApp {
     confirm: Option<FileAction>,
     notice: String,
     preview_texture: Option<(u64, TextureHandle)>,
+    preview_drag: Option<preview_ui::TransformDrag>,
     shown_title: Option<String>,
     timeline: timeline_ui::TimelineState,
     subtitle_panel: subtitle_panel::SubtitlePanel,
@@ -45,6 +46,9 @@ pub struct MvmApp {
     audio_adjust: audio_adjust_ui::AudioAdjustDialog,
     manim: math_ui::ManimDialog,
     mixer: mixer_ui::MixerState,
+    project_panel: project_panel::ProjectPanel,
+    speed: clip_dialogs::SpeedDialog,
+    settings: clip_dialogs::SettingsDialog,
     left_tab: LeftTab,
     text_draft: String,
     recovery_closed: bool,
@@ -61,6 +65,7 @@ impl MvmApp {
             confirm: None,
             notice: String::new(),
             preview_texture: None,
+            preview_drag: None,
             shown_title: None,
             timeline: timeline_ui::TimelineState::default(),
             subtitle_panel: subtitle_panel::SubtitlePanel::default(),
@@ -70,6 +75,9 @@ impl MvmApp {
             audio_adjust: audio_adjust_ui::AudioAdjustDialog::default(),
             manim: math_ui::ManimDialog::default(),
             mixer: mixer_ui::MixerState::default(),
+            project_panel: project_panel::ProjectPanel::default(),
+            speed: clip_dialogs::SpeedDialog::default(),
+            settings: clip_dialogs::SettingsDialog::default(),
             left_tab: LeftTab::default(),
             text_draft: String::new(),
             recovery_closed: false,
@@ -211,6 +219,8 @@ impl MvmApp {
             || self.recovery_visible()
             || self.external_visible()
             || self.export.is_open()
+            || self.speed.is_open()
+            || self.settings.is_open()
             || self.session.is_exporting()
         {
             return;
@@ -264,10 +274,21 @@ impl MvmApp {
                 Seek::Edit(1)
             } else if input.consume_key(Modifiers::NONE, Key::Space) {
                 Seek::Play
+            } else if input.consume_key(Modifiers::NONE, Key::J) {
+                Seek::Shuttle(-1)
+            } else if input.consume_key(Modifiers::NONE, Key::K) {
+                Seek::Stop
+            } else if input.consume_key(Modifiers::NONE, Key::L) {
+                Seek::Shuttle(1)
             } else {
                 Seek::None
             }
         });
+        let now = now_ms(ui);
+        self.run_seek(seek, now);
+    }
+
+    fn run_seek(&mut self, seek: Seek, now: u64) {
         match seek {
             Seek::Start => {
                 self.session.set_scrubbing(false);
@@ -279,6 +300,11 @@ impl MvmApp {
                     .seek(self.session.playhead_frame().saturating_add(delta));
             }
             Seek::Play => self.session.toggle_playback(),
+            Seek::Shuttle(direction) => {
+                let result = self.session.shuttle(direction, now);
+                self.note(result);
+            }
+            Seek::Stop => self.session.stop_shuttle(),
             Seek::Edit(direction) => self.session.jump_edit_point(direction > 0),
             Seek::None => {}
         }
@@ -311,6 +337,8 @@ impl MvmApp {
                 EditCommand::SplitAll
             } else if input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::K)) {
                 EditCommand::Split
+            } else if input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::R)) {
+                EditCommand::SpeedDuration
             } else if input.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::M) {
                 EditCommand::PreviousMarker
             } else {
@@ -424,8 +452,20 @@ impl MvmApp {
                 self.session.set_tool(tool);
                 Ok(())
             }
+            EditCommand::SpeedDuration => {
+                self.open_speed();
+                Ok(())
+            }
         };
         self.note(result);
+    }
+
+    /// 選択中の clip の速度・デュレーションの dialog を開く。
+    fn open_speed(&mut self) {
+        match self.session.selected_clip().map(str::to_owned) {
+            Some(id) => self.speed.open(&mut self.session, &id),
+            None => self.session.set_alert("速度を変える clip を選んでください"),
+        }
     }
 
     fn menu(&mut self, ui: &mut egui::Ui) {
@@ -451,6 +491,24 @@ impl MvmApp {
                     ui.close();
                 }
                 ui.separator();
+                if ui.button("メディアを追加…").clicked() {
+                    ui.close();
+                    if let Some(path) = pick_media_file() {
+                        self.perform_edit(|session| session.add_media_file_at_playhead(&path));
+                    }
+                }
+                if ui.button("素材を読み込み…").clicked() {
+                    ui.close();
+                    if let Some(paths) = project_panel::pick_media() {
+                        project_panel::import(&mut self.session, &paths, "");
+                        self.left_tab = LeftTab::Project;
+                    }
+                }
+                if ui.button("プロジェクト設定…").clicked() {
+                    self.settings.open(&self.session);
+                    ui.close();
+                }
+                ui.separator();
                 if ui
                     .add_enabled(!self.session.is_exporting(), egui::Button::new("書き出し"))
                     .clicked()
@@ -462,6 +520,51 @@ impl MvmApp {
                 if ui.button("終了").clicked() {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
+            });
+            ui.menu_button("再生", |ui| {
+                let now = now_ms(ui);
+                let mut seek = Seek::None;
+                for (label, key, action) in [
+                    ("再生 / 停止", "Space", Seek::Play),
+                    ("左へシャトル", "J", Seek::Shuttle(-1)),
+                    ("停止", "K", Seek::Stop),
+                    ("右へシャトル", "L", Seek::Shuttle(1)),
+                    ("1 フレーム前へ", "←", Seek::By(-1)),
+                    ("1 フレーム先へ", "→", Seek::By(1)),
+                    ("5 フレーム前へ", "Shift+←", Seek::By(-5)),
+                    ("5 フレーム先へ", "Shift+→", Seek::By(5)),
+                    ("前の編集点へ", "↑", Seek::Edit(-1)),
+                    ("次の編集点へ", "↓", Seek::Edit(1)),
+                    ("先頭へ", "Home", Seek::Start),
+                ] {
+                    if ui
+                        .add(egui::Button::new(label).shortcut_text(key))
+                        .clicked()
+                    {
+                        seek = action;
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                for (label, key, edit) in [
+                    (
+                        "マーカーを追加",
+                        "M",
+                        Session::add_marker as fn(&mut Session) -> _,
+                    ),
+                    ("インをマーク", "I", Session::mark_in),
+                    ("アウトをマーク", "O", Session::mark_out),
+                    ("インとアウトを消去", "Alt+X", Session::clear_marks),
+                ] {
+                    if ui
+                        .add(egui::Button::new(label).shortcut_text(key))
+                        .clicked()
+                    {
+                        self.perform_edit(edit);
+                        ui.close();
+                    }
+                }
+                self.run_seek(seek, now);
             });
             ui.menu_button("挿入", |ui| {
                 if ui.button("数式").clicked() {
@@ -522,6 +625,27 @@ impl MvmApp {
                 }
                 if ui.button("削除").clicked() {
                     self.perform_edit(Session::delete_selection);
+                    ui.close();
+                }
+                if ui.button("リップル削除（全トラック）").clicked() {
+                    self.perform_edit(Session::ripple_delete_selection);
+                    ui.close();
+                }
+                ui.separator();
+                if ui
+                    .add(egui::Button::new("速度・デュレーション…").shortcut_text("Ctrl+R"))
+                    .clicked()
+                {
+                    self.open_speed();
+                    ui.close();
+                }
+                if ui.button("フレーム保持を挿入").clicked() {
+                    if let Some(id) = self.session.selected_clip().map(str::to_owned) {
+                        self.perform_edit(|session| session.insert_frame_hold(&id));
+                    } else {
+                        self.session
+                            .set_alert("フレーム保持を挿入する clip を選んでください");
+                    }
                     ui.close();
                 }
             });
@@ -679,6 +803,18 @@ enum Seek {
     By(i64),
     Edit(i32),
     Play,
+    Shuttle(i32),
+    Stop,
+}
+
+/// egui の入力時刻（ミリ秒）。シャトルと自動保存の時計に使う。
+fn now_ms(ui: &egui::Ui) -> u64 {
+    let seconds = ui.input(|input| input.time);
+    if seconds.is_finite() && seconds > 0.0 {
+        (seconds * 1000.0) as u64
+    } else {
+        0
+    }
 }
 
 enum EditCommand {
@@ -705,6 +841,7 @@ enum EditCommand {
     JumpIn,
     JumpOut,
     ClearMarks,
+    SpeedDuration,
     Tool(TimelineTool),
 }
 
@@ -741,6 +878,12 @@ fn pick_open() -> Option<PathBuf> {
         .pick_file()
 }
 
+fn pick_media_file() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("メディアを追加")
+        .pick_file()
+}
+
 fn pick_save(title: &str) -> Option<PathBuf> {
     rfd::FileDialog::new()
         .set_title(title)
@@ -768,17 +911,15 @@ impl eframe::App for MvmApp {
 
 impl MvmApp {
     fn show(&mut self, ui: &mut egui::Ui) {
-        let seconds = ui.input(|input| input.time);
-        let now_ms = if seconds.is_finite() && seconds > 0.0 {
-            (seconds * 1000.0) as u64
-        } else {
-            0
-        };
+        let now_ms = now_ms(ui);
         if ui.input(|input| input.viewport().close_requested()) {
             self.handle_close_request(ui.ctx());
         }
         self.session.poll_maintenance(now_ms);
-        if self.session.poll_math() {
+        let math = self.session.poll_math();
+        let waveforms = self.session.poll_waveforms(now_ms);
+        let shuttle = self.session.poll_shuttle(now_ms);
+        if math || waveforms || shuttle {
             ui.ctx().request_repaint();
         }
         if self.session.recovery_prompt().is_none() {
@@ -807,6 +948,20 @@ impl MvmApp {
             .show(ui, |ui| {
                 timeline_ui::show(ui, &mut self.session, &mut self.timeline);
             });
+        // OS から落とされたファイルはプロジェクトパネルへ読み込む。Windows の OLE のドラッグ中は窓に pointer の
+        // 位置が届かず、どの行に落としたかを確かめられないので、timeline へは置かない。
+        let dropped: Vec<PathBuf> = ui.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .map(|file| file.path().to_path_buf())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            project_panel::import(&mut self.session, &dropped, "");
+            self.left_tab = LeftTab::Project;
+        }
         egui::Panel::left("project")
             .resizable(true)
             .default_size(260.0)
@@ -818,7 +973,9 @@ impl MvmApp {
                 });
                 ui.separator();
                 match self.left_tab {
-                    LeftTab::Project => project_panel::show(ui, self.session.project()),
+                    LeftTab::Project => {
+                        project_panel::show(ui, &mut self.session, &mut self.project_panel);
+                    }
                     LeftTab::Subtitles => subtitle_panel::show(
                         ui,
                         &mut self.session,
@@ -832,7 +989,11 @@ impl MvmApp {
             .resizable(true)
             .default_size(280.0)
             .show(ui, |ui| {
-                inspector::show(ui, &mut self.session, &mut self.inspector);
+                egui::ScrollArea::vertical()
+                    .id_salt("inspector_scroll")
+                    .show(ui, |ui| {
+                        inspector::show(ui, &mut self.session, &mut self.inspector);
+                    });
             });
         egui::CentralPanel::default().show(ui, |ui| {
             preview_ui::show(
@@ -841,6 +1002,7 @@ impl MvmApp {
                 &mut self.preview_texture,
                 &mut self.text_draft,
                 &mut self.notice,
+                &mut self.preview_drag,
             );
         });
         self.confirm_unsaved(ui);
@@ -852,6 +1014,14 @@ impl MvmApp {
             self.transcribe.open(&self.session, Some(clip_id));
         }
         transcribe_ui::show(ui, &mut self.session, &mut self.transcribe);
+        if let Some(clip_id) = self.timeline.speed_clip.take() {
+            self.speed.open(&mut self.session, &clip_id);
+        }
+        if let Some(clip_id) = self.timeline.match_settings_clip.take() {
+            self.settings.open_for_clip(&mut self.session, &clip_id);
+        }
+        clip_dialogs::show_speed(ui, &mut self.session, &mut self.speed);
+        clip_dialogs::show_settings(ui, &mut self.session, &mut self.settings);
         math_ui::show_manim_dialog(ui, &mut self.session, &mut self.manim);
         if std::mem::take(&mut self.close_now) {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1302,5 +1472,427 @@ mod tests {
         harness.run();
         harness.get_by_label("ラウドネスを揃える");
         harness.get_by_label("解析する");
+    }
+
+    fn video_clip(name: &str, start: i64) -> TimelineClip {
+        TimelineClip {
+            kind: TimelineClipKind::Video,
+            media_path: format!("{name}.mp4").into(),
+            name: name.to_owned(),
+            id: format!("id-{name}"),
+            media_item_id: "item".to_owned(),
+            source_fps: Rational::new(60, 1),
+            source_frame_count: 120,
+            source_out_frame: 120,
+            timeline_start_frame: start,
+            ..TimelineClip::default()
+        }
+    }
+
+    #[test]
+    fn the_project_panel_creates_a_folder_and_starts_renaming_it() {
+        let mut harness = harness(MvmApp::new());
+        harness.get_by_label("読み込み…");
+        harness.get_by_label("新規フォルダ").click();
+        harness.run();
+        let folders = &harness.state().session.project().media_folders;
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].name, "フォルダ 01");
+        // 作った直後は名前の入力欄になる。
+        let field = harness
+            .query_all_by_value("フォルダ 01")
+            .next()
+            .expect("名前の入力欄");
+        field.type_text("素材");
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        let name = &harness.state().session.project().media_folders[0].name;
+        assert_eq!(name, "フォルダ 01素材");
+        harness.get_by_label("フォルダ 01素材");
+    }
+
+    #[test]
+    fn the_track_buttons_add_video_and_audio_tracks() {
+        let mut harness = harness(MvmApp::new());
+        harness.get_by_label("+V").click();
+        harness.run();
+        harness.get_by_label("+A").click();
+        harness.run();
+        let project = harness.state().session.project();
+        assert_eq!(project.video_tracks.len(), 3);
+        assert_eq!(project.audio_tracks.len(), 2);
+        harness.get_by_label("V3");
+        harness.get_by_label("A2");
+    }
+
+    #[test]
+    fn the_settings_dialog_changes_the_frame_rate_in_one_undo() {
+        let mut harness = harness(MvmApp::new());
+        harness.get_by_label("ファイル").click();
+        harness.run();
+        harness.get_by_label("プロジェクト設定…").click();
+        harness.run();
+        harness.get_by_label("プロジェクト設定");
+        harness.get_by_value("60 fps").click();
+        harness.run();
+        harness.get_by_label("30 fps").click();
+        harness.run();
+        harness.get_by_label("適用").click();
+        harness.run();
+        assert!(harness.query_by_label("プロジェクト設定").is_none());
+        let fps = harness.state().session.project().timeline_fps;
+        assert_eq!(fps, Rational::new(30, 1));
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+        harness.run();
+        assert_eq!(
+            harness.state().session.project().timeline_fps,
+            Rational::new(60, 1)
+        );
+    }
+
+    #[test]
+    fn ctrl_r_opens_the_speed_dialog_only_for_a_clip_with_a_source() {
+        let mut harness = harness_with(vec![video_clip("映像", 0), text_clip("文字", 200)]);
+        harness
+            .state_mut()
+            .session
+            .select_only("id-映像".to_owned());
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::R);
+        harness.run();
+        harness.get_by_label("速度・デュレーション");
+        harness.get_by_label("オーディオのピッチを維持");
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        assert!(harness.query_by_label("速度・デュレーション").is_none());
+
+        harness
+            .state_mut()
+            .session
+            .select_only("id-文字".to_owned());
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::R);
+        harness.run();
+        assert!(harness.query_by_label("速度・デュレーション").is_none());
+        assert!(harness.state().notice.contains("速度を変えられません"));
+    }
+
+    #[test]
+    fn the_clip_menu_offers_the_edits_of_the_clip() {
+        let mut harness = harness_with(vec![video_clip("映像", 0)]);
+        harness.state_mut().session.seek(30);
+        harness.run();
+        harness.get_by_label("映像").click_secondary();
+        harness.run();
+        harness.get_by_label("速度・デュレーション…");
+        harness.get_by_label("プロジェクト設定をこの素材に合わせる");
+        harness.get_by_label("リップル削除（全トラック）");
+        assert!(harness.query_by_label("リンクを解除").is_none());
+        harness.get_by_label("フレーム保持を挿入").click();
+        harness.run();
+        let holds = harness
+            .state()
+            .session
+            .project()
+            .timeline_clips
+            .iter()
+            .filter(|clip| clip.frame_hold.is_some())
+            .count();
+        assert_eq!(holds, 1);
+    }
+
+    #[test]
+    fn the_inspector_animates_a_motion_channel_at_the_playhead() {
+        let mut harness = harness_with(vec![video_clip("映像", 0)]);
+        harness
+            .state_mut()
+            .session
+            .select_only("id-映像".to_owned());
+        harness.state_mut().session.seek(30);
+        harness.run();
+        harness.get_by_label("位置 X");
+        harness.get_by_label("縦横比を固定");
+        assert!(harness.query_by_label("音量").is_none());
+        // 1 つ目の「アニメ」は位置 X。
+        harness
+            .query_all_by_label("アニメ")
+            .next()
+            .expect("アニメの切り替え")
+            .click();
+        harness.run();
+        assert_eq!(harness.state().notice, "");
+        let keys = &harness.state().session.project().timeline_clips[0]
+            .effects
+            .position_x_keys;
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].frame, 30);
+        // キーのある channel は前後の移動とキーの切り替えを出す。
+        harness.get_by_label("キー").click();
+        harness.run();
+        let effects = &harness.state().session.project().timeline_clips[0].effects;
+        assert!(effects.position_x_keys.is_empty());
+    }
+
+    #[test]
+    fn the_inspector_edits_a_text_clip_in_one_commit() {
+        let mut heading = text_clip("見出し", 0);
+        heading.text.content = "見出し".to_owned();
+        // 書式の欄が全て見えるよう、縦に長い窓で開く。
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 1600.0))
+            .build_ui_state(|ui, app| app.show(ui), MvmApp::new());
+        harness.state_mut().session = Session::from_project(Project {
+            timeline_clips: vec![heading],
+            ..Project::default()
+        });
+        harness
+            .state_mut()
+            .session
+            .select_only("id-見出し".to_owned());
+        harness.run();
+        // timeline の clip 名も同じ文字を持つので、入力欄を役割で選ぶ。
+        let body = |node: &egui_kittest::kittest::AccessKitNode<'_>| {
+            node.role() == egui::accesskit::Role::MultilineTextInput
+                && node.value().as_deref() == Some("見出し")
+        };
+        harness.get_by(body).focus();
+        harness.run();
+        harness.key_press(egui::Key::End);
+        harness.get_by(body).type_text("を直す");
+        harness.run();
+        assert_eq!(
+            harness.state().session.project().timeline_clips[0]
+                .text
+                .content,
+            "見出し"
+        );
+        harness.get_by_label("文字を適用").click();
+        harness.run();
+        let clip = &harness.state().session.project().timeline_clips[0];
+        assert_eq!(clip.text.content, "見出しを直す");
+        assert_eq!(clip.name, "見出しを直す");
+    }
+
+    #[test]
+    fn an_audio_clip_shows_volume_and_fades_but_no_motion() {
+        let mut audio = video_clip("音", 0);
+        audio.kind = TimelineClipKind::Audio;
+        audio.track = TrackRef::audio(0);
+        let mut harness = harness_with(vec![audio]);
+        harness.state_mut().session.select_only("id-音".to_owned());
+        harness.run();
+        harness.get_by_label("音量");
+        harness.get_by_label("ダッキング");
+        harness.get_by_label("フェードイン");
+        assert!(harness.query_by_label("位置 X").is_none());
+    }
+
+    #[test]
+    fn j_and_k_run_and_stop_a_reverse_shuttle() {
+        // 試験の時計はすぐ進むので、先頭に着かない長さの clip の終わり近くから戻す。
+        let mut clip = text_clip("文字", 0);
+        clip.text.content = "文字".to_owned();
+        clip.source_frame_count = 100_000;
+        clip.source_out_frame = 100_000;
+        let mut harness = harness_with(vec![clip]);
+        harness.state_mut().session.seek(90_000);
+        harness.key_press(egui::Key::J);
+        harness.run_steps(2);
+        assert!(harness.state().session.playhead_frame() < 90_000);
+        assert_eq!(harness.state().session.shuttle_rate(), -1);
+        harness.get_by_label("シャトル -1 倍速（音声なし）");
+        harness.key_press(egui::Key::K);
+        harness.run_steps(2);
+        assert_eq!(harness.state().session.shuttle_rate(), 0);
+        assert!(
+            harness
+                .query_by_label("シャトル -1 倍速（音声なし）")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_playback_menu_lists_the_transport_with_its_keys() {
+        let mut harness = harness(MvmApp::new());
+        harness
+            .query_all_by_label("再生")
+            .next()
+            .expect("再生のメニュー")
+            .click();
+        harness.run();
+        harness.get_by_label_contains("左へシャトル");
+        harness.get_by_label_contains("次の編集点へ");
+        harness.get_by_label_contains("マーカーを追加");
+    }
+
+    #[test]
+    fn an_inspector_edit_lands_on_the_frame_where_it_started() {
+        let mut clip = video_clip("映像", 0);
+        clip.effects.position_x_keys = vec![
+            mvm_project::clip_effects::ClipKeyframe::new(0, 0.0),
+            mvm_project::clip_effects::ClipKeyframe::new(100, 50.0),
+        ];
+        let mut harness = harness_with(vec![clip]);
+        harness
+            .state_mut()
+            .session
+            .select_only("id-映像".to_owned());
+        harness.state_mut().session.seek(30);
+        harness.run();
+        // 位置 X は 30 frame で 15%。
+        let field = |node: &egui_kittest::kittest::AccessKitNode<'_>| {
+            node.role() == egui::accesskit::Role::SpinButton
+                && node.value().is_some_and(|value| value.starts_with("15"))
+        };
+        harness.get_by(field).focus();
+        harness.run();
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.get_by(|node| node.is_focused()).type_text("12");
+        harness.run();
+        // 入力の途中で再生ヘッドが動いても、下書きは消えず、始めた 30 frame へ書く。
+        harness.state_mut().session.seek(80);
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        let keys: Vec<_> = harness.state().session.project().timeline_clips[0]
+            .effects
+            .position_x_keys
+            .iter()
+            .map(|key| (key.frame, key.value))
+            .collect();
+        assert_eq!(keys, [(0, 0.0), (30, 12.0), (100, 50.0)]);
+    }
+
+    /// 試験で OS から落とすファイル。中身は読まない。
+    #[derive(Debug)]
+    struct DroppedPath(PathBuf);
+
+    impl egui::DroppedFile for DroppedPath {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            Err("試験では読まない".to_owned())
+        }
+    }
+
+    #[test]
+    fn a_file_dropped_from_the_os_goes_to_the_panel_not_the_timeline() {
+        let mut harness = harness(MvmApp::new());
+        // timeline の行の上に pointer を置いてから落としても、timeline には置かない。
+        let row = harness.get_by_label("V1").rect().center() + egui::vec2(400.0, 0.0);
+        harness.hover_at(row);
+        harness.run();
+        harness
+            .input_mut()
+            .dropped_files
+            .push(std::sync::Arc::new(DroppedPath(PathBuf::from(
+                "Z:/無い/素材.mp4",
+            ))));
+        harness.run();
+        let state = harness.state();
+        assert!(state.session.project().timeline_clips.is_empty());
+        // 読み込もうとして、読めなかったことを知らせる。
+        assert!(state.notice.contains("素材.mp4"), "{}", state.notice);
+        assert_eq!(state.left_tab, LeftTab::Project);
+    }
+
+    fn animated_clip(name: &str, start: i64) -> TimelineClip {
+        let mut clip = video_clip(name, start);
+        clip.effects.position_x_keys = vec![
+            mvm_project::clip_effects::ClipKeyframe::new(0, 0.0),
+            mvm_project::clip_effects::ClipKeyframe::new(100, 50.0),
+        ];
+        clip
+    }
+
+    /// 値が `prefix` で始まる、inspector の数値欄。
+    fn spin_starting_with(
+        prefix: &str,
+    ) -> impl Fn(&egui_kittest::kittest::AccessKitNode<'_>) -> bool {
+        move |node| {
+            node.role() == egui::accesskit::Role::SpinButton
+                && node.value().is_some_and(|value| value.starts_with(prefix))
+        }
+    }
+
+    #[test]
+    fn focusing_a_field_and_moving_the_playhead_adds_no_key() {
+        let mut harness = harness_with(vec![animated_clip("映像", 0)]);
+        harness
+            .state_mut()
+            .session
+            .select_only("id-映像".to_owned());
+        harness.state_mut().session.seek(30);
+        harness.run();
+        // 30 frame の位置 X（15%）の欄に入り、値を変えずに再生ヘッドを動かしてから抜ける。
+        harness.get_by(spin_starting_with("15")).focus();
+        harness.run();
+        harness.state_mut().session.seek(80);
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        let session = &harness.state().session;
+        assert_eq!(
+            session.project().timeline_clips[0]
+                .effects
+                .position_x_keys
+                .len(),
+            2,
+            "値を変えていないのにキーが増えました"
+        );
+        assert!(!session.can_undo());
+    }
+
+    #[test]
+    fn an_unfinished_edit_is_dropped_when_another_clip_is_selected() {
+        let mut harness = harness_with(vec![animated_clip("一", 0), animated_clip("二", 200)]);
+        harness.state_mut().session.select_only("id-一".to_owned());
+        harness.state_mut().session.seek(30);
+        harness.run();
+        harness.get_by(spin_starting_with("15")).focus();
+        harness.run();
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.get_by(|node| node.is_focused()).type_text("40");
+        harness.run();
+        // 確定せずに別の clip を選び、元の clip へ戻る。
+        harness.state_mut().session.select_only("id-二".to_owned());
+        harness.run();
+        harness.state_mut().session.select_only("id-一".to_owned());
+        harness.run();
+        // 戻っても未確定の 40 は出ず、Project の 15% を見せる。
+        assert!(harness.query_by(spin_starting_with("40")).is_none());
+        harness.get_by(spin_starting_with("15"));
+        assert!(!harness.state().session.can_undo());
+    }
+
+    #[test]
+    fn a_folder_is_dragged_into_another_folder_and_back_to_the_root() {
+        let folder = |id: &str, name: &str| MediaFolder {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            parent_id: String::new(),
+        };
+        let project = Project {
+            media_folders: vec![folder("a", "フォルダA"), folder("b", "フォルダB")],
+            ..Project::default()
+        };
+        let mut harness = harness(MvmApp::new());
+        harness.state_mut().session = Session::from_project(project);
+        harness.run();
+        let from = harness.get_by_label("フォルダA").rect().center();
+        let to = harness.get_by_label("フォルダB").rect().center();
+        press_and_release(&mut harness, from, to);
+        let parent = |harness: &Harness<'static, MvmApp>| {
+            harness.state().session.project().media_folders[0]
+                .parent_id
+                .clone()
+        };
+        assert_eq!(parent(&harness), "b", "フォルダをフォルダへ移せません");
+        // 開いたフォルダB の中の A を、パネル下の空白（root）へ戻す。
+        let from = harness.get_by_label("フォルダA").rect().center();
+        let empty = harness.get_by_label("フォルダB").rect().center() + egui::vec2(0.0, 300.0);
+        press_and_release(&mut harness, from, empty);
+        assert_eq!(parent(&harness), "", "root へ戻せません");
     }
 }

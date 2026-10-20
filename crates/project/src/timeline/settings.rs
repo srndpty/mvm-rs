@@ -103,6 +103,40 @@ pub fn install_manim_asset(
     Ok(selected)
 }
 
+/// 映像素材に合わせた Project の解像度と fps。Project は正方画素だけを持つので、anamorphic の素材は SAR を横幅へ
+/// 反映し、yuv420p で書き出せる偶数 pixel へ丸める（横は最も近い偶数、縦は切り上げ）。
+pub fn video_settings_for_media(
+    width: i32,
+    height: i32,
+    sar: Rational,
+    fps: Rational,
+) -> ProjectResult<(i32, i32, Rational)> {
+    let Some(fps) = fps.reduced() else {
+        return fail("素材の frame rate が不正です");
+    };
+    if !is_configurable_timeline_frame_rate(fps) {
+        return fail(format!(
+            "素材の frame rate（{}/{} fps）は Project 設定で対応していません",
+            fps.num, fps.den
+        ));
+    }
+    if width <= 0 || height <= 0 || !sar.is_positive() {
+        return fail("素材の解像度が不正です");
+    }
+    // 横 = round(width * sar / 2) * 2。整数で四捨五入する。
+    let numerator = i128::from(width) * i128::from(sar.num);
+    let denominator = i128::from(sar.den) * 2;
+    let half = (numerator * 2 + denominator) / (denominator * 2);
+    let output_width = i32::try_from(half * 2).unwrap_or(i32::MAX);
+    let output_height = height.saturating_add(1) / 2 * 2;
+    if !is_valid_project_output_size(output_width, output_height) {
+        return fail(format!(
+            "素材から導出した出力解像度が対応範囲外です: {output_width}×{output_height}"
+        ));
+    }
+    Ok((output_width, output_height, fps))
+}
+
 /// 解像度と timeline fps を 1 つの transaction で変更する。既存 clip の素材 domain は変えず、timeline 上の位置
 /// （開始・マーカー・イン/アウト・トランジションの長さ・字幕・clip 内の effect key）だけを、秒の位置が保たれるよう
 /// 新 fps へ換算する。key は新しい clip 尺の末尾 frame へ寄せ、同じ frame に重なったものは先の 1 つを残す。

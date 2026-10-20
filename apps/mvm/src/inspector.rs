@@ -3,7 +3,6 @@
 use eframe::egui;
 use mvm_app::Session;
 use mvm_core::timecode::format_timecode;
-use mvm_project::clip_effects::ClipKeyKind;
 use mvm_project::timeline::clip_interval;
 use mvm_project::{Project, TimelineClipKind};
 
@@ -20,11 +19,10 @@ pub struct InspectorState {
     clip_id: Option<String>,
     /// 下書きを読んだときの [`Session::edit_revision`]。undo などで Project が変われば読み直す。
     revision: u64,
-    opacity: f64,
-    volume: f64,
     speed_percent: f64,
     spans: Vec<SpanDraft>,
     math: crate::math_ui::MathInspector,
+    motion: crate::motion_ui::MotionState,
 }
 
 #[derive(Clone, Debug)]
@@ -39,11 +37,10 @@ impl Default for InspectorState {
         Self {
             clip_id: None,
             revision: 0,
-            opacity: 100.0,
-            volume: 100.0,
             speed_percent: 100.0,
             spans: Vec::new(),
             math: crate::math_ui::MathInspector::default(),
+            motion: crate::motion_ui::MotionState::default(),
         }
     }
 }
@@ -64,10 +61,12 @@ pub fn show(ui: &mut egui::Ui, session: &mut Session, state: &mut InspectorState
             ui.label("選択なし");
         }
         math_button(ui, session);
+        state.motion.forget();
         return;
     };
     let Some(clip) = session.project().clip(&id).cloned() else {
         ui.label("選択なし");
+        state.motion.forget();
         return;
     };
     if state.clip_id.as_deref() != Some(id.as_str()) || state.revision != session.edit_revision() {
@@ -84,35 +83,6 @@ pub fn show(ui: &mut egui::Ui, session: &mut Session, state: &mut InspectorState
             ui.label(error.to_string());
         }
     }
-    if clip.kind == TimelineClipKind::Audio {
-        let response = ui.add(
-            egui::DragValue::new(&mut state.volume)
-                .range(0.0..=200.0)
-                .speed(1.0)
-                .suffix(" % 音量"),
-        );
-        if response.drag_stopped() || response.lost_focus() {
-            report!(
-                session,
-                session.set_effect(&id, ClipKeyKind::Volume, state.volume)
-            );
-        }
-        key_list(ui, session, &clip, ClipKeyKind::Volume);
-    } else {
-        let response = ui.add(
-            egui::DragValue::new(&mut state.opacity)
-                .range(0.0..=100.0)
-                .speed(1.0)
-                .suffix(" % 不透明度"),
-        );
-        if response.drag_stopped() || response.lost_focus() {
-            report!(
-                session,
-                session.set_effect(&id, ClipKeyKind::Opacity, state.opacity),
-            );
-        }
-        key_list(ui, session, &clip, ClipKeyKind::Opacity);
-    }
     if !clip.has_synthetic_source_domain() {
         let response = ui.add(
             egui::DragValue::new(&mut state.speed_percent)
@@ -125,6 +95,7 @@ pub fn show(ui: &mut egui::Ui, session: &mut Session, state: &mut InspectorState
             report!(session, session.set_speed_percent(&id, percent));
         }
     }
+    crate::motion_ui::show(ui, session, &mut state.motion, &clip);
     let mut span_edit = None;
     let mut span_delete = None;
     for span in &mut state.spans {
@@ -175,30 +146,10 @@ fn math_button(ui: &mut egui::Ui, session: &mut Session) {
     }
 }
 
-fn key_list(
-    ui: &mut egui::Ui,
-    session: &mut Session,
-    clip: &mvm_project::TimelineClip,
-    kind: ClipKeyKind,
-) {
-    let mut remove = None;
-    for key in clip.effects.keys(kind) {
-        let label = format!("{} frame のキーを削除", key.frame);
-        if ui.button(label).clicked() {
-            remove = Some(key.frame);
-        }
-    }
-    if let Some(frame) = remove {
-        report!(session, session.delete_key(&clip.id, kind, frame));
-    }
-}
-
 fn load(session: &Session, clip: &mvm_project::TimelineClip, state: &mut InspectorState) {
     let project = session.project();
     state.clip_id = Some(clip.id.clone());
     state.revision = session.edit_revision();
-    state.opacity = clip.effects.base(ClipKeyKind::Opacity);
-    state.volume = clip.effects.base(ClipKeyKind::Volume);
     state.speed_percent = if clip.speed.den == 0 {
         100.0
     } else {

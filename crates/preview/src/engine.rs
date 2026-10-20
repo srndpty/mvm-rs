@@ -63,12 +63,31 @@ impl Command {
     }
 }
 
+/// 1 回に受けた command のうち、後に Seek / Play（どちらも描く）が続く Seek を除く。除いた Seek の frame と
+/// 世代は後の command が上書きするので、描かないこと以外は変わらない。
+fn coalesce_seeks(batch: Vec<Command>) -> Vec<Command> {
+    let last_draw = batch
+        .iter()
+        .rposition(|command| matches!(command, Command::Seek { .. } | Command::Play { .. }));
+    batch
+        .into_iter()
+        .enumerate()
+        .filter(|(index, command)| {
+            !matches!(command, Command::Seek { .. }) || Some(*index) == last_draw
+        })
+        .map(|(_, command)| command)
+        .collect()
+}
+
 struct Mail {
     lock: Mutex<MailInner>,
     changed: Condvar,
     wake: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// UI が最後に送った command の世代。worker が panic したら、この世代で知らせる。
     requested: AtomicU64,
+    /// 試験用: worker が出した画像の枚数。
+    #[cfg(test)]
+    published: AtomicU64,
 }
 
 struct MailInner {
@@ -99,6 +118,8 @@ impl Mail {
             changed: Condvar::new(),
             wake: Mutex::new(None),
             requested: AtomicU64::new(0),
+            #[cfg(test)]
+            published: AtomicU64::new(0),
         }
     }
 
@@ -141,6 +162,8 @@ impl Mail {
     }
 
     fn publish_image(&self, generation: u64, image: PreviewImage) {
+        #[cfg(test)]
+        self.published.fetch_add(1, Ordering::Relaxed);
         let mut inner = self.enter(generation);
         inner.image = Some(image);
         inner.error = None;
@@ -225,14 +248,17 @@ impl Worker {
                 }
             };
             if let Some(command) = command {
-                if !self.handle(command) {
-                    break;
-                }
+                // 溜まった command をまとめて受け、後で描き直す Seek は描かずに飛ばす（シャトルやスクラブで seek が
+                // 描画より速く届いても、待ち行列を伸ばさず最新の frame だけを描く）。
+                let mut batch = vec![command];
                 while let Ok(command) = commands.try_recv() {
-                    if !self.handle(command) {
-                        self.shutdown();
-                        return;
-                    }
+                    batch.push(command);
+                }
+                if !coalesce_seeks(batch)
+                    .into_iter()
+                    .all(|command| self.handle(command))
+                {
+                    break;
                 }
             }
             if self.playing
@@ -655,6 +681,145 @@ mod tests {
             "再生が 300 から始まっていません: {}",
             image.frame
         );
+    }
+
+    fn names(batch: &[Command]) -> Vec<String> {
+        batch
+            .iter()
+            .map(|command| match command {
+                Command::Seek { frame, .. } => format!("seek {frame}"),
+                Command::Play { frame, .. } => format!("play {frame}"),
+                Command::Pause { .. } => "pause".to_owned(),
+                Command::Shutdown => "shutdown".to_owned(),
+                _ => "other".to_owned(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn only_the_last_queued_seek_is_drawn() {
+        let seek = |frame| Command::Seek {
+            frame,
+            generation: 1,
+        };
+        let kept = coalesce_seeks(vec![
+            seek(1),
+            seek(2),
+            Command::Pause { generation: 2 },
+            seek(3),
+        ]);
+        assert_eq!(names(&kept), ["pause", "seek 3"]);
+        // 後に Play があれば、Play が描くので Seek は描かない。
+        let kept = coalesce_seeks(vec![
+            seek(4),
+            Command::Play {
+                frame: 5,
+                generation: 3,
+            },
+        ]);
+        assert_eq!(names(&kept), ["play 5"]);
+        // Play の後の Seek は描く。Shutdown は残す。
+        let kept = coalesce_seeks(vec![
+            Command::Play {
+                frame: 5,
+                generation: 3,
+            },
+            seek(6),
+            Command::Shutdown,
+        ]);
+        assert_eq!(names(&kept), ["play 5", "seek 6", "shutdown"]);
+    }
+
+    #[test]
+    fn a_flood_of_seeks_ends_on_the_last_requested_frame() {
+        let engine = PreviewEngine::start().expect("起動");
+        let project = Project {
+            timeline_clips: vec![span(600)],
+            ..Project::default()
+        };
+        engine
+            .set_project(Arc::new(project), Arc::new(MathLibrary::default()), 1)
+            .unwrap();
+        // シャトルのように、描くより速く seek を送る。世代は送るたびに進める。
+        for frame in 0..300_u64 {
+            engine.seek(frame as i64, frame + 2).unwrap();
+        }
+        let image = engine
+            .wait_image_until(Duration::from_secs(5), |image| image.frame == 299)
+            .expect("最後に要求した frame が届きません");
+        assert_eq!(image.frame, 299);
+        // 最後の画像の後に、古い seek の画像が届かない。
+        std::thread::sleep(Duration::from_millis(100));
+        let delivery = engine.poll().expect("通知");
+        assert_eq!(delivery.generation, 301);
+        if let Some(image) = delivery.image {
+            assert_eq!(image.frame, 299);
+        }
+    }
+
+    fn flooded_engine(frames: i64) -> PreviewEngine {
+        let engine = PreviewEngine::start().expect("起動");
+        let project = Project {
+            timeline_clips: vec![span(frames)],
+            ..Project::default()
+        };
+        engine
+            .set_project(Arc::new(project), Arc::new(MathLibrary::default()), 1)
+            .unwrap();
+        for frame in 0..frames {
+            engine.seek(frame, frame as u64 + 2).unwrap();
+        }
+        engine
+    }
+
+    #[test]
+    fn a_pause_after_a_flood_of_seeks_publishes_no_later_frame() {
+        let engine = flooded_engine(300);
+        engine.pause(1_000).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        // 止めた世代の画像は届かない（UI は古い世代の画像を捨てる）。
+        if let Some(delivery) = engine.poll() {
+            assert!(
+                delivery.generation < 1_000 || delivery.image.is_none(),
+                "止めた後に frame を出しました"
+            );
+        }
+    }
+
+    #[test]
+    fn a_project_change_after_a_flood_of_seeks_shows_only_the_new_project() {
+        let engine = flooded_engine(300);
+        let smaller = Project {
+            timeline_clips: vec![span(60)],
+            output_width: 1280,
+            output_height: 720,
+            ..Project::default()
+        };
+        engine
+            .set_project(Arc::new(smaller), Arc::new(MathLibrary::default()), 1_000)
+            .unwrap();
+        engine.seek(10, 1_001).unwrap();
+        let image = engine
+            .wait_image_until(Duration::from_secs(5), |image| image.frame == 10)
+            .expect("新しい Project の frame が届きません");
+        assert_eq!((image.width, image.height), (1280, 720));
+        std::thread::sleep(Duration::from_millis(100));
+        let delivery = engine.poll().expect("通知");
+        assert_eq!(delivery.generation, 1_001);
+        if let Some(image) = delivery.image {
+            assert_eq!(image.width, 1280, "古い Project の画像が後から届きました");
+        }
+    }
+
+    #[test]
+    fn shutting_down_after_a_flood_of_seeks_does_not_draw_them_all() {
+        let engine = flooded_engine(300);
+        let mail = Arc::clone(&engine.mail);
+        drop(engine);
+        // 終了までに描くのは、worker が受け取った batch ごとの最後の seek だけ。300 枚を順に描いていないことを、
+        // 出した画像の枚数で確かめる（描画の速さには依らない）。
+        let published = mail.published.load(Ordering::Relaxed);
+        assert!(published < 30, "{published} 枚描きました");
     }
 
     #[test]

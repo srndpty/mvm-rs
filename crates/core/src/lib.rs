@@ -6,6 +6,7 @@ pub mod export_eta;
 pub mod layer_placement;
 pub mod output_timebase;
 pub mod rational;
+pub mod shuttle;
 pub mod source_frame_mapping;
 pub mod text_offsets;
 pub mod timecode;

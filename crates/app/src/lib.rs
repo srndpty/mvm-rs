@@ -13,22 +13,28 @@ mod history;
 mod manim_clip;
 mod math;
 mod math_commands;
+mod media;
 mod mixer;
 mod preferences;
 mod recovery_pump;
 mod session;
+mod shuttle;
 mod subtitles;
+mod timeline_commands;
 mod timeline_view;
 mod transcribe;
+mod waveforms;
 
 pub use audio_adjust::{AudioAdjustmentClipReport, AudioAdjustmentOutcome};
 pub use error::AppError;
 pub use math::MathClipStatus;
+pub use media::{ImportReport, RemovalPlan};
 pub use mvm_export::{ExportError, ExportProgress, ExportQuality, ExportRequest, ExportSummary};
 pub use mvm_preview::{MeterPeaks, PreviewImage};
 pub use mvm_project::audio_adjustment::AudioAdjustmentSettings;
 pub use preferences::Preferences;
 pub use session::{RecoveryPrompt, Session};
+pub use timeline_commands::VideoSettings;
 pub use timeline_view::{
     MAX_PIXELS_PER_FRAME, MIN_PIXELS_PER_FRAME, TimeWindow, clamp_pixels_per_frame,
     display_span_frames, ranges_overlap, ruler_step, visible_window,

@@ -5,9 +5,13 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use mvm_core::Rational;
+use mvm_core::rational::div_ceil;
+
 use crate::error::{ProjectResult, fail};
 use crate::model::{
-    MediaFolder, MediaItem, MediaKind, Project, TimelineClipKind, is_canonical_frame_rate,
+    MediaFolder, MediaItem, MediaKind, Project, TimelineClip, TimelineClipKind,
+    default_still_clip_frames, is_canonical_frame_rate,
 };
 use crate::path_identity::canonical_path_key;
 use crate::timeline::finalize_timeline_candidate;
@@ -421,4 +425,110 @@ pub fn remove_media_bin_entries(
     finalize_timeline_candidate(&mut candidate)?;
     commit(project, candidate)?;
     Ok(plan.clip_ids)
+}
+
+/// 素材 1 つを timeline へ置くときの clip。音声を持つ動画は `linked_audio` にリンク相手を持つ。
+/// 置き場所（track・開始位置）は呼び出し側が決める。
+#[derive(Clone, Debug, PartialEq)]
+pub struct MediaClips {
+    pub primary: TimelineClip,
+    pub linked_audio: Option<TimelineClip>,
+}
+
+/// 音声素材の尺を timeline の frame 数にする（端数は切り上げ）。音声素材は fps を持たないので、timeline の fps を
+/// 素材の frame domain に使う。
+pub fn audio_source_frame_count(
+    duration_samples: i64,
+    sample_rate: i32,
+    timeline_fps: Rational,
+) -> ProjectResult<i64> {
+    if duration_samples <= 0 || sample_rate <= 0 || !timeline_fps.is_positive() {
+        return fail("音声素材の尺または frame rate が不正です");
+    }
+    let numerator = i128::from(duration_samples) * i128::from(timeline_fps.num);
+    let denominator = i128::from(sample_rate) * i128::from(timeline_fps.den);
+    match i64::try_from(div_ceil(numerator, denominator)) {
+        Ok(frames) if frames >= 1 => Ok(frames),
+        _ => fail("音声素材の尺を frame 数へ変換できません"),
+    }
+}
+
+/// パネルの素材から timeline へ置く clip を作る。`has_audio` は動画に音声 stream があるか（素材の値には無く、
+/// 調べた時点の事実）。clip の名前はファイル名にする。
+pub fn media_clips_for_item(
+    project: &Project,
+    item_id: &str,
+    has_audio: bool,
+    new_id: &mut dyn FnMut() -> String,
+) -> ProjectResult<MediaClips> {
+    let Some(item) = find_media_item(project, item_id) else {
+        return fail("素材がありません");
+    };
+    let clip = |kind: TimelineClipKind, fps: Rational, frames: i64, id: String| TimelineClip {
+        kind,
+        media_path: item.media_path.clone(),
+        name: item.media_path.file_name().map_or_else(
+            || item.name.clone(),
+            |name| name.to_string_lossy().into_owned(),
+        ),
+        id,
+        media_item_id: item.id.clone(),
+        source_fps: fps,
+        source_frame_count: frames,
+        source_in_frame: 0,
+        source_out_frame: frames,
+        ..TimelineClip::default()
+    };
+    let clips = match item.kind {
+        MediaKind::Video => {
+            let mut primary = clip(
+                TimelineClipKind::Video,
+                item.fps,
+                item.frame_count,
+                new_id(),
+            );
+            let linked_audio = has_audio.then(|| {
+                let mut audio = clip(
+                    TimelineClipKind::Audio,
+                    item.fps,
+                    item.frame_count,
+                    new_id(),
+                );
+                let group = new_id();
+                primary.link_group_id.clone_from(&group);
+                audio.link_group_id = group;
+                audio
+            });
+            MediaClips {
+                primary,
+                linked_audio,
+            }
+        }
+        MediaKind::Audio => {
+            let frames = audio_source_frame_count(
+                item.duration_samples,
+                item.sample_rate,
+                project.timeline_fps,
+            )?;
+            MediaClips {
+                primary: clip(
+                    TimelineClipKind::Audio,
+                    project.timeline_fps,
+                    frames,
+                    new_id(),
+                ),
+                linked_audio: None,
+            }
+        }
+        MediaKind::Image => MediaClips {
+            primary: clip(
+                TimelineClipKind::Image,
+                project.timeline_fps,
+                default_still_clip_frames(project.timeline_fps),
+                new_id(),
+            ),
+            linked_audio: None,
+        },
+    };
+    Ok(clips)
 }

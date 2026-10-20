@@ -88,6 +88,10 @@ pub struct Session {
     pub(crate) load_serial: u64,
     /// 端末の設定を読めないので数式の描画を始められない理由。「再試行」で読み直す。
     pub(crate) math_blocked: Option<String>,
+    /// timeline に描く音声波形。素材 file ごとに背景で読む。
+    pub(crate) waveforms: crate::waveforms::Waveforms,
+    /// J / L の倍速・逆方向の送り。1 倍の正方向は通常の再生なので持たない。
+    pub(crate) shuttle: Option<crate::shuttle::ShuttleState>,
 }
 
 #[derive(Clone)]
@@ -169,6 +173,8 @@ impl Session {
             math: None,
             load_serial: 1,
             math_blocked: None,
+            waveforms: crate::waveforms::Waveforms::default(),
+            shuttle: None,
         }
     }
 

@@ -12,7 +12,7 @@ use mvm_core::Rational;
 use mvm_core::output_timebase::OutputTimebase;
 use mvm_math::require_ready;
 use mvm_media::Mp4Settings;
-use mvm_platform::{FileProbeStatus, ReplaceApproval, probe_file};
+use mvm_platform::{FileProbe, FileProbeStatus, ReplaceApproval, probe_file};
 use mvm_preview::{AudioSpan, MathLibrary, audio_spans, output_size, output_timebase};
 use mvm_project::timeline::validate_timeline;
 use mvm_project::{ManimGenerationState, Project, TimelineClipKind};
@@ -89,6 +89,44 @@ pub struct ExportPlan {
     pub audio_spans: Vec<AudioSpan>,
     /// 描けた数式。出力する数式・数式列・Graph のラベルは全てここにある（計画の時点で確かめる）。
     pub math: Arc<MathLibrary>,
+    /// 出力する clip が読む素材の、計画の時点の実体。書き終えたら照合する。
+    pub sources: SourceManifest,
+}
+
+/// 書き出しが読む素材 file の実体（volume・file ID・大きさ・更新時刻）の控え。
+///
+/// 書き終えた後に照合し、変わっていれば書き出した file を公開しない。照合は始めと終わりの 2 点だけなので、
+/// 途中で書き換えて元の実体へ戻した場合までは見分けない。decode が file を開き直す時点によっては、書き換えの
+/// 前後の中身が混ざる。書き換えを防ぐ（素材を開いたまま共有を拒む、snapshot を取る）ものではない。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SourceManifest {
+    sources: Vec<(PathBuf, FileProbe)>,
+}
+
+impl SourceManifest {
+    /// 出力する clip（有効で、出力する track にある）の素材の今の実体を控える。
+    pub fn capture(project: &Project) -> Self {
+        let mut sources: Vec<(PathBuf, FileProbe)> = Vec::new();
+        for clip in &project.timeline_clips {
+            if !clip.enabled
+                || !project.is_track_output_enabled(clip.track)
+                || clip.media_path.as_os_str().is_empty()
+                || sources.iter().any(|(path, _)| *path == clip.media_path)
+            {
+                continue;
+            }
+            sources.push((clip.media_path.clone(), probe_file(&clip.media_path)));
+        }
+        Self { sources }
+    }
+
+    /// 控えた時点と実体が違う最初の素材。
+    pub fn changed(&self) -> Option<&Path> {
+        self.sources
+            .iter()
+            .find(|(path, probe)| probe_file(path) != *probe)
+            .map(|(path, _)| path.as_path())
+    }
 }
 
 impl ExportPlan {
@@ -115,6 +153,7 @@ pub fn plan_export(
 ) -> Result<ExportPlan, ExportError> {
     let output_path = check_output_path(&request.output_path)?;
     let replace = check_existing_output(&output_path, request.replace.as_ref())?;
+    let sources = SourceManifest::capture(project);
     reject_source_as_output(project, &output_path)?;
     let validation =
         validate_timeline(project).map_err(|error| ExportError::failed(error.to_string()))?;
@@ -157,6 +196,7 @@ pub fn plan_export(
         timebase,
         audio_spans: spans,
         math,
+        sources,
     })
 }
 
@@ -501,6 +541,42 @@ mod tests {
         )
         .expect("新しい file");
         assert!(plan.replace.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_manifest_notices_a_source_rewritten_after_planning() {
+        let dir = std::env::temp_dir().join(format!("mvm-plan-manifest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let used = dir.join("used.mp4");
+        let unused = dir.join("unused.mp4");
+        std::fs::write(&used, b"used").unwrap();
+        std::fs::write(&unused, b"unused").unwrap();
+        let mut shown = video("shown", 10);
+        shown.media_path = used.clone();
+        let mut disabled = video("disabled", 10);
+        disabled.media_path = unused.clone();
+        disabled.enabled = false;
+        disabled.timeline_start_frame = 20;
+        let project = Project {
+            timeline_clips: vec![shown, disabled],
+            ..Project::default()
+        };
+        let plan = plan_export(
+            &project,
+            &request(&dir.join("out.mp4").to_string_lossy()),
+            Arc::new(MathLibrary::default()),
+        )
+        .unwrap();
+        assert_eq!(plan.sources.changed(), None);
+        // 出力しない clip の素材が変わっても問わない。
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&unused, b"rewritten").unwrap();
+        assert_eq!(plan.sources.changed(), None);
+        // 出力する clip の素材が変われば見つける（大きさが同じでも更新時刻で）。
+        std::fs::write(&used, b"USED").unwrap();
+        assert_eq!(plan.sources.changed(), Some(used.as_path()));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

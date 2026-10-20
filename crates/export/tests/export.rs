@@ -620,3 +620,70 @@ fn graph_clips_are_exported_like_the_preview() {
     );
     std::fs::remove_dir_all(&dir).expect("片付け");
 }
+
+/// 指定の frame を書いたところで素材の更新時刻を変える（外部の tool が素材を書き換えた代わり）。
+struct TouchSource {
+    source: PathBuf,
+    at: i64,
+}
+
+impl ExportControl for TouchSource {
+    fn progress(&self, completed: i64, _total: i64) {
+        if completed == self.at {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&self.source)
+                .expect("素材を開く");
+            file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+                .expect("更新時刻を変える");
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        false
+    }
+}
+
+#[test]
+#[ignore = "workstation"]
+fn a_source_rewritten_while_exporting_is_not_published() {
+    let _gpu = gpu();
+    let dir = work_dir("source-changed");
+    let media = dir.join("source.mp4");
+    std::fs::copy(smoke("v1080p60_h264.mp4"), &media).expect("素材の複製");
+    let project = Project {
+        timeline_clips: vec![video_clip("clip", &media, 0, 0, 30)],
+        ..Project::default()
+    };
+    let output = dir.join("changed.mp4");
+    let plan = plan_export(
+        &project,
+        &request(&output, ExportQuality::Compact),
+        std::sync::Arc::new(MathLibrary::default()),
+    )
+    .expect("計画");
+    let control = TouchSource {
+        source: media.clone(),
+        at: 5,
+    };
+    let error = run_export(&project, &plan, &control).unwrap_err();
+    assert!(
+        matches!(&error, ExportError::Failed(message) if message.contains("素材が変わりました")),
+        "{error}"
+    );
+    assert!(
+        !output.exists() && temporaries(&output).is_empty(),
+        "素材が変わった書き出しを置きました"
+    );
+
+    // 素材が変わらなければ置く（負の対照）。
+    let plan = plan_export(
+        &project,
+        &request(&output, ExportQuality::Compact),
+        std::sync::Arc::new(MathLibrary::default()),
+    )
+    .expect("計画");
+    run_export(&project, &plan, &Recorder::default()).expect("書き出し");
+    assert!(output.is_file());
+    std::fs::remove_dir_all(&dir).expect("片付け");
+}

@@ -577,6 +577,7 @@ impl MvmApp {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("ファイル", |ui| {
                 // 書き出し中は Project を切り替えない（書き出しは開始時の Project を書き続ける）。
+                // 名前を付けて保存も session を入れ直すので同じ扱いにする。
                 let switchable = !self.session.is_exporting();
                 if ui
                     .add_enabled(switchable, egui::Button::new("新規プロジェクト"))
@@ -599,7 +600,10 @@ impl MvmApp {
                     self.save();
                     ui.close();
                 }
-                if ui.button("名前を付けて保存").clicked() {
+                if ui
+                    .add_enabled(switchable, egui::Button::new("名前を付けて保存"))
+                    .clicked()
+                {
                     self.save_as();
                     ui.close();
                 }

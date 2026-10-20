@@ -6,9 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use mvm_core::timecode::format_timecode;
-use mvm_platform::{
-    ProjectLock, ReplaceApproval, atomic_create, atomic_replace_approved, atomic_write, probe_file,
-};
+use mvm_platform::{CommitPolicy, ProjectLock, ReplaceApproval, commit_bytes};
 use mvm_preview::{PreviewEngine, PreviewImage, plan_frame};
 use mvm_project::Project;
 use mvm_project::json::{parse_project_json, serialize_project_json};
@@ -64,7 +62,12 @@ pub struct Session {
     pub(crate) autosave_note: bool,
     pub(crate) lock: Option<ProjectLock>,
     pub(crate) canonical_sha256: String,
-    pub(crate) file_stamp: Option<(u64, i64)>,
+    /// 保存先の file のうち、この session が最後に読んだか書いた実体。上書き保存はこの実体だけを置き換える。
+    /// 無ければ（読んだ後に消えていた）新しい file として書く。
+    canonical_file: Option<ReplaceApproval>,
+    /// 外部変更を見つけたときの保存先の実体。利用者が「上書き」を選んだら、この実体だけを置き換える
+    /// （見つけた後にさらに変わっていれば置き換えない）。無ければ（消えていた）新しい file として書く。
+    external_file: Option<ReplaceApproval>,
     pub(crate) external_change: bool,
     pub(crate) recovery: Option<RecoveryOffer>,
     pub(crate) recovery_corrupt: bool,
@@ -118,20 +121,13 @@ pub enum ExistingFile {
 }
 
 impl ExistingFile {
-    fn write(&self, path: &Path, bytes: &[u8]) -> Result<(), AppError> {
-        match self {
-            Self::Keep => atomic_create(path, bytes),
-            Self::Replace(approval) => {
-                if approval.path() != path {
-                    return Err(AppError::new(format!(
-                        "置き換えを承認した file と保存先が違います: {}",
-                        path.display()
-                    )));
-                }
-                atomic_replace_approved(approval, bytes)
-            }
-        }
-        .map_err(|error| AppError::new(error.to_string()))
+    /// 書いた file の実体を返す（次の上書き保存の承認になる）。
+    fn write(&self, path: &Path, bytes: &[u8]) -> Result<ReplaceApproval, AppError> {
+        let policy = match self {
+            Self::Keep => CommitPolicy::CreateNew,
+            Self::Replace(approval) => CommitPolicy::ReplaceApproved(approval),
+        };
+        commit_bytes(path, bytes, policy).map_err(|error| AppError::new(error.to_string()))
     }
 }
 
@@ -189,7 +185,8 @@ impl Session {
             autosave_note: false,
             lock: None,
             canonical_sha256: String::new(),
-            file_stamp: None,
+            canonical_file: None,
+            external_file: None,
             external_change: false,
             recovery: None,
             recovery_corrupt: false,
@@ -415,13 +412,16 @@ impl Session {
         let project = Project::default();
         let bytes = project_bytes(&project, &path)?;
         let lock = self.acquire_lock(&path)?;
-        if let Err(error) = existing.write(&path, &bytes) {
-            self.restore_unused_lock(lock);
-            return Err(error);
-        }
+        let written = match existing.write(&path, &bytes) {
+            Ok(written) => written,
+            Err(error) => {
+                self.restore_unused_lock(lock);
+                return Err(error);
+            }
+        };
         // 前の Project の文字起こし・自動音量・Manim の作業は取り消して捨てる（別の Project へ適用しない）。
         self.background.abandon();
-        self.install(project, path, false, lock, sha256_hex(&bytes));
+        self.install(project, path, lock, sha256_hex(&bytes), Some(written));
         Ok(())
     }
 
@@ -429,12 +429,7 @@ impl Session {
     pub fn open_project(&mut self, path: &Path) -> Result<(), AppError> {
         self.refuse_switch_while_exporting()?;
         let path = absolute_path(path)?;
-        let bytes = std::fs::read(&path).map_err(|error| {
-            AppError::new(format!(
-                "Project を読めません ({}): {error}",
-                path.display()
-            ))
-        })?;
+        let (bytes, file) = read_with_identity(&path)?;
         let text = String::from_utf8(bytes.clone()).map_err(|_| {
             AppError::new(format!(
                 "Project が UTF-8 ではありません ({})",
@@ -445,7 +440,7 @@ impl Session {
             parse_project_json(&text, &path).map_err(|error| AppError::new(error.to_string()))?;
         let lock = self.acquire_lock(&path)?;
         self.background.abandon();
-        self.install(project, path, false, lock, sha256_hex(&bytes));
+        self.install(project, path, lock, sha256_hex(&bytes), Some(file));
         Ok(())
     }
 
@@ -461,6 +456,8 @@ impl Session {
     /// 別の file へ保存し、それを現在の保存先にする。既存の file は `existing` が
     /// [`ExistingFile::Replace`] のときだけ置き換える（今の保存先へ書き直すときも同じ）。
     pub fn save_project_as(&mut self, path: &Path, existing: ExistingFile) -> Result<(), AppError> {
+        // 保存先を変えると session を入れ直す（履歴・選択・preview）。書き出し中は Project の切り替えと同じく拒む。
+        self.refuse_switch_while_exporting()?;
         let path = absolute_path(path)?;
         let lock = self.acquire_lock(&path)?;
         let bytes = match project_bytes(&self.project, &path) {
@@ -470,11 +467,20 @@ impl Session {
                 return Err(error);
             }
         };
-        if let Err(error) = existing.write(&path, &bytes) {
-            self.restore_unused_lock(lock);
-            return Err(error);
-        }
-        self.install(self.project.clone(), path, false, lock, sha256_hex(&bytes));
+        let written = match existing.write(&path, &bytes) {
+            Ok(written) => written,
+            Err(error) => {
+                self.restore_unused_lock(lock);
+                return Err(error);
+            }
+        };
+        self.install(
+            self.project.clone(),
+            path,
+            lock,
+            sha256_hex(&bytes),
+            Some(written),
+        );
         Ok(())
     }
 
@@ -486,9 +492,36 @@ impl Session {
             self.confirm_canonical(&path)?;
         }
         let bytes = project_bytes(&self.project, &path)?;
-        atomic_write(&path, &bytes).map_err(|error| AppError::new(error.to_string()))?;
+        // 通常の保存は最後に読み書きした実体だけを、外部変更を承認した保存は見つけたときの実体だけを置き換える。
+        // 照合から置き換えまでの間に他の process が書いた変更は上書きしない。
+        let expected = if force {
+            self.external_file.clone()
+        } else {
+            self.canonical_file.clone()
+        };
+        let policy = match &expected {
+            Some(approval) => CommitPolicy::ReplaceApproved(approval),
+            None => CommitPolicy::CreateNew,
+        };
+        let written = match commit_bytes(&path, &bytes, policy) {
+            Ok(written) => written,
+            Err(error) => {
+                let changed = match &expected {
+                    Some(approval) => !approval.is_current(),
+                    None => path.exists(),
+                };
+                if changed {
+                    self.note_external_change(&path);
+                    return Err(AppError::new(format!(
+                        "Project file が外部で変更されています（保存しませんでした）: {error}"
+                    )));
+                }
+                return Err(AppError::new(error.to_string()));
+            }
+        };
         self.canonical_sha256 = sha256_hex(&bytes);
-        self.file_stamp = stamp_of(&path);
+        self.canonical_file = Some(written);
+        self.external_file = None;
         self.external_change = false;
         self.saved = self.project.clone();
         self.dirty = false;
@@ -652,13 +685,14 @@ impl Session {
         self.preview_generation = self.preview_generation.saturating_add(1);
     }
 
+    /// `file` は保存先の file のうち、`hash` の中身として読んだか書いた実体。
     fn install(
         &mut self,
         project: Project,
         path: PathBuf,
-        dirty: bool,
         lock: ProjectLock,
         hash: String,
+        file: Option<ReplaceApproval>,
     ) {
         // 置き換える Project の未保存の変更は、ここで捨てる（保存済みなら削除は積んである）。
         // 同じ path を開き直すときに、捨てた変更を recovery として出さないよう、調べる前に終える。
@@ -674,14 +708,15 @@ impl Session {
         self.project = project.clone();
         self.saved = project;
         self.path = Some(path);
-        self.dirty = dirty;
+        self.dirty = false;
         self.history.clear();
         self.selection.clear();
         self.subtitle_selection.clear();
         self.selected_edge = None;
         self.selected_marker = None;
         self.canonical_sha256 = hash;
-        self.file_stamp = self.path.as_deref().and_then(stamp_of);
+        self.canonical_file = file;
+        self.external_file = None;
         self.external_change = false;
         self.recovery = recovery.offer;
         self.recovery_corrupt = recovery.corrupt;
@@ -741,16 +776,24 @@ impl Session {
             if self.canonical_sha256.is_empty() {
                 return Ok(());
             }
-            self.external_change = true;
+            self.note_external_change(path);
             return Err(AppError::new("Project file が外部で変更されています"));
         }
-        let bytes = std::fs::read(path)
+        let (bytes, file) = read_with_identity(path)
             .map_err(|error| AppError::new(format!("Project file を照合できません ({error})")))?;
         if sha256_hex(&bytes) != self.canonical_sha256 {
-            self.external_change = true;
+            self.note_external_change(path);
             return Err(AppError::new("Project file が外部で変更されています"));
         }
+        // 中身が正本と同じ実体を、この後の置き換えの承認にする（同じ中身で書き直されただけなら保存できる）。
+        self.canonical_file = Some(file);
         Ok(())
+    }
+
+    /// 外部変更を見つけた。その時点の実体を、利用者が「上書き」を選んだときに置き換えてよい file として覚える。
+    fn note_external_change(&mut self, path: &Path) {
+        self.external_change = true;
+        self.external_file = ReplaceApproval::capture(path).ok().flatten();
     }
 
     pub(crate) fn note_project_edit(&mut self) {
@@ -877,23 +920,26 @@ impl Session {
         let Some(path) = self.path.clone() else {
             return;
         };
-        let probe = probe_file(&path);
-        let stamp = (probe.status == mvm_platform::FileProbeStatus::File)
-            .then_some((probe.size, probe.last_write_100ns));
-        if stamp == self.file_stamp {
+        if self
+            .canonical_file
+            .as_ref()
+            .is_some_and(ReplaceApproval::is_current)
+        {
             return;
         }
-        if stamp.is_none() && self.canonical_sha256.is_empty() {
+        if !path.exists() {
+            if !self.canonical_sha256.is_empty() {
+                self.note_external_change(&path);
+            }
             return;
         }
-        match std::fs::read(&path) {
-            Ok(bytes) if sha256_hex(&bytes) == self.canonical_sha256 => {
-                self.file_stamp = stamp;
+        match read_with_identity(&path) {
+            // 実体は変わったが中身は同じ（触れただけ・同じ中身で書き直した）。以後はこの実体を正本とする。
+            Ok((bytes, file)) if sha256_hex(&bytes) == self.canonical_sha256 => {
+                self.canonical_file = Some(file);
             }
-            Ok(_) => self.external_change = true,
-            Err(_) if !path.exists() && !self.canonical_sha256.is_empty() => {
-                self.external_change = true;
-            }
+            Ok(_) => self.note_external_change(&path),
+            // 読めない間（書き込み中など）は次の確認に回す。
             Err(_) => {}
         }
     }
@@ -990,10 +1036,25 @@ fn new_session_id() -> String {
     )
 }
 
-fn stamp_of(path: &Path) -> Option<(u64, i64)> {
-    let probe = probe_file(path);
-    (probe.status == mvm_platform::FileProbeStatus::File)
-        .then_some((probe.size, probe.last_write_100ns))
+/// file を読み、読んだ中身に対応する実体を返す。読む前と後で実体が違えば（読んでいる間に書き換わった）失敗する。
+fn read_with_identity(path: &Path) -> Result<(Vec<u8>, ReplaceApproval), AppError> {
+    let unreadable = |detail: String| {
+        AppError::new(format!(
+            "Project を読めません ({}): {detail}",
+            path.display()
+        ))
+    };
+    let before = ReplaceApproval::capture(path)
+        .map_err(|error| unreadable(error.to_string()))?
+        .ok_or_else(|| unreadable("file がありません".to_owned()))?;
+    let bytes = std::fs::read(path).map_err(|error| unreadable(error.to_string()))?;
+    let after = ReplaceApproval::capture(path).map_err(|error| unreadable(error.to_string()))?;
+    if after.as_ref() != Some(&before) {
+        return Err(unreadable(
+            "読んでいる間に file が変わりました。もう一度開いてください".to_owned(),
+        ));
+    }
+    Ok((bytes, before))
 }
 
 struct RecoveryInspect {
@@ -1379,6 +1440,54 @@ mod tests {
     }
 
     #[test]
+    fn overwriting_replaces_only_the_external_version_that_was_found() {
+        let dir = scratch_dir();
+        let path = dir.join("external-twice.mvm");
+        let mut session = Session::new();
+        session
+            .create_project(&path, ExistingFile::Keep)
+            .expect("作成");
+        session.place_text("手元").expect("編集");
+        fs::write(&path, b"{}\n").expect("1 回目の外部の書き換え");
+        session.save_project().expect_err("外部変更");
+        assert!(session.external_change());
+        // 外部変更を見つけた後に、さらに別の tool が書き換えた。見つけた版ではないので上書きしない。
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&path, b"{ \"second\": true }\n").expect("2 回目の外部の書き換え");
+        let error = session
+            .save_overwriting_external()
+            .expect_err("見つけた後に変わった file を上書きしました");
+        assert!(error.message().contains("外部で変更"), "{error}");
+        assert_eq!(fs::read(&path).expect("file"), b"{ \"second\": true }\n");
+        assert!(session.external_change());
+        // 今の版を見つけ直したので、上書きを選べば置き換える（負の対照）。
+        session.save_overwriting_external().expect("上書き");
+        assert!(!session.external_change());
+        assert!(!session.dirty());
+        drop(session);
+        fs::remove_dir_all(&dir).expect("片付け");
+    }
+
+    #[test]
+    fn the_same_content_rewritten_by_another_tool_still_saves() {
+        let dir = scratch_dir();
+        let path = dir.join("touched.mvm");
+        let mut session = Session::new();
+        session
+            .create_project(&path, ExistingFile::Keep)
+            .expect("作成");
+        let content = fs::read(&path).expect("file");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::remove_file(&path).expect("消す");
+        fs::write(&path, &content).expect("同じ中身で作り直す");
+        session.place_text("編集").expect("編集");
+        session.save_project().expect("同じ中身なら保存できる");
+        assert!(!session.external_change());
+        drop(session);
+        fs::remove_dir_all(&dir).expect("片付け");
+    }
+
+    #[test]
     fn opening_another_project_removes_only_the_recovery_this_session_wrote() {
         let dir = scratch_dir();
         let first = dir.join("first.mvm");
@@ -1457,11 +1566,7 @@ mod tests {
             .expect("作成");
         session.poll_maintenance(10_000);
         assert!(!session.external_change());
-        fs::write(
-            &path, b"{}
-",
-        )
-        .expect("外部の書き換え");
+        fs::write(&path, b"{}\n").expect("外部の書き換え");
         session.poll_maintenance(10_999);
         assert!(
             !session.external_change(),

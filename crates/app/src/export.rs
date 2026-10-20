@@ -123,6 +123,11 @@ mod tests {
             .expect_err("書き出し中に作りました");
         assert!(error.message().contains("書き出し中"), "{error}");
         assert!(!dir.join("new.mvm").exists());
+        let error = session
+            .save_project_as(&dir.join("renamed.mvm"), ExistingFile::Keep)
+            .expect_err("書き出し中に名前を付けて保存しました");
+        assert!(error.message().contains("書き出し中"), "{error}");
+        assert!(!dir.join("renamed.mvm").exists());
         assert!(session.path().is_none(), "画面の Project が変わりました");
         session.cancel_export();
         while session.is_exporting() {

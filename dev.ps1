@@ -98,10 +98,37 @@ function Invoke-Tests {
                 $skipped += 'recognizes_speech_with_the_real_whisper（MVM_WHISPER_CLI・MVM_WHISPER_MODEL・MVM_TRANSCRIBE_AUDIO が未指定）'
             }
         }
-        & cargo test --workspace --locked @ExtraArguments @harness 2>&1 |
-            Tee-Object -Variable output | Out-Host
+        # 失敗した実行を後から調べられるよう、出力を毎回 tmp\test-logs へ残す（成功した実行も残す）。
+        $logDirectory = Join-Path $repoRoot 'tmp\test-logs'
+        New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
+        $mode = if ($IncludeIgnored) { 'test-full' } else { 'test' }
+        $log = Join-Path $logDirectory ("$mode-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        $revision = (& git -C $repoRoot rev-parse --short HEAD 2>$null)
+        $changes = @(& git -C $repoRoot status --porcelain 2>$null).Count
+        @(
+            "date: $(Get-Date -Format o)"
+            "command: cargo test --workspace --locked --no-fail-fast $($ExtraArguments -join ' ') $($harness -join ' ')"
+            "git: $revision（未コミットの変更 $changes 件）"
+            "rustc: $(& rustc -V)"
+            "host: $env:COMPUTERNAME / PowerShell $($PSVersionTable.PSVersion)"
+            ''
+        ) | Set-Content -LiteralPath $log -Encoding utf8
+        # 1 つの試験 binary が失敗しても残りを走らせ、失敗を全てログに残す。
+        & cargo test --workspace --locked --no-fail-fast @ExtraArguments @harness 2>&1 |
+            Tee-Object -FilePath $log -Append | Tee-Object -Variable output | Out-Host
         $exitCode = $LASTEXITCODE
+        Add-Content -LiteralPath $log -Value "`nexit code: $exitCode" -Encoding utf8
         if ($exitCode -ne 0) {
+            # 長い出力の途中に埋もれた失敗を、末尾にまとめて出す。
+            $failures = @($output | ForEach-Object { "$_" } | Where-Object {
+                    $_ -match '^test .+ FAILED$' -or $_ -match '^---- .+ ----$' -or
+                    $_ -match 'panicked at' -or $_ -match '^error: ' -or
+                    $_ -match "process didn't exit successfully"
+                })
+            [Console]::Error.WriteLine("試験が失敗しました（exit code $exitCode）。ログ: $log")
+            foreach ($line in $failures) {
+                [Console]::Error.WriteLine("  $line")
+            }
             exit $exitCode
         }
         $passed = 0
@@ -115,6 +142,7 @@ function Invoke-Tests {
             exit 1
         }
         Write-Output "通過した試験: $passed 件"
+        Write-Output "ログ: $log"
         foreach ($name in $skipped) {
             Write-Output "skipped: $name"
         }

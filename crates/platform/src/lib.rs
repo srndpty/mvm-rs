@@ -14,7 +14,7 @@ mod process;
 mod replace;
 mod wide;
 
-pub use atomic_write::{atomic_create, atomic_replace_approved, atomic_write, place_file};
+pub use atomic_write::{CommitPolicy, atomic_write, commit_bytes, commit_file};
 pub use command_line::{find_on_path, quote_argument};
 pub use error::PlatformError;
 pub use file_id::{FileProbe, FileProbeStatus, probe_file};

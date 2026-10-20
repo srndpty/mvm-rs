@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use mvm_media::{Mp4Writer, ProbedMedia, probe_media_file};
-use mvm_platform::{ReplaceApproval, place_file};
+use mvm_platform::{CommitPolicy, ReplaceApproval, commit_file};
 use mvm_preview::{AudioMixer, FramePlan, PlannedSource, StillPreview, plan_frame};
 use mvm_project::Project;
 
@@ -64,6 +64,13 @@ pub fn run_export(
     // 最後の frame の後に取り消されたら、公開しない。
     if control.cancelled() {
         return Err(ExportError::Cancelled);
+    }
+    // 読んだ素材が計画の時点と同じ実体か確かめる。途中で書き換わっていれば、混ざった動画かもしれないので置かない。
+    if let Some(changed) = plan.sources.changed() {
+        return Err(ExportError::failed(format!(
+            "書き出している間に素材が変わりました（書き出した file は置きません）: {}",
+            changed.display()
+        )));
     }
     // 計画の後に素材と出力先が同じ file になっていないか、置く直前にもう一度確かめる。
     reject_source_as_output(project, &plan.output_path)?;
@@ -120,7 +127,11 @@ impl TemporaryOutput {
         output: &Path,
         approval: Option<&ReplaceApproval>,
     ) -> Result<(), ExportError> {
-        place_file(&self.path, output, approval).map_err(|error| {
+        let policy = match approval {
+            Some(approval) => CommitPolicy::ReplaceApproved(approval),
+            None => CommitPolicy::CreateNew,
+        };
+        commit_file(&self.path, output, policy).map_err(|error| {
             ExportError::failed(format!(
                 "書き出した file を {} へ置けません: {error}",
                 output.display()

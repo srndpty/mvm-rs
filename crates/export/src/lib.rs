@@ -9,5 +9,5 @@ mod run;
 
 pub use error::ExportError;
 pub use job::{ExportJob, ExportProgress, ExportStatus};
-pub use plan::{ExportPlan, ExportQuality, ExportRequest, plan_export};
+pub use plan::{ExportPlan, ExportQuality, ExportRequest, SourceManifest, plan_export};
 pub use run::{ExportControl, ExportSummary, TEMPORARY_MARKER, run_export};

@@ -1,21 +1,30 @@
 //! 利用者が置き換えを承認した既存 file だけを置き換える。
 //!
 //! 承認した時点の実体（volume・file ID・大きさ・更新時刻）を [`ReplaceApproval`] に覚える。置き換える直前に
-//! その path を、他の process の書き込みと削除を拒む handle で開いて照合し、照合した handle のまま退避名へ
-//! rename する。新しい file は既存を置換しない rename で置き、最後に退避した file を消す。照合から置き換えまでの
-//! 間に、承認していない file へ差し替わることはない（差し替わっていれば照合か rename が失敗する）。
+//! その path を、他の process の書き込みを拒む handle で開いて照合し、書き終えた一時 file を POSIX semantics の
+//! rename 1 回で対象の名前へ置く（既存を置き換える）。
+//!
+//! - 途中で process が落ちても、対象の名前は常に前の file か新しい file を指す。退避名は使わない。
+//! - 照合から置き換えまで、他の process は承認した file の中身を書き換えられない。
+//! - 単一操作の置き換えは、置き換えられる file を開いている全ての handle が削除の共有を許すときだけ成功する
+//!   [事実: 2026-10-20 に NTFS で確かめた。削除の共有を拒む handle があると共有違反になる]。そのため照合中の
+//!   handle も削除（名前の変更）を共有する。照合から置き換えまでの数 µs の間に、他の process が承認した file を
+//!   別名へ移し、同じ名前で新しい file を作ると、その file を置き換えてしまう。置き換えた後に、照合した file の
+//!   名前が残っているか（link 数）で確かめ、残っていれば失敗として報告する。
+//! - POSIX semantics の rename に対応しない file system（FAT 系など）では、置き換えずに失敗する。
 
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_LOCK_VIOLATION,
-    ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION, HANDLE,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
+    ERROR_LOCK_VIOLATION, ERROR_NOT_SUPPORTED, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
+    HANDLE,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_INFO, FILE_READ_ATTRIBUTES,
-    FILE_RENAME_INFO, FILE_SHARE_READ, FileDispositionInfo, FileRenameInfo, OPEN_EXISTING,
+    CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
+    FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
+    FileRenameInfoEx, FileStandardInfo, GetFileInformationByHandleEx, OPEN_EXISTING,
     SetFileInformationByHandle,
 };
 use windows::Win32::System::Threading::Sleep;
@@ -28,7 +37,9 @@ use crate::wide::wide_path;
 const OPEN_ATTEMPTS: u32 = 40;
 const OPEN_WAIT_MS: u32 = 50;
 
-static BACKUP_SERIAL: AtomicU32 = AtomicU32::new(1);
+/// `FILE_RENAME_INFO.Flags`（winbase.h）。windows crate に定数が無いので書く。
+const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x1;
+const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x2;
 
 /// 置き換えを承認した既存 file。承認した時点の実体を覚え、置き換える直前に照合する。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,9 +69,19 @@ impl ReplaceApproval {
         }
     }
 
+    /// この process が `path`（絶対パス）に置いた file の実体。
+    pub(crate) fn placed(path: PathBuf, probe: FileProbe) -> Self {
+        Self { path, probe }
+    }
+
     /// 承認した file の絶対パス。
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// `path` の今の実体が承認したものと同じか。
+    pub fn is_current(&self) -> bool {
+        self.matches(&probe_file(&self.path))
     }
 
     fn matches(&self, probe: &FileProbe) -> bool {
@@ -79,59 +100,95 @@ pub(crate) fn replace_approved(
     approval: &ReplaceApproval,
 ) -> Result<(), PlatformError> {
     let target = approval.path();
-    let target_wide = wide_path(target)?;
-    let guard = Guarded::open(&target_wide, target)?;
-    if !approval.matches(&read_identity(guard.handle)) {
+    let guard = Handle::open_with_retry(
+        target,
+        DELETE.0 | FILE_READ_ATTRIBUTES.0,
+        FILE_SHARE_READ | FILE_SHARE_DELETE,
+    )
+    .map_err(|error| match error {
+        OpenError::Missing => PlatformError::new(format!(
+            "置き換えを承認した file がありません: {}",
+            target.display()
+        )),
+        OpenError::Other(message) => PlatformError::new(format!(
+            "置き換える file を開けません ({}): {message}",
+            target.display()
+        )),
+    })?;
+    if !approval.matches(&read_identity(guard.0)) {
         return Err(PlatformError::new(format!(
             "置き換えを承認した後に file が変わりました: {}",
             target.display()
         )));
     }
-    let backup = backup_path(target);
-    guard.rename(&backup).map_err(|error| {
+    let incoming = Handle::open_with_retry(
+        temporary,
+        DELETE.0 | FILE_READ_ATTRIBUTES.0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )
+    .map_err(|error| {
         PlatformError::new(format!(
-            "置き換える file を退避できません ({}): {error}",
+            "書き終えた一時 file を開けません ({}): {}",
+            temporary.display(),
+            match error {
+                OpenError::Missing => "ありません".to_owned(),
+                OpenError::Other(message) => message,
+            }
+        ))
+    })?;
+    incoming.rename_replacing(target).map_err(|error| {
+        let code = error.code();
+        let message = if code == HRESULT::from_win32(ERROR_INVALID_PARAMETER.0)
+            || code == HRESULT::from_win32(ERROR_NOT_SUPPORTED.0)
+        {
+            "この drive の file system は、単一操作での置き換え（POSIX semantics の rename）に対応していません。別の名前で保存してください".to_owned()
+        } else {
+            error.to_string()
+        };
+        PlatformError::new(format!(
+            "file を置き換えられません ({}): {message}",
             target.display()
         ))
     })?;
-    let temporary_wide = wide_path(temporary)?;
-    if let Err(error) = crate::atomic_write::move_to_new(&temporary_wide, &target_wide, target) {
-        // 退避した file を元の名前へ戻す。戻せなければ、退避先を知らせる（file は失っていない）。
-        return Err(match guard.rename(target) {
-            Ok(()) => error,
-            Err(restore) => PlatformError::new(format!(
-                "{error}。元の file を戻せません（{} に残っています）: {restore}",
-                backup.display()
-            )),
-        });
+    // 照合した file が置き換わっていれば、名前を失って link 数が 0 になっている。
+    match guard.link_count() {
+        Ok(0) => Ok(()),
+        Ok(_) => Err(PlatformError::new(format!(
+            "置き換える直前に、承認した file が別の名前へ移されました。{} にあった別の file を置き換えた可能性があります",
+            target.display()
+        ))),
+        Err(error) => Err(PlatformError::new(format!(
+            "置き換えた file を確かめられません ({}): {error}",
+            target.display()
+        ))),
     }
-    guard.delete();
-    Ok(())
 }
 
-fn backup_path(target: &Path) -> PathBuf {
-    let serial = BACKUP_SERIAL.fetch_add(1, Ordering::Relaxed);
-    let mut name = target.as_os_str().to_owned();
-    name.push(format!(".mvmold.{}.{serial}", std::process::id()));
-    PathBuf::from(name)
+enum OpenError {
+    Missing,
+    Other(String),
 }
 
-/// 他の process の書き込みと削除を拒んで開いた、置き換える file。
-struct Guarded {
-    handle: HANDLE,
-}
+/// この module が開いた file の handle。drop で閉じる。
+struct Handle(HANDLE);
 
-impl Guarded {
-    fn open(wide: &[u16], path: &Path) -> Result<Self, PlatformError> {
-        let mut last = None;
+impl Handle {
+    /// 他の process が使用中なら短い間待ってやり直す。
+    fn open_with_retry(
+        path: &Path,
+        access: u32,
+        share: FILE_SHARE_MODE,
+    ) -> Result<Self, OpenError> {
+        let wide = wide_path(path).map_err(|error| OpenError::Other(error.to_string()))?;
+        let mut last = String::new();
         for attempt in 0..OPEN_ATTEMPTS {
-            // SAFETY: wide は NUL 終端。共有は読み取りだけなので、開いている間は他の process が書き換えも
-            // 削除もできない。失敗時に handle は返らない。
+            // SAFETY: wide は NUL 終端。共有の指定で、開いている間に他の process ができる操作を決める。
+            // 失敗時に handle は返らない。
             let opened = unsafe {
                 CreateFileW(
                     PCWSTR(wide.as_ptr()),
-                    DELETE.0 | FILE_READ_ATTRIBUTES.0,
-                    FILE_SHARE_READ,
+                    access,
+                    share,
                     None,
                     OPEN_EXISTING,
                     FILE_ATTRIBUTE_NORMAL,
@@ -139,82 +196,74 @@ impl Guarded {
                 )
             };
             match opened {
-                Ok(handle) => return Ok(Self { handle }),
-                Err(error) if missing(&error) => {
-                    return Err(PlatformError::new(format!(
-                        "置き換えを承認した file がありません: {}",
-                        path.display()
-                    )));
-                }
+                Ok(handle) => return Ok(Self(handle)),
+                Err(error) if missing(&error) => return Err(OpenError::Missing),
                 Err(error) if busy(&error) && attempt + 1 < OPEN_ATTEMPTS => {
-                    last = Some(error);
+                    last = error.to_string();
                     // SAFETY: 待つ時間は定数。他の状態は変えない。
                     unsafe { Sleep(OPEN_WAIT_MS) };
                 }
-                Err(error) => {
-                    last = Some(error);
-                    break;
-                }
+                Err(error) => return Err(OpenError::Other(error.to_string())),
             }
         }
-        Err(PlatformError::new(format!(
-            "置き換える file を開けません ({}): {}",
-            path.display(),
-            last.map_or_else(String::new, |error| error.to_string())
-        )))
+        Err(OpenError::Other(last))
     }
 
-    /// 開いている file の名前を `to` へ変える。`to` に file があれば失敗する。
-    fn rename(&self, to: &Path) -> Result<(), PlatformError> {
+    /// 開いている file を `to` へ置く。`to` に file があれば、POSIX semantics で置き換える（1 回の操作）。
+    fn rename_replacing(&self, to: &Path) -> windows::core::Result<()> {
         let name: Vec<u16> = to.as_os_str().encode_wide().collect();
         let name_bytes = name
             .len()
             .checked_mul(2)
             .and_then(|bytes| u32::try_from(bytes).ok())
-            .ok_or_else(|| PlatformError::new("パスが長すぎます"))?;
+            .ok_or_else(|| {
+                windows::core::Error::from(HRESULT::from_win32(ERROR_INVALID_PARAMETER.0))
+            })?;
         let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
         let total = header + name.len() * 2 + 2;
+        let size = u32::try_from(total).map_err(|_| {
+            windows::core::Error::from(HRESULT::from_win32(ERROR_INVALID_PARAMETER.0))
+        })?;
         // FILE_RENAME_INFO は HANDLE を含むので 8 byte 境界に置く。
         let mut buffer = vec![0u64; total.div_ceil(8)];
         let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
         // SAFETY: buffer は FILE_RENAME_INFO の頭と名前（NUL 終端）が収まる大きさで、8 byte 境界にある。
         // 名前は FileName の位置から書き、buffer の外へは出ない。
         unsafe {
-            (*info).Anonymous.ReplaceIfExists = false;
+            (*info).Anonymous.Flags =
+                FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
             (*info).RootDirectory = HANDLE::default();
             (*info).FileNameLength = name_bytes;
             let target = buffer.as_mut_ptr().cast::<u8>().add(header).cast::<u16>();
             std::ptr::copy_nonoverlapping(name.as_ptr(), target, name.len());
         }
-        let size = u32::try_from(total).map_err(|_| PlatformError::new("パスが長すぎます"))?;
         // SAFETY: handle は DELETE 権限で開いた file。buffer は上で組んだ FILE_RENAME_INFO で、呼び出しの間生きている。
         unsafe {
-            SetFileInformationByHandle(self.handle, FileRenameInfo, buffer.as_ptr().cast(), size)
+            SetFileInformationByHandle(self.0, FileRenameInfoEx, buffer.as_ptr().cast(), size)
         }
-        .map_err(|error| PlatformError::new(error.to_string()))
     }
 
-    /// 閉じたときに消す。置き換えが済んだ後の、退避した file に使う。
-    fn delete(self) {
-        let info = FILE_DISPOSITION_INFO { DeleteFile: true };
-        // SAFETY: handle は DELETE 権限で開いた file。info は呼び出しの間生きている。消せなくても退避名の
-        // file が残るだけで、置いた file には触れない。
+    /// file の名前（hard link）の数。名前を全て失った file は 0。
+    fn link_count(&self) -> windows::core::Result<u32> {
+        let mut info = FILE_STANDARD_INFO::default();
+        // SAFETY: handle は FILE_READ_ATTRIBUTES で開いた file。info は呼び出しの間生きている POD。
         unsafe {
-            let _ = SetFileInformationByHandle(
-                self.handle,
-                FileDispositionInfo,
-                (&info as *const FILE_DISPOSITION_INFO).cast(),
-                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
-            );
-        }
+            GetFileInformationByHandleEx(
+                self.0,
+                FileStandardInfo,
+                (&mut info as *mut FILE_STANDARD_INFO).cast(),
+                std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+            )
+        }?;
+        Ok(info.NumberOfLinks)
     }
 }
 
-impl Drop for Guarded {
+impl Drop for Handle {
     fn drop(&mut self) {
-        // SAFETY: open が返した handle をここで 1 回だけ閉じる。
+        // SAFETY: open_with_retry が返した handle をここで 1 回だけ閉じる。
         unsafe {
-            let _ = CloseHandle(self.handle);
+            let _ = CloseHandle(self.0);
         }
     }
 }

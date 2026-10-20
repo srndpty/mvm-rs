@@ -1,15 +1,30 @@
 //! 計画どおりに 1 frame ずつ合成して encode し、検証してから正規名へ置く。
 //!
-//! 途中で失敗・取消したときは一時 file を消し、正規名には何も書かない。
+//! encode 中の file は job ごとに一意な名前で排他的に作り、この job が作ったものだけを消す。
+//! 途中で失敗・取消したときはそれを消し、正規名には何も書かない。
+//!
+//! 正規名へは、計画の時点で無かったなら既存を置換しない rename で置く（書き出し中に別の job や別の tool が
+//! 作った file を上書きしない）。あったなら、置き換えを承認した file のままであることを照合してから置き換える。
 
-use std::path::Path;
+use std::fs::OpenOptions;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use mvm_media::{Mp4Writer, ProbedMedia, probe_media_file};
+use mvm_platform::{CommitPolicy, ReplaceApproval, commit_file};
 use mvm_preview::{AudioMixer, FramePlan, PlannedSource, StillPreview, plan_frame};
 use mvm_project::Project;
 
 use crate::error::ExportError;
-use crate::plan::ExportPlan;
+use crate::plan::{ExportPlan, reject_source_as_output};
+
+/// encode 中の file の名前の接尾辞。`<出力>.mvmtmp.<process ID>.<連番>` にする。
+pub const TEMPORARY_MARKER: &str = ".mvmtmp.";
+
+/// 一意な名前を探す回数の上限。前に落ちた process の残りと名前がぶつかったときだけ次を試す。
+const TEMPORARY_ATTEMPTS: u32 = 64;
+
+static TEMPORARY_SERIAL: AtomicU32 = AtomicU32::new(1);
 
 /// 書き出しの進み具合を受け取り、取消を伝える。worker thread から呼ぶ。
 pub trait ExportControl {
@@ -42,23 +57,98 @@ pub fn run_export(
             ))
         })?;
     }
-    remove_if_present(&plan.temporary_path)?;
-    let result = encode(project, plan, control)
-        .and_then(|encoded| verify(plan, &encoded))
-        .and_then(|summary| {
-            // 最後の frame の後に取り消されたら、公開しない。
-            if control.cancelled() {
-                Err(ExportError::Cancelled)
-            } else {
-                Ok(summary)
-            }
-        })
-        .and_then(|summary| publish(plan).map(|()| summary));
-    if result.is_err() {
-        // 失敗の理由は元の error。片付けの失敗で上書きしない。
-        let _ = std::fs::remove_file(&plan.temporary_path);
+    // drop（失敗・取消・panic の巻き戻し）で、この job が作った file だけを消す。
+    let temporary = TemporaryOutput::create(&plan.output_path)?;
+    let summary = encode(project, plan, temporary.path(), control)
+        .and_then(|encoded| verify(plan, temporary.path(), &encoded))?;
+    // 最後の frame の後に取り消されたら、公開しない。
+    if control.cancelled() {
+        return Err(ExportError::Cancelled);
     }
-    result
+    // 読んだ素材が計画の時点と同じ実体か確かめる。途中で書き換わっていれば、混ざった動画かもしれないので置かない。
+    if let Some(changed) = plan.sources.changed() {
+        return Err(ExportError::failed(format!(
+            "書き出している間に素材が変わりました（書き出した file は置きません）: {}",
+            changed.display()
+        )));
+    }
+    // 計画の後に素材と出力先が同じ file になっていないか、置く直前にもう一度確かめる。
+    reject_source_as_output(project, &plan.output_path)?;
+    temporary.publish(&plan.output_path, plan.replace.as_ref())?;
+    Ok(summary)
+}
+
+/// この job が排他的に作った encode 中の file。公開しないまま drop すると消す。
+struct TemporaryOutput {
+    path: PathBuf,
+    published: bool,
+}
+
+impl TemporaryOutput {
+    fn create(output: &Path) -> Result<Self, ExportError> {
+        let mut last = None;
+        for _ in 0..TEMPORARY_ATTEMPTS {
+            let serial = TEMPORARY_SERIAL.fetch_add(1, Ordering::Relaxed);
+            let mut name = output.as_os_str().to_owned();
+            name.push(format!("{TEMPORARY_MARKER}{}.{serial}", std::process::id()));
+            let path = PathBuf::from(name);
+            // create_new は既存の file を開かない。他の job の一時 file には触れない。
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(_) => {
+                    return Ok(Self {
+                        path,
+                        published: false,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    last = Some(error);
+                }
+                Err(error) => {
+                    return Err(ExportError::failed(format!(
+                        "一時 file を作れません ({}): {error}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        Err(ExportError::failed(format!(
+            "一時 file の名前を決められません ({}): {}",
+            output.display(),
+            last.map_or_else(String::new, |error| error.to_string())
+        )))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn publish(
+        mut self,
+        output: &Path,
+        approval: Option<&ReplaceApproval>,
+    ) -> Result<(), ExportError> {
+        let policy = match approval {
+            Some(approval) => CommitPolicy::ReplaceApproved(approval),
+            None => CommitPolicy::CreateNew,
+        };
+        commit_file(&self.path, output, policy).map_err(|error| {
+            ExportError::failed(format!(
+                "書き出した file を {} へ置けません: {error}",
+                output.display()
+            ))
+        })?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for TemporaryOutput {
+    fn drop(&mut self) {
+        if !self.published {
+            // 失敗の理由は元の error。片付けの失敗で上書きしない。
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// encode が書いた中身。検証と結果の報告に使う。
@@ -70,6 +160,7 @@ struct Encoded {
 fn encode(
     project: &Project,
     plan: &ExportPlan,
+    temporary: &Path,
     control: &dyn ExportControl,
 ) -> Result<Encoded, ExportError> {
     let mut preview =
@@ -82,7 +173,7 @@ fn encode(
     } else {
         None
     };
-    let mut writer = Mp4Writer::create(&plan.temporary_path, &plan.mp4_settings())
+    let mut writer = Mp4Writer::create(temporary, &plan.mp4_settings())
         .map_err(|error| ExportError::failed(error.to_string()))?;
     let mut interleaved = Vec::new();
     let mut left = Vec::new();
@@ -173,14 +264,18 @@ fn seconds_label(frame: i64, plan: &ExportPlan) -> String {
 }
 
 /// 書いた file を開き直し、寸法・fps・frame 数が計画と一致することを確かめる。
-fn verify(plan: &ExportPlan, encoded: &Encoded) -> Result<ExportSummary, ExportError> {
+fn verify(
+    plan: &ExportPlan,
+    temporary: &Path,
+    encoded: &Encoded,
+) -> Result<ExportSummary, ExportError> {
     if encoded.frames != plan.total_frames || encoded.audio_samples != plan.total_samples {
         return Err(ExportError::failed(format!(
             "encode した量が計画と違います（映像 {} / {} frame、音声 {} / {} sample）",
             encoded.frames, plan.total_frames, encoded.audio_samples, plan.total_samples
         )));
     }
-    let probed = probe_media_file(&plan.temporary_path).map_err(|error| {
+    let probed = probe_media_file(temporary).map_err(|error| {
         ExportError::failed(format!("書き出した file を検証できません: {error}"))
     })?;
     let ProbedMedia::Video(video) = probed else {
@@ -220,22 +315,56 @@ fn verify(plan: &ExportPlan, encoded: &Encoded) -> Result<ExportSummary, ExportE
     })
 }
 
-fn publish(plan: &ExportPlan) -> Result<(), ExportError> {
-    std::fs::rename(&plan.temporary_path, &plan.output_path).map_err(|error| {
-        ExportError::failed(format!(
-            "書き出した file を {} へ置けません: {error}",
-            plan.output_path.display()
-        ))
-    })
-}
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
 
-fn remove_if_present(path: &Path) -> Result<(), ExportError> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(ExportError::failed(format!(
-            "前回の一時 file を消せません ({}): {error}",
-            path.display()
-        ))),
+    #[test]
+    fn each_job_owns_a_distinct_temporary_and_removes_only_its_own() {
+        let dir = std::env::temp_dir().join(format!("mvm-export-temp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let output = dir.join("out.mp4");
+        // 別の process が書いている途中の一時 file。
+        let foreign = dir.join(format!("out.mp4{TEMPORARY_MARKER}999999.1"));
+        std::fs::write(&foreign, b"other job").unwrap();
+
+        let first = TemporaryOutput::create(&output).unwrap();
+        let second = TemporaryOutput::create(&output).unwrap();
+        assert_ne!(first.path(), second.path());
+        assert!(first.path().is_file() && second.path().is_file());
+        let first_path = first.path().to_path_buf();
+        drop(first);
+        assert!(
+            !first_path.exists(),
+            "取り消した job の一時 file が残りました"
+        );
+        assert!(second.path().is_file(), "別の job の一時 file を消しました");
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"other job");
+
+        std::fs::write(second.path(), b"encoded").unwrap();
+        second.publish(&output, None).unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"encoded");
+
+        // 計画の時点で無かった正規名に、書き出し中に別の job が置いた file は上書きしない。
+        let late = TemporaryOutput::create(&output).unwrap();
+        std::fs::write(late.path(), b"late").unwrap();
+        let late_path = late.path().to_path_buf();
+        assert!(late.publish(&output, None).is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"encoded");
+        assert!(
+            !late_path.exists(),
+            "公開できなかった一時 file が残りました"
+        );
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["out.mp4", &format!("out.mp4{TEMPORARY_MARKER}999999.1")]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

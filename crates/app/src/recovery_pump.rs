@@ -3,7 +3,7 @@
 //! 古い書き込みが後から新しい recovery を上書きしない。Drop は積んだ job を全て終えてから返す。
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -51,17 +51,20 @@ impl RecoveryPump {
         }
     }
 
+    /// 同じ recovery への積んだ書き込みは、新しいもので置き換える。他の file の job は残す。
     pub fn enqueue_write(&mut self, write: RecoveryWrite) {
-        self.queue.retain(Job::is_delete);
+        let path = write.recovery_path.clone();
+        self.queue
+            .retain(|job| !(job.is_write() && job.recovery_path() == path.as_path()));
         self.queue.push_back(Job::Write(write));
         self.start();
     }
 
+    /// 同じ recovery への積んだ書き込みと削除は、この削除 1 つにまとめる。他の file の job は残す。
     pub fn enqueue_delete(&mut self, recovery_path: PathBuf) {
-        self.queue.retain(Job::is_delete);
-        if !self.queue.iter().any(Job::is_delete) {
-            self.queue.push_back(Job::Delete { recovery_path });
-        }
+        self.queue
+            .retain(|job| job.recovery_path() != recovery_path.as_path());
+        self.queue.push_back(Job::Delete { recovery_path });
         self.start();
     }
 
@@ -144,8 +147,15 @@ fn join(handle: JoinHandle<Result<(), String>>) -> Result<(), String> {
 }
 
 impl Job {
-    fn is_delete(&self) -> bool {
-        matches!(self, Self::Delete { .. })
+    fn is_write(&self) -> bool {
+        matches!(self, Self::Write(_))
+    }
+
+    fn recovery_path(&self) -> &Path {
+        match self {
+            Self::Write(write) => &write.recovery_path,
+            Self::Delete { recovery_path } => recovery_path,
+        }
     }
 }
 
@@ -178,5 +188,101 @@ fn run(job: Job) -> Result<(), String> {
                 recovery_path.display()
             )),
         },
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use std::sync::mpsc;
+
+    use super::*;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mvm-pump-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `release` を drop するまで終わらない job を走らせ、後の job を積んだままにする。
+    fn blocked(pump: &mut RecoveryPump) -> mpsc::Sender<()> {
+        let (release, wait) = mpsc::channel::<()>();
+        pump.running = Some(Running {
+            revision: 0,
+            write: false,
+            handle: std::thread::spawn(move || {
+                let _ = wait.recv();
+                Ok(())
+            }),
+        });
+        release
+    }
+
+    fn write(dir: &Path, name: &str) -> RecoveryWrite {
+        let canonical = dir.join(format!("{name}.mvm"));
+        RecoveryWrite {
+            revision: 1,
+            project: Arc::new(Project::default()),
+            recovery_path: crate::files::recovery_path(&canonical),
+            canonical_path: canonical,
+            canonical_sha256: String::new(),
+            saved_at: crate::files::utc_timestamp(std::time::SystemTime::now()),
+            session_id: "test".to_owned(),
+        }
+    }
+
+    #[test]
+    fn deletes_of_different_files_are_all_kept() {
+        let dir = scratch_dir("deletes");
+        let a = dir.join("a.mvm.recovery");
+        let b = dir.join("b.mvm.recovery");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let mut pump = RecoveryPump::new();
+        let release = blocked(&mut pump);
+        pump.enqueue_delete(a.clone());
+        pump.enqueue_delete(b.clone());
+        pump.enqueue_delete(a.clone());
+        let queued: Vec<_> = pump
+            .queue
+            .iter()
+            .map(|job| job.recovery_path().to_path_buf())
+            .collect();
+        assert_eq!(
+            queued,
+            [b.clone(), a.clone()],
+            "同じ file の削除はまとめ、別の file は残す"
+        );
+        drop(release);
+        pump.flush().unwrap();
+        assert!(!a.exists() && !b.exists(), "積んだ削除を落としました");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_later_write_of_another_file_does_not_drop_an_earlier_delete() {
+        let dir = scratch_dir("order");
+        let first = write(&dir, "a");
+        let first_path = first.recovery_path.clone();
+        let second = write(&dir, "b");
+        let second_path = second.recovery_path.clone();
+        let mut pump = RecoveryPump::new();
+        let release = blocked(&mut pump);
+        pump.enqueue_write(first);
+        pump.enqueue_delete(first_path.clone());
+        pump.enqueue_write(second);
+        drop(release);
+        pump.flush().unwrap();
+        assert!(!first_path.exists(), "削除した recovery が残りました");
+        assert!(second_path.is_file(), "後の書き込みが消えました");
+
+        // 削除の後の同じ file への書き込みは残る（負の対照）。
+        let release = blocked(&mut pump);
+        pump.enqueue_delete(second_path.clone());
+        pump.enqueue_write(write(&dir, "b"));
+        drop(release);
+        pump.flush().unwrap();
+        assert!(second_path.is_file(), "削除の後の書き込みを落としました");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

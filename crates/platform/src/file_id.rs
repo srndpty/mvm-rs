@@ -91,7 +91,7 @@ fn missing_error(error: &windows::core::Error) -> bool {
         || code == HRESULT::from_win32(ERROR_PATH_NOT_FOUND.0)
 }
 
-fn read_identity(handle: HANDLE) -> FileProbe {
+pub(crate) fn read_identity(handle: HANDLE) -> FileProbe {
     // SAFETY: 3 つの struct は POD。API が成功したときだけ中身を読む。
     let (id, basic, standard) = unsafe {
         let mut id = std::mem::zeroed::<FILE_ID_INFO>();

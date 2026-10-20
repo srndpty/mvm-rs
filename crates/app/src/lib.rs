@@ -30,10 +30,11 @@ pub use error::AppError;
 pub use math::MathClipStatus;
 pub use media::{ImportReport, RemovalPlan};
 pub use mvm_export::{ExportError, ExportProgress, ExportQuality, ExportRequest, ExportSummary};
+pub use mvm_platform::ReplaceApproval;
 pub use mvm_preview::{MeterPeaks, PreviewImage};
 pub use mvm_project::audio_adjustment::AudioAdjustmentSettings;
 pub use preferences::Preferences;
-pub use session::{RecoveryPrompt, Session};
+pub use session::{ExistingFile, RecoveryPrompt, Session, replace_approval};
 pub use timeline_commands::VideoSettings;
 pub use timeline_view::{
     MAX_PIXELS_PER_FRAME, MIN_PIXELS_PER_FRAME, TimeWindow, clamp_pixels_per_frame,

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use eframe::egui;
-use mvm_app::{ExportQuality, ExportRequest, Session};
+use mvm_app::{ExportQuality, ExportRequest, ReplaceApproval, Session, replace_approval};
 use mvm_core::Rational;
 use mvm_core::export_eta::format_export_remaining;
 use mvm_project::timeline::timeline_end_frame;
@@ -16,6 +16,8 @@ pub struct ExportDialog {
     quality: ExportQuality,
     burn_subtitles: bool,
     error: String,
+    /// 書き出し先に既にある file を置き換えるかの確認中。確認を出した時点の実体を持つ。
+    overwrite: Option<ReplaceApproval>,
     /// 直前の書き出しの結果。成功は通常の色、失敗は shell の notice に出す。
     pub finished: String,
 }
@@ -31,6 +33,7 @@ impl ExportDialog {
             self.burn_subtitles = true;
         }
         self.error.clear();
+        self.overwrite = None;
         self.open = true;
     }
 
@@ -72,6 +75,7 @@ pub fn show(
 fn show_settings(ui: &mut egui::Ui, session: &mut Session, dialog: &mut ExportDialog) {
     let mut start = false;
     let mut cancel = false;
+    let mut replace = None;
     let project = session.project();
     let fps = project.timeline_fps;
     let has_subtitles = project
@@ -97,11 +101,17 @@ fn show_settings(ui: &mut egui::Ui, session: &mut Session, dialog: &mut ExportDi
         ui.add_space(6.0);
         ui.label("書き出し先（MP4）");
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut dialog.path).desired_width(360.0));
+            let edited = ui
+                .add(egui::TextEdit::singleline(&mut dialog.path).desired_width(360.0))
+                .changed();
             if ui.button("参照").clicked()
                 && let Some(path) = pick_output(&dialog.path)
             {
                 dialog.path = path.display().to_string();
+                dialog.overwrite = None;
+            }
+            if edited {
+                dialog.overwrite = None;
             }
         });
         ui.add_space(6.0);
@@ -122,34 +132,71 @@ fn show_settings(ui: &mut egui::Ui, session: &mut Session, dialog: &mut ExportDi
             ui.colored_label(egui::Color32::from_rgb(230, 120, 120), &dialog.error);
         }
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            if ui.button("書き出す").clicked() {
-                start = true;
-            }
-            if ui.button("キャンセル").clicked() {
-                cancel = true;
-            }
-        });
+        if let Some(approval) = &dialog.overwrite {
+            ui.label(format!(
+                "{} は既にあります。置き換えますか？",
+                approval.path().display()
+            ));
+            ui.horizontal(|ui| {
+                if ui.button("置き換えて書き出す").clicked() {
+                    replace = Some(true);
+                }
+                if ui.button("やめる").clicked() {
+                    replace = Some(false);
+                }
+            });
+        } else {
+            ui.horizontal(|ui| {
+                if ui.button("書き出す").clicked() {
+                    start = true;
+                }
+                if ui.button("キャンセル").clicked() {
+                    cancel = true;
+                }
+            });
+        }
     });
     if cancel {
         dialog.open = false;
         return;
     }
-    if start {
-        let request = ExportRequest {
-            output_path: ensure_mp4(PathBuf::from(dialog.path.trim())),
-            quality: dialog.quality,
-            burn_subtitles: dialog.burn_subtitles,
-        };
-        match session.start_export(&request) {
-            Ok(()) => {
-                dialog.path = request.output_path.display().to_string();
-                dialog.error.clear();
-                dialog.finished.clear();
-                dialog.open = false;
+    let output_path = ensure_mp4(PathBuf::from(dialog.path.trim()));
+    let approval = match (start, replace) {
+        // 空の書き出し先は計画が理由を付けて拒む。
+        (true, _) if output_path.as_os_str().is_empty() => None,
+        // 既にある file には書かずに、置き換えの確認を出す。確認した時点の実体だけを置き換える。
+        (true, _) => match replace_approval(&output_path) {
+            Ok(None) => None,
+            Ok(Some(approval)) => {
+                dialog.overwrite = Some(approval);
+                return;
             }
-            Err(error) => dialog.error = error.message().to_owned(),
+            Err(error) => {
+                dialog.error = error.message().to_owned();
+                return;
+            }
+        },
+        (_, Some(true)) => dialog.overwrite.take(),
+        (_, Some(false)) => {
+            dialog.overwrite = None;
+            return;
         }
+        (false, None) => return,
+    };
+    let request = ExportRequest {
+        output_path,
+        quality: dialog.quality,
+        burn_subtitles: dialog.burn_subtitles,
+        replace: approval,
+    };
+    match session.start_export(&request) {
+        Ok(()) => {
+            dialog.path = request.output_path.display().to_string();
+            dialog.error.clear();
+            dialog.finished.clear();
+            dialog.open = false;
+        }
+        Err(error) => dialog.error = error.message().to_owned(),
     }
 }
 

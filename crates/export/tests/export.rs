@@ -11,10 +11,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use mvm_core::Rational;
 use mvm_export::{
-    ExportControl, ExportError, ExportJob, ExportQuality, ExportRequest, plan_export, run_export,
-    temporary_path,
+    ExportControl, ExportError, ExportJob, ExportQuality, ExportRequest, TEMPORARY_MARKER,
+    plan_export, run_export,
 };
 use mvm_media::PcmStream;
+use mvm_platform::ReplaceApproval;
 use mvm_preview::{MathLibrary, PreviewImage, StillPreview, plan_frame};
 use mvm_project::timeline::insert_frame_hold;
 use mvm_project::{
@@ -44,6 +45,20 @@ fn smoke(name: &str) -> PathBuf {
     path
 }
 
+/// `output` の隣に残った encode 中の file。
+fn temporaries(output: &Path) -> Vec<PathBuf> {
+    let prefix = format!(
+        "{}{TEMPORARY_MARKER}",
+        output.file_name().unwrap().to_string_lossy()
+    );
+    std::fs::read_dir(output.parent().unwrap())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|entry| entry.path())
+        .collect()
+}
+
 fn work_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("mvm-export-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("作業 directory");
@@ -71,6 +86,7 @@ fn request(path: &Path, quality: ExportQuality) -> ExportRequest {
         output_path: path.to_path_buf(),
         quality,
         burn_subtitles: true,
+        replace: None,
     }
 }
 
@@ -175,9 +191,14 @@ fn export_matches_the_preview_and_the_hand_computed_source_frames() {
         }
     };
 
+    // 古い file の置き換えは承認したものとする（承認が無ければ計画が拒む）。
+    let approved = ExportRequest {
+        replace: Some(ReplaceApproval::capture(&output).unwrap().unwrap()),
+        ..request(&output, ExportQuality::High)
+    };
     let plan = plan_export(
         &project,
-        &request(&output, ExportQuality::High),
+        &approved,
         std::sync::Arc::new(MathLibrary::default()),
     )
     .expect("計画");
@@ -186,10 +207,7 @@ fn export_matches_the_preview_and_the_hand_computed_source_frames() {
     let summary = run_export(&project, &plan, &recorder).expect("書き出し");
     assert_eq!(summary.frames, total);
     assert_eq!(*recorder.last.lock().unwrap(), Some((total, total)));
-    assert!(
-        !temporary_path(&output).exists(),
-        "一時 file が残っています"
-    );
+    assert!(temporaries(&output).is_empty(), "一時 file が残っています");
     assert!(
         std::fs::metadata(&output).unwrap().len() > 1000,
         "古い file のままです"
@@ -366,7 +384,7 @@ fn cancelling_or_failing_leaves_no_file_behind() {
     let error = run_export(&project, &plan, &recorder).unwrap_err();
     assert_eq!(error, ExportError::Cancelled);
     assert!(
-        !output.exists() && !temporary_path(&output).exists(),
+        !output.exists() && temporaries(&output).is_empty(),
         "取消で file が残りました"
     );
 
@@ -376,7 +394,7 @@ fn cancelling_or_failing_leaves_no_file_behind() {
     job.cancel();
     assert!(job.wait().unwrap_err().is_cancelled());
     assert!(
-        !output.exists() && !temporary_path(&output).exists(),
+        !output.exists() && temporaries(&output).is_empty(),
         "job の取消で file が残りました"
     );
 
@@ -397,7 +415,7 @@ fn cancelling_or_failing_leaves_no_file_behind() {
         "{error}"
     );
     assert!(
-        !failed.exists() && !temporary_path(&failed).exists(),
+        !failed.exists() && temporaries(&failed).is_empty(),
         "失敗で file が残りました"
     );
     std::fs::remove_dir_all(&dir).expect("片付け");
@@ -600,5 +618,72 @@ fn graph_clips_are_exported_like_the_preview() {
         mean_difference(&exported[3], &expected[3]) < PARITY_MEAN_LIMIT,
         "preview と違います"
     );
+    std::fs::remove_dir_all(&dir).expect("片付け");
+}
+
+/// 指定の frame を書いたところで素材の更新時刻を変える（外部の tool が素材を書き換えた代わり）。
+struct TouchSource {
+    source: PathBuf,
+    at: i64,
+}
+
+impl ExportControl for TouchSource {
+    fn progress(&self, completed: i64, _total: i64) {
+        if completed == self.at {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&self.source)
+                .expect("素材を開く");
+            file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+                .expect("更新時刻を変える");
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        false
+    }
+}
+
+#[test]
+#[ignore = "workstation"]
+fn a_source_rewritten_while_exporting_is_not_published() {
+    let _gpu = gpu();
+    let dir = work_dir("source-changed");
+    let media = dir.join("source.mp4");
+    std::fs::copy(smoke("v1080p60_h264.mp4"), &media).expect("素材の複製");
+    let project = Project {
+        timeline_clips: vec![video_clip("clip", &media, 0, 0, 30)],
+        ..Project::default()
+    };
+    let output = dir.join("changed.mp4");
+    let plan = plan_export(
+        &project,
+        &request(&output, ExportQuality::Compact),
+        std::sync::Arc::new(MathLibrary::default()),
+    )
+    .expect("計画");
+    let control = TouchSource {
+        source: media.clone(),
+        at: 5,
+    };
+    let error = run_export(&project, &plan, &control).unwrap_err();
+    assert!(
+        matches!(&error, ExportError::Failed(message) if message.contains("素材が変わりました")),
+        "{error}"
+    );
+    assert!(
+        !output.exists() && temporaries(&output).is_empty(),
+        "素材が変わった書き出しを置きました"
+    );
+
+    // 素材が変わらなければ置く（負の対照）。
+    let plan = plan_export(
+        &project,
+        &request(&output, ExportQuality::Compact),
+        std::sync::Arc::new(MathLibrary::default()),
+    )
+    .expect("計画");
+    run_export(&project, &plan, &Recorder::default()).expect("書き出し");
+    assert!(output.is_file());
     std::fs::remove_dir_all(&dir).expect("片付け");
 }

@@ -10,11 +10,14 @@ mod file_id;
 mod lock;
 #[allow(unsafe_code)]
 mod process;
+#[allow(unsafe_code)]
+mod replace;
 mod wide;
 
-pub use atomic_write::atomic_write;
+pub use atomic_write::{CommitPolicy, atomic_write, commit_bytes, commit_file};
 pub use command_line::{find_on_path, quote_argument};
 pub use error::PlatformError;
 pub use file_id::{FileProbe, FileProbeStatus, probe_file};
 pub use lock::{ProjectLock, acquire_project_lock};
 pub use process::{ProcessOutcome, ProcessRequest, run_process};
+pub use replace::ReplaceApproval;

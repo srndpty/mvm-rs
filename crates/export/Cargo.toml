@@ -13,6 +13,7 @@ workspace = true
 mvm-core = { workspace = true }
 mvm-math = { workspace = true }
 mvm-media = { workspace = true }
+mvm-platform = { workspace = true }
 mvm-preview = { workspace = true }
 mvm-project = { workspace = true }
 

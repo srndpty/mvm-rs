@@ -1,4 +1,5 @@
-//! 書き出しの計画。始める前に、書き出せない Project をここで全部落とす。GPU と file は触らない。
+//! 書き出しの計画。始める前に、書き出せない Project をここで全部落とす。GPU は触らない。
+//! file は、出力先が素材と同じ実体でないかを確かめるために識別子を読むだけで、書かない。
 //!
 //! 各 frame の layer と音声区間は preview と同じ関数（[`mvm_preview::plan_frame`]・
 //! [`mvm_preview::audio_spans`]）で決める。ここで持つのは、書き出し全体の尺・出力形式と、
@@ -11,6 +12,7 @@ use mvm_core::Rational;
 use mvm_core::output_timebase::OutputTimebase;
 use mvm_math::require_ready;
 use mvm_media::Mp4Settings;
+use mvm_platform::{FileProbe, FileProbeStatus, ReplaceApproval, probe_file};
 use mvm_preview::{AudioSpan, MathLibrary, audio_spans, output_size, output_timebase};
 use mvm_project::timeline::validate_timeline;
 use mvm_project::{ManimGenerationState, Project, TimelineClipKind};
@@ -62,14 +64,17 @@ pub struct ExportRequest {
     pub quality: ExportQuality,
     /// 字幕を映像へ焼き込む。焼き込まなくても、字幕の終端までは書き出す。
     pub burn_subtitles: bool,
+    /// 書き出し先に既にある file の置き換えの承認。無ければ既存の file へは書き出さない。
+    pub replace: Option<ReplaceApproval>,
 }
 
 /// 検査を通った書き出し。[`crate::run_export`] と [`crate::ExportJob`] へ渡す。
 #[derive(Clone, Debug)]
 pub struct ExportPlan {
     pub output_path: PathBuf,
-    /// encode 中に書く file。検証を通ってから `output_path` へ rename する。
-    pub temporary_path: PathBuf,
+    /// 計画の時点で書き出し先にあった file の置き換えの承認。`None` なら書き出し先は新しい file で、
+    /// 書き終えたときに別の file ができていれば置き換えずに失敗する。
+    pub replace: Option<ReplaceApproval>,
     pub width: u32,
     pub height: u32,
     pub fps: Rational,
@@ -84,6 +89,44 @@ pub struct ExportPlan {
     pub audio_spans: Vec<AudioSpan>,
     /// 描けた数式。出力する数式・数式列・Graph のラベルは全てここにある（計画の時点で確かめる）。
     pub math: Arc<MathLibrary>,
+    /// 出力する clip が読む素材の、計画の時点の実体。書き終えたら照合する。
+    pub sources: SourceManifest,
+}
+
+/// 書き出しが読む素材 file の実体（volume・file ID・大きさ・更新時刻）の控え。
+///
+/// 書き終えた後に照合し、変わっていれば書き出した file を公開しない。照合は始めと終わりの 2 点だけなので、
+/// 途中で書き換えて元の実体へ戻した場合までは見分けない。decode が file を開き直す時点によっては、書き換えの
+/// 前後の中身が混ざる。書き換えを防ぐ（素材を開いたまま共有を拒む、snapshot を取る）ものではない。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SourceManifest {
+    sources: Vec<(PathBuf, FileProbe)>,
+}
+
+impl SourceManifest {
+    /// 出力する clip（有効で、出力する track にある）の素材の今の実体を控える。
+    pub fn capture(project: &Project) -> Self {
+        let mut sources: Vec<(PathBuf, FileProbe)> = Vec::new();
+        for clip in &project.timeline_clips {
+            if !clip.enabled
+                || !project.is_track_output_enabled(clip.track)
+                || clip.media_path.as_os_str().is_empty()
+                || sources.iter().any(|(path, _)| *path == clip.media_path)
+            {
+                continue;
+            }
+            sources.push((clip.media_path.clone(), probe_file(&clip.media_path)));
+        }
+        Self { sources }
+    }
+
+    /// 控えた時点と実体が違う最初の素材。
+    pub fn changed(&self) -> Option<&Path> {
+        self.sources
+            .iter()
+            .find(|(path, probe)| probe_file(path) != *probe)
+            .map(|(path, _)| path.as_path())
+    }
 }
 
 impl ExportPlan {
@@ -109,6 +152,9 @@ pub fn plan_export(
     math: Arc<MathLibrary>,
 ) -> Result<ExportPlan, ExportError> {
     let output_path = check_output_path(&request.output_path)?;
+    let replace = check_existing_output(&output_path, request.replace.as_ref())?;
+    let sources = SourceManifest::capture(project);
+    reject_source_as_output(project, &output_path)?;
     let validation =
         validate_timeline(project).map_err(|error| ExportError::failed(error.to_string()))?;
     let (width, height) =
@@ -138,8 +184,8 @@ pub fn plan_export(
             .map_err(|error| ExportError::failed(error.to_string()))?
     };
     Ok(ExportPlan {
-        temporary_path: temporary_path(&output_path),
         output_path,
+        replace,
         width,
         height,
         fps,
@@ -150,6 +196,7 @@ pub fn plan_export(
         timebase,
         audio_spans: spans,
         math,
+        sources,
     })
 }
 
@@ -181,11 +228,84 @@ fn check_output_path(path: &Path) -> Result<PathBuf, ExportError> {
     })
 }
 
-/// 出力の正規名の隣に置く、encode 中の file。
-pub fn temporary_path(output: &Path) -> PathBuf {
-    let mut name = output.as_os_str().to_owned();
-    name.push(".mvmtmp");
-    PathBuf::from(name)
+/// 書き出し先に今ある file と承認を突き合わせる。無ければ新しい file として書く（古い承認は使わない）。
+/// あれば、同じ実体への承認があるときだけ置き換える。承認の無い既存の file には書き出さない。
+fn check_existing_output(
+    output: &Path,
+    approval: Option<&ReplaceApproval>,
+) -> Result<Option<ReplaceApproval>, ExportError> {
+    let current =
+        ReplaceApproval::capture(output).map_err(|error| ExportError::failed(error.to_string()))?;
+    match (current, approval) {
+        (None, _) => Ok(None),
+        (Some(current), Some(approval)) if current == *approval => Ok(Some(current)),
+        (Some(_), Some(_)) => Err(ExportError::failed(format!(
+            "置き換えを承認した後に書き出し先の file が変わりました: {}",
+            output.display()
+        ))),
+        (Some(_), None) => Err(ExportError::failed(format!(
+            "書き出し先に file があります。置き換えるか確かめてください: {}",
+            output.display()
+        ))),
+    }
+}
+
+/// 出力先が Project の参照する file（素材・Manim の script と生成物）と同じ実体なら失敗させる。
+/// 置き換えると元の素材を失う。パスの綴りではなく volume と file ID で比べるので、大文字小文字・
+/// 別の綴り・hard link でも同じ file を見分ける。出力先がまだ無ければ、どの素材とも同じではない。
+/// 素材の実体を確かめられなければ（開けない・directory など）、同じでないと言えないので失敗させる。
+/// 素材が無いだけなら、出力先と同じ file ではない。
+pub(crate) fn reject_source_as_output(project: &Project, output: &Path) -> Result<(), ExportError> {
+    let target = probe_file(output);
+    match target.status {
+        FileProbeStatus::Missing => return Ok(()),
+        FileProbeStatus::Unavailable => {
+            return Err(ExportError::failed(format!(
+                "書き出し先が素材と同じ file か確かめられません: {}",
+                output.display()
+            )));
+        }
+        FileProbeStatus::File => {}
+    }
+    let same = |path: &Path| -> Result<bool, ExportError> {
+        let source = probe_file(path);
+        match source.status {
+            FileProbeStatus::Missing => Ok(false),
+            FileProbeStatus::File => Ok(
+                source.volume_serial == target.volume_serial && source.file_id == target.file_id
+            ),
+            FileProbeStatus::Unavailable => Err(ExportError::failed(format!(
+                "素材が書き出し先と同じ file か確かめられません: {}",
+                path.display()
+            ))),
+        }
+    };
+    let sources = project
+        .timeline_clips
+        .iter()
+        .map(|clip| clip.media_path.as_path())
+        .chain(
+            project
+                .media_items
+                .iter()
+                .map(|item| item.media_path.as_path()),
+        )
+        .chain(project.manim_assets.iter().flat_map(|asset| {
+            [
+                asset.script_path.as_path(),
+                asset.generated_video_path.as_path(),
+            ]
+        }))
+        .filter(|path| !path.as_os_str().is_empty());
+    for source in sources {
+        if same(source)? {
+            return Err(ExportError::failed(format!(
+                "書き出し先が Project の素材と同じ file です（素材を上書きします）: {}",
+                source.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// 数式・数式列・Graph のラベルの描画が済んでいない、または Manim の動画を生成していない clip が出力に
@@ -238,6 +358,7 @@ mod tests {
             output_path: PathBuf::from(path),
             quality: ExportQuality::Standard,
             burn_subtitles: true,
+            replace: None,
         }
     }
 
@@ -303,10 +424,6 @@ mod tests {
         assert_eq!(plan.fps, Rational::new(60, 1));
         assert_eq!(plan.crf, 23);
         assert!(plan.output_path.is_absolute());
-        assert_eq!(
-            plan.temporary_path.file_name().unwrap().to_string_lossy(),
-            "out.mp4.mvmtmp"
-        );
 
         project.audio_tracks[0].muted = true;
         let silent = plan_export(
@@ -337,6 +454,156 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// 既にある `path` を置き換える承認を付けた依頼。
+    fn approved(path: &Path) -> ExportRequest {
+        ExportRequest {
+            replace: Some(ReplaceApproval::capture(path).unwrap().unwrap()),
+            ..request(&path.to_string_lossy())
+        }
+    }
+
+    #[test]
+    fn rejects_an_output_that_is_a_source_file_under_any_spelling() {
+        let dir = std::env::temp_dir().join(format!("mvm-plan-source-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.mp4");
+        std::fs::write(&source, b"source").unwrap();
+        let linked = dir.join("linked.mp4");
+        std::fs::hard_link(&source, &linked).unwrap();
+        let other = dir.join("other.mp4");
+        std::fs::write(&other, b"other").unwrap();
+
+        let mut clip = video("v", 10);
+        clip.media_path = source.clone();
+        let project = Project {
+            timeline_clips: vec![clip],
+            ..Project::default()
+        };
+        let upper = PathBuf::from(source.to_string_lossy().to_uppercase());
+        // 置き換えを承認していても、素材は置き換えない。
+        for output in [&source, &upper, &linked] {
+            let message = error_of(&project, &approved(output));
+            assert!(
+                message.contains("素材と同じ"),
+                "{}: {message}",
+                output.display()
+            );
+        }
+
+        // media bin だけにある素材と Manim の生成物も守る。
+        let bin = Project {
+            timeline_clips: vec![video("v", 10)],
+            media_items: vec![mvm_project::MediaItem {
+                media_path: other.clone(),
+                ..mvm_project::MediaItem::default()
+            }],
+            ..Project::default()
+        };
+        assert!(error_of(&bin, &approved(&other)).contains("素材と同じ"));
+        let manim = Project {
+            timeline_clips: vec![video("v", 10)],
+            manim_assets: vec![mvm_project::ManimAsset {
+                script_path: dir.join("scene.py"),
+                scene_name: "Scene".to_owned(),
+                generated_video_path: other.clone(),
+                generation_state: ManimGenerationState::Ready,
+                source_fingerprint: String::new(),
+            }],
+            ..Project::default()
+        };
+        assert!(error_of(&manim, &approved(&other)).contains("素材と同じ"));
+
+        // 実体を確かめられない素材（ここでは directory）があれば、同じでないと言えないので失敗する。
+        let unknown = Project {
+            timeline_clips: vec![video("v", 10)],
+            media_items: vec![mvm_project::MediaItem {
+                media_path: dir.clone(),
+                ..mvm_project::MediaItem::default()
+            }],
+            ..Project::default()
+        };
+        assert!(error_of(&unknown, &approved(&other)).contains("確かめられません"));
+
+        // 素材でない既存 file は承認があれば、まだ無い file はそのまま書き出せる（負の対照）。
+        let plan = plan_export(
+            &project,
+            &approved(&other),
+            Arc::new(MathLibrary::default()),
+        )
+        .expect("承認した既存の file");
+        assert!(plan.replace.is_some());
+        let plan = plan_export(
+            &project,
+            &request(&dir.join("new.mp4").to_string_lossy()),
+            Arc::new(MathLibrary::default()),
+        )
+        .expect("新しい file");
+        assert!(plan.replace.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_manifest_notices_a_source_rewritten_after_planning() {
+        let dir = std::env::temp_dir().join(format!("mvm-plan-manifest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let used = dir.join("used.mp4");
+        let unused = dir.join("unused.mp4");
+        std::fs::write(&used, b"used").unwrap();
+        std::fs::write(&unused, b"unused").unwrap();
+        let mut shown = video("shown", 10);
+        shown.media_path = used.clone();
+        let mut disabled = video("disabled", 10);
+        disabled.media_path = unused.clone();
+        disabled.enabled = false;
+        disabled.timeline_start_frame = 20;
+        let project = Project {
+            timeline_clips: vec![shown, disabled],
+            ..Project::default()
+        };
+        let plan = plan_export(
+            &project,
+            &request(&dir.join("out.mp4").to_string_lossy()),
+            Arc::new(MathLibrary::default()),
+        )
+        .unwrap();
+        assert_eq!(plan.sources.changed(), None);
+        // 出力しない clip の素材が変わっても問わない。
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&unused, b"rewritten").unwrap();
+        assert_eq!(plan.sources.changed(), None);
+        // 出力する clip の素材が変われば見つける（大きさが同じでも更新時刻で）。
+        std::fs::write(&used, b"USED").unwrap();
+        assert_eq!(plan.sources.changed(), Some(used.as_path()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_existing_output_needs_an_approval_of_that_very_file() {
+        let dir = std::env::temp_dir().join(format!("mvm-plan-existing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let output = dir.join("out.mp4");
+        std::fs::write(&output, b"earlier export").unwrap();
+        let project = Project {
+            timeline_clips: vec![video("v", 10)],
+            ..Project::default()
+        };
+        let message = error_of(&project, &request(&output.to_string_lossy()));
+        assert!(message.contains("確かめてください"), "{message}");
+
+        let stale = approved(&output);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&output, b"rewritten by another tool").unwrap();
+        let message = error_of(&project, &stale);
+        assert!(message.contains("変わりました"), "{message}");
+
+        // 承認の後に消えた file は新しい file として書く（承認は持ち越さない）。
+        std::fs::remove_file(&output).unwrap();
+        let plan = plan_export(&project, &stale, Arc::new(MathLibrary::default())).unwrap();
+        assert!(plan.replace.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

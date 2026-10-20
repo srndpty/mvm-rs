@@ -608,6 +608,15 @@ impl PreviewEngine {
     }
 }
 
+impl PreviewEngine {
+    /// 停止を頼み、終了を待たずに worker の thread を手放す。重い decode の途中でも UI を止めない。
+    /// 受け取った側が thread を持ち、終わったら join する（detach しない）。手放した後の画像は誰も受け取らない。
+    pub fn retire(mut self) -> Option<JoinHandle<()>> {
+        let _ = self.commands.send(Command::Shutdown);
+        self.thread.take()
+    }
+}
+
 impl Drop for PreviewEngine {
     fn drop(&mut self) {
         let _ = self.commands.send(Command::Shutdown);
@@ -660,6 +669,29 @@ mod tests {
         assert_eq!(image.width, 1920);
         assert_eq!(image.rgba.len(), 1920 * 1080 * 4);
         assert_eq!(&image.rgba[..4], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn a_retired_engine_stops_by_itself() {
+        let engine = PreviewEngine::start().expect("起動");
+        let project = Project {
+            timeline_clips: vec![span(600)],
+            ..Project::default()
+        };
+        engine
+            .set_project(Arc::new(project), Arc::new(MathLibrary::default()), 1)
+            .unwrap();
+        engine.play(0, 1).unwrap();
+        engine
+            .wait_image_until(Duration::from_secs(2), |_| true)
+            .expect("frame が届きません");
+        let thread = engine.retire().expect("worker の thread");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !thread.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(thread.is_finished(), "停止を頼んだ worker が止まりません");
+        thread.join().unwrap();
     }
 
     #[test]

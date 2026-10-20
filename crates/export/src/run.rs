@@ -2,12 +2,16 @@
 //!
 //! encode 中の file は job ごとに一意な名前で排他的に作り、この job が作ったものだけを消す。
 //! 途中で失敗・取消したときはそれを消し、正規名には何も書かない。
+//!
+//! 正規名へは、計画の時点で無かったなら既存を置換しない rename で置く（書き出し中に別の job や別の tool が
+//! 作った file を上書きしない）。あったなら、置き換えを承認した file のままであることを照合してから置き換える。
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use mvm_media::{Mp4Writer, ProbedMedia, probe_media_file};
+use mvm_platform::{ReplaceApproval, place_file};
 use mvm_preview::{AudioMixer, FramePlan, PlannedSource, StillPreview, plan_frame};
 use mvm_project::Project;
 
@@ -63,7 +67,7 @@ pub fn run_export(
     }
     // 計画の後に素材と出力先が同じ file になっていないか、置く直前にもう一度確かめる。
     reject_source_as_output(project, &plan.output_path)?;
-    temporary.publish(&plan.output_path)?;
+    temporary.publish(&plan.output_path, plan.replace.as_ref())?;
     Ok(summary)
 }
 
@@ -111,8 +115,12 @@ impl TemporaryOutput {
         &self.path
     }
 
-    fn publish(mut self, output: &Path) -> Result<(), ExportError> {
-        std::fs::rename(&self.path, output).map_err(|error| {
+    fn publish(
+        mut self,
+        output: &Path,
+        approval: Option<&ReplaceApproval>,
+    ) -> Result<(), ExportError> {
+        place_file(&self.path, output, approval).map_err(|error| {
             ExportError::failed(format!(
                 "書き出した file を {} へ置けません: {error}",
                 output.display()
@@ -324,8 +332,19 @@ mod tests {
         assert_eq!(std::fs::read(&foreign).unwrap(), b"other job");
 
         std::fs::write(second.path(), b"encoded").unwrap();
-        second.publish(&output).unwrap();
+        second.publish(&output, None).unwrap();
         assert_eq!(std::fs::read(&output).unwrap(), b"encoded");
+
+        // 計画の時点で無かった正規名に、書き出し中に別の job が置いた file は上書きしない。
+        let late = TemporaryOutput::create(&output).unwrap();
+        std::fs::write(late.path(), b"late").unwrap();
+        let late_path = late.path().to_path_buf();
+        assert!(late.publish(&output, None).is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"encoded");
+        assert!(
+            !late_path.exists(),
+            "公開できなかった一時 file が残りました"
+        );
         let mut names: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())

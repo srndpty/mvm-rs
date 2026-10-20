@@ -309,16 +309,51 @@ fn the_first_video_goes_to_v1_with_its_sound_on_a1() {
 }
 
 #[test]
-fn a_later_video_gets_a_new_video_track_and_a_new_audio_track_when_a1_is_busy() {
+fn an_overlapping_video_uses_the_free_v2_and_adds_an_audio_track_when_a1_is_busy() {
     let mut project = Project::default();
     let (first, first_audio) = linked_pair("v");
     place_video_media_at(&mut project, first, Some(first_audio), 0).unwrap();
     let (second, second_audio) = linked_pair("w");
     place_video_media_at(&mut project, second, Some(second_audio), 10).unwrap();
-    // 既定の V1・V2 に続く V3 へ置く（空いた V2 は使わない）。
-    assert_eq!(project.clip("w").unwrap().track, TrackRef::video(2));
+    // V1 は [0, 100) が使用中なので、空いている既定の V2 へ置く（track は足さない）。
+    assert_eq!(project.clip("w").unwrap().track, TrackRef::video(1));
+    assert_eq!(project.video_tracks.len(), 2);
+    // A1 も使用中なので、足した A2 へ置く。
     assert_eq!(project.clip("w-a").unwrap().track, A2);
     assert_eq!(project.clip("v-a").unwrap().track, A1);
+    assert_eq!(project.audio_tracks.len(), 2);
+
+    // V1・V2 とも使用中の区間なら、そのときだけ V3 を足す。
+    let (third, third_audio) = linked_pair("x");
+    place_video_media_at(&mut project, third, Some(third_audio), 50).unwrap();
+    assert_eq!(project.clip("x").unwrap().track, TrackRef::video(2));
+    assert_eq!(project.video_tracks.len(), 3);
+    assert_eq!(project.clip("x-a").unwrap().track, TrackRef::audio(2));
+}
+
+#[test]
+fn a_video_after_the_existing_ones_reuses_v1_and_a1() {
+    let mut project = Project::default();
+    let (first, first_audio) = linked_pair("v");
+    place_video_media_at(&mut project, first, Some(first_audio), 0).unwrap();
+    let (second, second_audio) = linked_pair("w");
+    // 最初の clip は [0, 100) なので、100 からなら V1・A1 が空いている。
+    place_video_media_at(&mut project, second, Some(second_audio), 100).unwrap();
+    assert_eq!(project.clip("w").unwrap().track, V1);
+    assert_eq!(project.clip("w-a").unwrap().track, A1);
+    assert_eq!(project.video_tracks.len(), 2);
+    assert_eq!(project.audio_tracks.len(), 1);
+}
+
+#[test]
+fn a_muted_track_is_skipped_when_placing_a_video() {
+    let mut project = Project::default();
+    project.video_tracks[0].muted = true;
+    project.audio_tracks[0].muted = true;
+    let (video, audio) = linked_pair("v");
+    place_video_media_at(&mut project, video, Some(audio), 0).unwrap();
+    assert_eq!(project.clip("v").unwrap().track, TrackRef::video(1));
+    assert_eq!(project.clip("v-a").unwrap().track, A2);
 }
 
 #[test]

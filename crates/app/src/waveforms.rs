@@ -193,21 +193,78 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::*;
 
-    /// 結果が届くまで進める。時計は毎回 1 秒進め、実体の確認も毎回行う。
+    /// worker の decode を待つ実時間の上限。0.1〜0.2 秒の WAV の decode は、debug ビルドで他の試験と並行に
+    /// 走らせてもこれより十分短い。超えたら待ちの不足ではなく異常として、その時の状態を報告する。
+    const WAIT_LIMIT: Duration = Duration::from_secs(30);
+
+    /// 失敗したときに、どこで止まったか（decode 中・待ち行列・実体の変化）を報告する。
+    fn describe(waveforms: &Waveforms) -> String {
+        let job = match &waveforms.job {
+            Some((path, identity, job)) => format!(
+                "decode 中 {}（終了 {}、始めた後に実体が変化 {}）",
+                path.display(),
+                job.is_finished(),
+                probe_file(path) != *identity
+            ),
+            None => "decode なし".to_owned(),
+        };
+        let entries: Vec<String> = waveforms
+            .entries
+            .iter()
+            .map(|(path, entry)| {
+                format!(
+                    "{} = {}（実体が変化 {}）",
+                    path.display(),
+                    state(waveforms, path),
+                    probe_file(path) != entry.identity
+                )
+            })
+            .collect();
+        format!("{job}; 待ち行列 {:?}; entry {entries:?}", waveforms.queue)
+    }
+
+    /// 走っている decode が終わるまで待つ（結果はまだ受け取らない）。
+    fn wait_for_job(waveforms: &Waveforms, deadline: Instant) {
+        while waveforms
+            .job
+            .as_ref()
+            .is_some_and(|(_, _, job)| !job.is_finished())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "波形の decode が {WAIT_LIMIT:?} で終わりません: {}",
+                describe(waveforms)
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// 結果が届き、待ち行列が空になるまで進める。論理時刻 `clock` は poll ごとに確認の間隔を 1 つ進め、
+    /// 実体の確認を毎回行わせる（実時間の経過とは独立）。worker の終わりは実時間の期限付きで待つ。
     fn settle(waveforms: &mut Waveforms, in_use: &HashSet<PathBuf>, clock: &mut u64) {
-        for _ in 0..1_000 {
+        let deadline = Instant::now() + WAIT_LIMIT;
+        loop {
             *clock += CHECK_INTERVAL_MS;
             waveforms.poll(*clock, in_use, None);
             if waveforms.job.is_none() && waveforms.queue.is_empty() {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(2));
+            assert!(
+                waveforms.job.is_some(),
+                "待ち行列があるのに decode を始めていません: {}",
+                describe(waveforms)
+            );
+            assert!(
+                Instant::now() < deadline,
+                "波形が {WAIT_LIMIT:?} で落ち着きません: {}",
+                describe(waveforms)
+            );
+            wait_for_job(waveforms, deadline);
         }
-        panic!("波形の decode が終わりません");
     }
 
     fn state(waveforms: &Waveforms, path: &Path) -> &'static str {
@@ -290,17 +347,12 @@ mod tests {
     fn decode_without_taking(waveforms: &mut Waveforms, path: &Path) {
         assert!(waveforms.get(path).is_none());
         assert!(!waveforms.start_next(None));
-        for _ in 0..1_000 {
-            if waveforms
-                .job
-                .as_ref()
-                .is_some_and(|(_, _, job)| job.is_finished())
-            {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        panic!("波形の decode が終わりません");
+        assert!(
+            waveforms.job.is_some(),
+            "decode を始めていません: {}",
+            describe(waveforms)
+        );
+        wait_for_job(waveforms, Instant::now() + WAIT_LIMIT);
     }
 
     #[test]

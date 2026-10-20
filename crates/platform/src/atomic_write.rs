@@ -22,6 +22,7 @@ use windows::Win32::System::Threading::{GetCurrentProcessId, Sleep};
 use windows::core::{HRESULT, PCWSTR};
 
 use crate::error::PlatformError;
+use crate::replace::{ReplaceApproval, replace_approved};
 use crate::wide::wide_path;
 
 const REPLACE_ATTEMPTS: u32 = 40;
@@ -29,17 +30,67 @@ const REPLACE_WAIT_MS: u32 = 50;
 
 static TEMP_SERIAL: AtomicU32 = AtomicU32::new(1);
 
+/// 一時 file を書き終えた後、対象の名前へどう置くか。
+#[derive(Clone, Copy)]
+enum Placement<'a> {
+    /// 既存の file を無条件に置換する（session が持ち続けている保存先・自動復旧）。
+    Replace,
+    /// 既存の file があれば失敗する。
+    CreateNew,
+    /// 承認した file だけを置換する。
+    Approved(&'a ReplaceApproval),
+}
+
 /// `path` を `bytes` で置換する。失敗したときは元の file を残し、一時 file は消す。
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), PlatformError> {
-    write_and_move(path, bytes, true)
+    write_and_move(path, bytes, Placement::Replace)
 }
 
 /// `path` に file が無いときだけ `bytes` で作る。既にあれば何も書かずに失敗する。
 pub fn atomic_create(path: &Path, bytes: &[u8]) -> Result<(), PlatformError> {
-    write_and_move(path, bytes, false)
+    write_and_move(path, bytes, Placement::CreateNew)
 }
 
-fn write_and_move(path: &Path, bytes: &[u8], replace_existing: bool) -> Result<(), PlatformError> {
+/// 置き換えを承認した file を `bytes` で置き換える。承認の後に別の file へ変わっていれば何も書かずに失敗する。
+pub fn atomic_replace_approved(
+    approval: &ReplaceApproval,
+    bytes: &[u8],
+) -> Result<(), PlatformError> {
+    write_and_move(approval.path(), bytes, Placement::Approved(approval))
+}
+
+/// 書き終えた `temporary`（`target` と同じ directory）を `target` に置く。`approval` が無ければ既存の
+/// file を置き換えず、あれば承認した file だけを置き換える。失敗しても `temporary` は消さない。
+pub fn place_file(
+    temporary: &Path,
+    target: &Path,
+    approval: Option<&ReplaceApproval>,
+) -> Result<(), PlatformError> {
+    match approval {
+        None => move_to_new(&wide_path(temporary)?, &wide_path(target)?, target),
+        Some(approval) => {
+            let absolute = std::path::absolute(target).map_err(|error| {
+                PlatformError::new(format!(
+                    "パスを解決できません ({}): {error}",
+                    target.display()
+                ))
+            })?;
+            if absolute != approval.path() {
+                return Err(PlatformError::new(format!(
+                    "置き換えを承認した file と置き先が違います: {}",
+                    target.display()
+                )));
+            }
+            replace_approved(temporary, approval)
+        }
+    }
+}
+
+fn write_and_move(
+    path: &Path,
+    bytes: &[u8],
+    placement: Placement<'_>,
+) -> Result<(), PlatformError> {
     if path.as_os_str().is_empty() {
         return Err(PlatformError::new("書き込み先のパスが空です"));
     }
@@ -55,10 +106,10 @@ fn write_and_move(path: &Path, bytes: &[u8], replace_existing: bool) -> Result<(
         return Err(error);
     }
     let target_wide = wide_path(path)?;
-    let result = if replace_existing {
-        replace(&temporary_wide, &target_wide)
-    } else {
-        move_to_new(&temporary_wide, &target_wide, path)
+    let result = match placement {
+        Placement::Replace => replace(&temporary_wide, &target_wide),
+        Placement::CreateNew => move_to_new(&temporary_wide, &target_wide, path),
+        Placement::Approved(approval) => replace_approved(&temporary, approval),
     };
     if result.is_err() {
         file.delete();
@@ -181,7 +232,11 @@ fn replace(temporary: &[u16], target: &[u16]) -> Result<(), PlatformError> {
 }
 
 /// 置換しない rename。既存の target があれば失敗する（確認と rename の間に競合しない）。
-fn move_to_new(temporary: &[u16], target: &[u16], path: &Path) -> Result<(), PlatformError> {
+pub(crate) fn move_to_new(
+    temporary: &[u16],
+    target: &[u16],
+    path: &Path,
+) -> Result<(), PlatformError> {
     // SAFETY: 両方とも NUL 終端の同じ directory 上のパス。REPLACE_EXISTING が無いので target は変えない。
     unsafe {
         MoveFileExW(
@@ -260,6 +315,94 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["project.mvm"], "一時 file が残っています");
+        fs::remove_dir_all(&dir).expect("片付け");
+    }
+
+    #[test]
+    fn an_approved_file_is_replaced_only_while_it_is_the_same_file() {
+        let dir = scratch_dir();
+        let path = dir.join("lecture.mvm");
+        assert!(
+            ReplaceApproval::capture(&path)
+                .expect("無い file")
+                .is_none()
+        );
+        fs::write(&path, b"approved").expect("既存");
+        let approval = ReplaceApproval::capture(&path)
+            .expect("確かめる")
+            .expect("ある");
+        atomic_replace_approved(&approval, b"replaced").expect("承認した file の置き換え");
+        assert_eq!(fs::read(&path).expect("読み戻し"), b"replaced");
+
+        // 置き換えた後は、前の承認では置き換えない。
+        let error = atomic_replace_approved(&approval, b"again").expect_err("古い承認");
+        assert!(error.message().contains("変わりました"), "{error}");
+        assert_eq!(fs::read(&path).expect("読み戻し"), b"replaced");
+
+        // 承認の後に別の process が消して作り直した file も置き換えない。
+        let approval = ReplaceApproval::capture(&path)
+            .expect("確かめる")
+            .expect("ある");
+        fs::remove_file(&path).expect("消す");
+        fs::write(&path, b"other process").expect("作り直す");
+        atomic_replace_approved(&approval, b"mine").expect_err("差し替わった file");
+        assert_eq!(fs::read(&path).expect("読み戻し"), b"other process");
+
+        // 承認の後に消えた file は、置き換えずに失敗する。
+        let approval = ReplaceApproval::capture(&path)
+            .expect("確かめる")
+            .expect("ある");
+        fs::remove_file(&path).expect("消す");
+        atomic_replace_approved(&approval, b"mine").expect_err("消えた file");
+        assert!(!path.exists());
+
+        // 他の process が書き込み中の file は置き換えない。
+        fs::write(&path, b"busy").expect("作る");
+        let approval = ReplaceApproval::capture(&path)
+            .expect("確かめる")
+            .expect("ある");
+        let writer = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("書き込み中");
+        atomic_replace_approved(&approval, b"mine").expect_err("書き込み中の file");
+        drop(writer);
+        assert_eq!(fs::read(&path).expect("読み戻し"), b"busy");
+
+        let names: Vec<_> = fs::read_dir(&dir)
+            .expect("directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            ["lecture.mvm"],
+            "一時 file か退避した file が残っています"
+        );
+        fs::remove_dir_all(&dir).expect("片付け");
+    }
+
+    #[test]
+    fn placing_a_file_without_approval_never_replaces() {
+        let dir = scratch_dir();
+        let target = dir.join("out.mp4");
+        let first = dir.join("first.tmp");
+        fs::write(&first, b"first").expect("一時 file");
+        place_file(&first, &target, None).expect("新しい file");
+        assert_eq!(fs::read(&target).expect("読み戻し"), b"first");
+        let second = dir.join("second.tmp");
+        fs::write(&second, b"second").expect("一時 file");
+        place_file(&second, &target, None).expect_err("承認の無い置換");
+        assert_eq!(fs::read(&target).expect("読み戻し"), b"first");
+        assert!(second.is_file(), "失敗した一時 file は呼び出し側が片付ける");
+
+        let approval = ReplaceApproval::capture(&target)
+            .expect("確かめる")
+            .expect("ある");
+        place_file(&second, &dir.join("other.mp4"), Some(&approval)).expect_err("別の置き先");
+        place_file(&second, &target, Some(&approval)).expect("承認した置換");
+        assert_eq!(fs::read(&target).expect("読み戻し"), b"second");
+        assert!(!second.exists());
         fs::remove_dir_all(&dir).expect("片付け");
     }
 

@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use mvm_core::timecode::format_timecode;
-use mvm_platform::{ProjectLock, atomic_create, atomic_write, probe_file};
+use mvm_platform::{
+    ProjectLock, ReplaceApproval, atomic_create, atomic_replace_approved, atomic_write, probe_file,
+};
 use mvm_preview::{PreviewEngine, PreviewImage, plan_frame};
 use mvm_project::Project;
 use mvm_project::json::{parse_project_json, serialize_project_json};
@@ -107,22 +109,36 @@ pub(crate) struct RecoveryOffer {
 }
 
 /// 新しい保存先（新規作成・名前を付けて保存）に file が既にあるときの扱い。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExistingFile {
     /// 置き換えない。既にあれば何も書かずに失敗する。
     Keep,
-    /// 置き換える。利用者が上書きを承認したときだけ使う。
-    Replace,
+    /// 利用者が置き換えを承認した file だけを置き換える。承認の後に別の file へ変わっていれば失敗する。
+    Replace(ReplaceApproval),
 }
 
 impl ExistingFile {
-    fn write(self, path: &Path, bytes: &[u8]) -> Result<(), AppError> {
+    fn write(&self, path: &Path, bytes: &[u8]) -> Result<(), AppError> {
         match self {
             Self::Keep => atomic_create(path, bytes),
-            Self::Replace => atomic_write(path, bytes),
+            Self::Replace(approval) => {
+                if approval.path() != path {
+                    return Err(AppError::new(format!(
+                        "置き換えを承認した file と保存先が違います: {}",
+                        path.display()
+                    )));
+                }
+                atomic_replace_approved(approval, bytes)
+            }
         }
         .map_err(|error| AppError::new(error.to_string()))
     }
+}
+
+/// 置き換えの確認を出す直前に呼ぶ。`path` に file があれば、今の実体を承認として返す。無ければ `None`。
+/// 利用者が置き換えを承認したら [`ExistingFile::Replace`] や書き出しの依頼に渡す。
+pub fn replace_approval(path: &Path) -> Result<Option<ReplaceApproval>, AppError> {
+    ReplaceApproval::capture(path).map_err(|error| AppError::new(error.to_string()))
 }
 
 /// 開いたときに見つかった自動復旧データ。
@@ -394,6 +410,7 @@ impl Session {
     /// 既定の Project を `path` へ書き、それを現在の session にする。失敗しても今の session は残す。
     /// 既存の file は `existing` が [`ExistingFile::Replace`] のときだけ置き換える。
     pub fn create_project(&mut self, path: &Path, existing: ExistingFile) -> Result<(), AppError> {
+        self.refuse_switch_while_exporting()?;
         let path = absolute_path(path)?;
         let project = Project::default();
         let bytes = project_bytes(&project, &path)?;
@@ -410,6 +427,7 @@ impl Session {
 
     /// `path` を読む。失敗しても今の session は残す。
     pub fn open_project(&mut self, path: &Path) -> Result<(), AppError> {
+        self.refuse_switch_while_exporting()?;
         let path = absolute_path(path)?;
         let bytes = std::fs::read(&path).map_err(|error| {
             AppError::new(format!(
@@ -679,7 +697,10 @@ impl Session {
         self.playhead_frame = 0;
         self.scrubbing = false;
         self.playing = false;
-        self.engine = None;
+        // 前の Project の preview は停止を頼むだけで、終わりは待たない（decode の途中で UI を止めない）。
+        if let Some(thread) = self.engine.take().and_then(PreviewEngine::retire) {
+            self.background.retire_thread(thread);
+        }
         self.preview_image = None;
         self.preview_error = None;
         self.skipped_note = None;
@@ -688,6 +709,17 @@ impl Session {
         self.edit_epoch = self.edit_epoch.saturating_add(1);
         self.edit_revision = self.edit_revision.saturating_add(1);
         self.preview_generation = self.preview_generation.saturating_add(1);
+    }
+
+    /// 書き出しは開始時の Project を書き続ける。画面の Project と書き出す Project を食い違わせないため、
+    /// 書き出し中は別の Project へ切り替えない。
+    fn refuse_switch_while_exporting(&self) -> Result<(), AppError> {
+        if self.is_exporting() {
+            return Err(AppError::new(
+                "書き出し中は Project を切り替えられません。取り消すか、終わってから操作してください",
+            ));
+        }
+        Ok(())
     }
 
     fn acquire_lock(&mut self, path: &Path) -> Result<ProjectLock, AppError> {
@@ -1252,9 +1284,22 @@ mod tests {
         assert_eq!(fs::read(&path).expect("file"), saved);
         assert_eq!(session.path(), Some(other.as_path()));
 
+        // 承認の後に変わった file は置き換えない。
+        let stale = ReplaceApproval::capture(&path).unwrap().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&path, b"changed by another tool").expect("外部の変更");
+        session
+            .save_project_as(&path, ExistingFile::Replace(stale))
+            .expect_err("承認の後に変わった file を置き換えました");
+        assert_eq!(fs::read(&path).expect("file"), b"changed by another tool");
+        fs::write(&path, &saved).expect("戻す");
+
         // 承認すれば置き換える（負の対照）。
         session
-            .save_project_as(&path, ExistingFile::Replace)
+            .save_project_as(
+                &path,
+                ExistingFile::Replace(ReplaceApproval::capture(&path).unwrap().unwrap()),
+            )
             .expect("承認した上書き");
         assert_ne!(fs::read(&path).expect("file"), saved);
         assert_eq!(session.path(), Some(path.as_path()));

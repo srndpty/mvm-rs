@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, TextureHandle};
-use mvm_app::{AppError, ExistingFile, RecoveryPrompt, Session};
+use mvm_app::{AppError, ExistingFile, RecoveryPrompt, ReplaceApproval, Session, replace_approval};
 use mvm_project::timeline::TimelineTool;
 
 use crate::{
@@ -31,9 +31,32 @@ enum FileAction {
     Close,
 }
 
+/// 新しい保存先へ Project を書く操作。
+#[derive(Clone, Copy)]
+enum SaveTarget {
+    New,
+    SaveAs,
+}
+
+/// 既にある file を置き換えてよいかの確認。確認を出した時点の実体を承認として持ち、
+/// 承認の後に別の file へ変わっていれば session が置き換えずに失敗する。
+struct PendingOverwrite {
+    target: SaveTarget,
+    approval: ReplaceApproval,
+    /// 保存できたら続ける操作（未保存の確認から保存したとき）。
+    then: Option<FileAction>,
+}
+
+enum SaveOutcome {
+    Saved,
+    Cancelled,
+    AwaitingOverwrite,
+}
+
 pub struct MvmApp {
     session: Session,
     confirm: Option<FileAction>,
+    overwrite: Option<PendingOverwrite>,
     notice: String,
     preview_texture: Option<(u64, TextureHandle)>,
     preview_drag: Option<preview_ui::TransformDrag>,
@@ -63,6 +86,7 @@ impl MvmApp {
         Self {
             session: Session::new(),
             confirm: None,
+            overwrite: None,
             notice: String::new(),
             preview_texture: None,
             preview_drag: None,
@@ -111,9 +135,9 @@ impl MvmApp {
         self.confirm = None;
         match action {
             FileAction::New => {
-                if let Some((path, existing)) = pick_save("新規プロジェクトの保存先") {
-                    let result = self.session.create_project(&path, existing);
-                    self.note(result);
+                if let Some(path) = pick_save("新規プロジェクトの保存先") {
+                    let result = self.write_new_target(SaveTarget::New, path, None);
+                    self.note(result.map(|_| ()));
                 }
             }
             FileAction::Open => {
@@ -166,29 +190,109 @@ impl MvmApp {
             let result = self.session.save_project();
             self.note(result);
             self.show_external_again_if_refused();
-        } else if let Some((path, existing)) = pick_save("プロジェクトの保存先") {
-            let result = self.session.save_project_as(&path, existing);
-            self.note(result);
+        } else if let Some(path) = pick_save("プロジェクトの保存先") {
+            let result = self.write_new_target(SaveTarget::SaveAs, path, None);
+            self.note(result.map(|_| ()));
         }
     }
 
     fn save_as(&mut self) {
-        if let Some((path, existing)) = pick_save("名前を付けて保存") {
-            let result = self.session.save_project_as(&path, existing);
-            self.note(result);
+        if let Some(path) = pick_save("名前を付けて保存") {
+            let result = self.write_new_target(SaveTarget::SaveAs, path, None);
+            self.note(result.map(|_| ()));
         }
     }
 
-    /// 保存できたとき `Ok(true)`。ダイアログを閉じたときは `Ok(false)`。
-    fn save_current(&mut self) -> Result<bool, AppError> {
+    /// 保存して `then` へ続ける。保存先を選び直して既存の file を置き換えるときは、確認の後に続ける。
+    fn save_current(&mut self, then: FileAction) -> Result<SaveOutcome, AppError> {
         if self.session.path().is_some() {
             self.session.save_project()?;
-            Ok(true)
-        } else if let Some((path, existing)) = pick_save("プロジェクトの保存先") {
-            self.session.save_project_as(&path, existing)?;
-            Ok(true)
+            Ok(SaveOutcome::Saved)
+        } else if let Some(path) = pick_save("プロジェクトの保存先") {
+            self.write_new_target(SaveTarget::SaveAs, path, Some(then))
         } else {
-            Ok(false)
+            Ok(SaveOutcome::Cancelled)
+        }
+    }
+
+    /// 選んだ保存先へ書く。file が既にあれば書かずに置き換えの確認を出す（OS の dialog の確認は、
+    /// 書き込みまでの間に現れた file を承認しないので頼らない）。無ければ、既存を置き換えない書き込みにする。
+    fn write_new_target(
+        &mut self,
+        target: SaveTarget,
+        path: PathBuf,
+        then: Option<FileAction>,
+    ) -> Result<SaveOutcome, AppError> {
+        match replace_approval(&path)? {
+            None => {
+                self.write_target(target, &path, ExistingFile::Keep)?;
+                Ok(SaveOutcome::Saved)
+            }
+            Some(approval) => {
+                self.overwrite = Some(PendingOverwrite {
+                    target,
+                    approval,
+                    then,
+                });
+                Ok(SaveOutcome::AwaitingOverwrite)
+            }
+        }
+    }
+
+    fn write_target(
+        &mut self,
+        target: SaveTarget,
+        path: &std::path::Path,
+        existing: ExistingFile,
+    ) -> Result<(), AppError> {
+        match target {
+            SaveTarget::New => self.session.create_project(path, existing),
+            SaveTarget::SaveAs => self.session.save_project_as(path, existing),
+        }
+    }
+
+    /// 確認した file を置き換え、続ける操作があれば続ける。
+    fn approve_overwrite(&mut self) {
+        let Some(pending) = self.overwrite.take() else {
+            return;
+        };
+        let path = pending.approval.path().to_path_buf();
+        match self.write_target(
+            pending.target,
+            &path,
+            ExistingFile::Replace(pending.approval),
+        ) {
+            Ok(()) => {
+                self.notice.clear();
+                if let Some(then) = pending.then {
+                    self.perform(then);
+                }
+            }
+            Err(error) => self.notice = error.message().to_owned(),
+        }
+    }
+
+    fn confirm_overwrite(&mut self, ui: &mut egui::Ui) {
+        let Some(pending) = &self.overwrite else {
+            return;
+        };
+        let path = pending.approval.path().display().to_string();
+        let mut replace = None;
+        egui::Modal::new(egui::Id::new("overwrite")).show(ui.ctx(), |ui| {
+            ui.label(format!("{path} は既にあります。置き換えますか？"));
+            ui.horizontal(|ui| {
+                if ui.button("置き換える").clicked() {
+                    replace = Some(true);
+                }
+                if ui.button("キャンセル").clicked() {
+                    replace = Some(false);
+                }
+            });
+        });
+        match replace {
+            Some(true) => self.approve_overwrite(),
+            Some(false) => self.overwrite = None,
+            None => {}
         }
     }
 
@@ -216,6 +320,7 @@ impl MvmApp {
 
     fn handle_shortcuts(&mut self, ui: &mut egui::Ui) {
         if self.confirm.is_some()
+            || self.overwrite.is_some()
             || self.recovery_visible()
             || self.external_visible()
             || self.export.is_open()
@@ -471,11 +576,19 @@ impl MvmApp {
     fn menu(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("ファイル", |ui| {
-                if ui.button("新規プロジェクト").clicked() {
+                // 書き出し中は Project を切り替えない（書き出しは開始時の Project を書き続ける）。
+                let switchable = !self.session.is_exporting();
+                if ui
+                    .add_enabled(switchable, egui::Button::new("新規プロジェクト"))
+                    .clicked()
+                {
                     self.request(FileAction::New);
                     ui.close();
                 }
-                if ui.button("開く").clicked() {
+                if ui
+                    .add_enabled(switchable, egui::Button::new("開く"))
+                    .clicked()
+                {
                     self.request(FileAction::Open);
                     ui.close();
                 }
@@ -681,12 +794,13 @@ impl MvmApp {
             });
         });
         match choice {
-            Some(UnsavedChoice::Save) => match self.save_current() {
-                Ok(true) => {
+            Some(UnsavedChoice::Save) => match self.save_current(action) {
+                Ok(SaveOutcome::Saved) => {
                     self.notice.clear();
                     self.perform(action);
                 }
-                Ok(false) => {}
+                Ok(SaveOutcome::AwaitingOverwrite) => self.confirm = None,
+                Ok(SaveOutcome::Cancelled) => {}
                 Err(error) => {
                     self.notice = error.message().to_owned();
                     self.show_external_again_if_refused();
@@ -884,20 +998,13 @@ fn pick_media_file() -> Option<PathBuf> {
         .pick_file()
 }
 
-/// 保存先を選ぶ。dialog は選んだ名前の上書きを確認するので、その名前のままなら置き換えてよい。
-/// 拡張子を足した名前は確認を経ていないので、既にあれば置き換えずに失敗させる。
-fn pick_save(title: &str) -> Option<(PathBuf, ExistingFile)> {
-    let picked = rfd::FileDialog::new()
+/// 保存先を選ぶ。既にある file を置き換えるかは、書く直前に [`MvmApp::write_new_target`] が確かめる。
+fn pick_save(title: &str) -> Option<PathBuf> {
+    rfd::FileDialog::new()
         .set_title(title)
         .add_filter("mvm project", &["mvm"])
-        .save_file()?;
-    let path = ensure_mvm(picked.clone());
-    let existing = if path == picked {
-        ExistingFile::Replace
-    } else {
-        ExistingFile::Keep
-    };
-    Some((path, existing))
+        .save_file()
+        .map(ensure_mvm)
 }
 
 fn ensure_mvm(path: PathBuf) -> PathBuf {
@@ -1015,6 +1122,7 @@ impl MvmApp {
             );
         });
         self.confirm_unsaved(ui);
+        self.confirm_overwrite(ui);
         self.confirm_recovery(ui);
         self.confirm_external(ui);
         export_ui::show(ui, &mut self.session, &mut self.export, &mut self.notice);
@@ -1261,6 +1369,57 @@ mod tests {
         harness.get_by_label("保存していない変更があります");
         harness.get_by_label("破棄して続ける");
         harness.get_by_label("キャンセル");
+    }
+
+    #[test]
+    fn saving_onto_an_existing_file_asks_and_replaces_only_the_confirmed_file() {
+        let dir = std::env::temp_dir().join(format!("mvm-shell-overwrite-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("existing.mvm");
+        std::fs::write(&path, b"another project").unwrap();
+        let mut harness = harness(MvmApp::new());
+        let outcome = harness
+            .state_mut()
+            .write_new_target(SaveTarget::SaveAs, path.clone(), None);
+        assert!(matches!(outcome, Ok(SaveOutcome::AwaitingOverwrite)));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"another project",
+            "確認の前に書きました"
+        );
+        harness.run();
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        assert!(harness.state().overwrite.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), b"another project");
+        assert!(harness.state().session.path().is_none());
+
+        // 確認を出した後に別の tool が書き換えた file は、承認しても置き換えない。
+        let _ = harness
+            .state_mut()
+            .write_new_target(SaveTarget::SaveAs, path.clone(), None);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, b"rewritten meanwhile").unwrap();
+        harness.state_mut().approve_overwrite();
+        assert!(
+            harness.state().notice.contains("変わりました"),
+            "{}",
+            harness.state().notice
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"rewritten meanwhile");
+
+        // 確認した file は置き換える（負の対照）。
+        let _ = harness
+            .state_mut()
+            .write_new_target(SaveTarget::SaveAs, path.clone(), None);
+        harness.run();
+        harness.get_by_label("置き換える").click();
+        harness.run();
+        assert_ne!(std::fs::read(&path).unwrap(), b"rewritten meanwhile");
+        assert_eq!(harness.state().session.path(), Some(path.as_path()));
+        drop(harness);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

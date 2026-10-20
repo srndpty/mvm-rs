@@ -83,6 +83,7 @@ mod tests {
             output_path: PathBuf::from(path),
             quality: ExportQuality::Standard,
             burn_subtitles: true,
+            replace: None,
         }
     }
 
@@ -94,6 +95,44 @@ mod tests {
         assert!(!session.is_exporting());
         assert!(session.export_progress().is_none());
         assert!(session.poll_export().is_none());
+    }
+
+    #[test]
+    fn the_project_cannot_be_switched_while_exporting() {
+        let dir =
+            std::env::temp_dir().join(format!("mvm-app-export-switch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let other = dir.join("other.mvm");
+        let mut creator = Session::new();
+        creator
+            .create_project(&other, ExistingFile::Keep)
+            .expect("切り替え先");
+        drop(creator);
+        let mut session = Session::new();
+        session.place_text("書き出す").expect("clip");
+        session
+            .start_export(&request(&dir.join("out.mp4").to_string_lossy()))
+            .expect("開始");
+        let error = session
+            .open_project(&other)
+            .expect_err("書き出し中に開きました");
+        assert!(error.message().contains("書き出し中"), "{error}");
+        let error = session
+            .create_project(&dir.join("new.mvm"), ExistingFile::Keep)
+            .expect_err("書き出し中に作りました");
+        assert!(error.message().contains("書き出し中"), "{error}");
+        assert!(!dir.join("new.mvm").exists());
+        assert!(session.path().is_none(), "画面の Project が変わりました");
+        session.cancel_export();
+        while session.is_exporting() {
+            let _ = session.poll_export();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // 書き出しが終われば切り替えられる（負の対照）。
+        session.open_project(&other).expect("書き出しの後");
+        drop(session);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

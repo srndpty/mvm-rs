@@ -15,6 +15,7 @@ use mvm_export::{
     plan_export, run_export,
 };
 use mvm_media::PcmStream;
+use mvm_platform::ReplaceApproval;
 use mvm_preview::{MathLibrary, PreviewImage, StillPreview, plan_frame};
 use mvm_project::timeline::insert_frame_hold;
 use mvm_project::{
@@ -85,6 +86,7 @@ fn request(path: &Path, quality: ExportQuality) -> ExportRequest {
         output_path: path.to_path_buf(),
         quality,
         burn_subtitles: true,
+        replace: None,
     }
 }
 
@@ -189,9 +191,14 @@ fn export_matches_the_preview_and_the_hand_computed_source_frames() {
         }
     };
 
+    // 古い file の置き換えは承認したものとする（承認が無ければ計画が拒む）。
+    let approved = ExportRequest {
+        replace: Some(ReplaceApproval::capture(&output).unwrap().unwrap()),
+        ..request(&output, ExportQuality::High)
+    };
     let plan = plan_export(
         &project,
-        &request(&output, ExportQuality::High),
+        &approved,
         std::sync::Arc::new(MathLibrary::default()),
     )
     .expect("計画");

@@ -44,6 +44,13 @@ impl BackgroundWork {
         self.transcription_result = None;
     }
 
+    /// 停止を頼んだ thread（前の Project の preview の worker など）を、終了を待たずに預かる。
+    pub fn retire_thread<T: Send + 'static>(&mut self, handle: JoinHandle<T>) {
+        self.retired.push(RetiredThread {
+            handle: Some(Box::new(handle)),
+        });
+    }
+
     /// 手放した作業のうち、終わったものの thread を join する。UI の周回ごとに呼ぶ。
     pub fn reap(&mut self) {
         self.retired = std::mem::take(&mut self.retired)

@@ -158,6 +158,9 @@ xtask/       arch 検査（cargo metadata で crate 間の依存方向と unsafe
   inspector の effect（位置・拡大率・回転・クロップ・不透明度・音量・ダッキングのアニメーションとキー・補間、
   フェード）と文字 clip の編集、preview の枠（移動と角の拡縮）、音声 clip の波形、J / K / L のシャトル、
   「再生」メニュー
+- [事実] C++ 版から意図して変えたもの: 「メディアを追加」の動画は、V1 から順に置く区間が空いている非 mute の
+  video track へ置き、どこにも置けないときだけ track を足す（C++ 版 `addVideoClip` は 2 本目から毎回新しい
+  track を足した）。リンク音声も A1 から順に空いている track へ置く
 - 照合で見つけ、まだ移していないものは [roadmap.md](roadmap.md) に書いた
 
 **P8 切り替え**

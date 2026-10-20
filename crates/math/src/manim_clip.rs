@@ -71,41 +71,144 @@ fn find_output(directory: &Path) -> Option<PathBuf> {
 
 /// 描いた動画を `directory` に公開する。名前は中身の SHA-256 で、公開した file は上書きしない
 /// （同じ中身が既にあればそれを使う）。Project の undo が古い参照へ戻っても、その動画は変わらない。
+///
+/// 動画は一定の大きさずつ読み、hash を取りながら、この呼び出しだけが持つ一時 file へ写す（全体を memory に
+/// 載せない）。写した file を flush して読み直し、hash が一致してから、既存を置き換えない hard link で公開する。
+/// 同じ中身を同時に公開した job があれば、公開先の hash を確かめてそれを使う。
 pub fn publish_video(rendered: &Path, directory: &Path) -> Result<PathBuf, MathError> {
-    let bytes = std::fs::read(rendered)
-        .map_err(|error| MathError::new(format!("生成した動画を読めません: {error}")))?;
-    if bytes.is_empty() {
+    let partial = PartialVideo::create(directory)?;
+    let (name, size) = partial.copy_from(rendered)?;
+    if size == 0 {
         return Err(MathError::new("生成した動画が空です"));
     }
-    let name = hex(&Sha256::digest(&bytes));
-    let published = directory.join(format!("{name}.mp4"));
-    if published.is_file() {
-        let existing = std::fs::read(&published)
-            .map_err(|error| MathError::new(format!("公開済みの動画を読めません: {error}")))?;
-        if existing == bytes {
-            return Ok(published);
-        }
-        return Err(MathError::new(format!(
-            "公開済みの動画の中身が名前と一致しません: {}",
-            published.display()
-        )));
+    if file_digest(partial.path())
+        .map_err(|error| MathError::new(format!("写した動画を読み直せません: {error}")))?
+        != name
+    {
+        return Err(MathError::new(
+            "写した動画の中身が生成した動画と一致しません",
+        ));
     }
-    // 一時名へ書き切ってから、既存の file を置き換えない hard link で公開する。
-    let partial = directory.join(format!("{name}.mp4.partial-{}", std::process::id()));
-    std::fs::write(&partial, &bytes)
-        .map_err(|error| MathError::new(format!("生成した動画を書けません: {error}")))?;
-    let linked = std::fs::hard_link(&partial, &published);
-    let _ = std::fs::remove_file(&partial);
-    match linked {
+    let published = directory.join(format!("{name}.mp4"));
+    match std::fs::hard_link(partial.path(), &published) {
         Ok(()) => Ok(published),
-        // 同時に同じ中身を公開した場合は、その file を使う。
-        Err(_) if std::fs::read(&published).is_ok_and(|existing| existing == bytes) => {
-            Ok(published)
+        // 既にある（前に公開した、または同時に公開した job がある）なら、中身が名前どおりのときだけ使う。
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            match file_digest(&published) {
+                Ok(existing) if existing == name => Ok(published),
+                Ok(_) => Err(MathError::new(format!(
+                    "公開済みの動画の中身が名前と一致しません: {}",
+                    published.display()
+                ))),
+                Err(error) => Err(MathError::new(format!(
+                    "公開済みの動画を読めません ({}): {error}",
+                    published.display()
+                ))),
+            }
         }
         Err(error) => Err(MathError::new(format!(
             "生成した動画を公開できません: {error}"
         ))),
     }
+}
+
+/// 一度に読む大きさ。
+const COPY_CHUNK: usize = 1024 * 1024;
+
+static PARTIAL_SERIAL: AtomicU64 = AtomicU64::new(1);
+
+/// この呼び出しが排他的に作った一時 file。drop で消す（公開した hard link は残る）。
+struct PartialVideo {
+    path: PathBuf,
+    file: std::fs::File,
+}
+
+impl PartialVideo {
+    fn create(directory: &Path) -> Result<Self, MathError> {
+        let mut last = None;
+        // 前に落ちた process の残りと名前がぶつかったときだけ次を試す。
+        for _ in 0..64 {
+            let serial = PARTIAL_SERIAL.fetch_add(1, Ordering::Relaxed);
+            let path = directory.join(format!("manim.partial-{}-{serial}", std::process::id()));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => return Ok(Self { path, file }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    last = Some(error);
+                }
+                Err(error) => {
+                    return Err(MathError::new(format!(
+                        "生成した動画の一時 file を作れません: {error}"
+                    )));
+                }
+            }
+        }
+        Err(MathError::new(format!(
+            "生成した動画の一時 file の名前を決められません: {}",
+            last.map_or_else(String::new, |error| error.to_string())
+        )))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// `source` を写し、中身の SHA-256（小文字 16 進）と大きさを返す。写し終えたら媒体へ flush する。
+    fn copy_from(&self, source: &Path) -> Result<(String, u64), MathError> {
+        use std::io::{Read, Write};
+        let mut input = std::fs::File::open(source)
+            .map_err(|error| MathError::new(format!("生成した動画を読めません: {error}")))?;
+        let mut output = &self.file;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0u8; COPY_CHUNK];
+        let mut size = 0u64;
+        loop {
+            let read = input
+                .read(&mut buffer)
+                .map_err(|error| MathError::new(format!("生成した動画を読めません: {error}")))?;
+            let Some(chunk) = buffer.get(..read) else {
+                return Err(MathError::new("生成した動画を読んだ大きさが不正です"));
+            };
+            if chunk.is_empty() {
+                break;
+            }
+            hasher.update(chunk);
+            output
+                .write_all(chunk)
+                .map_err(|error| MathError::new(format!("生成した動画を書けません: {error}")))?;
+            size = size.saturating_add(read as u64);
+        }
+        self.file
+            .sync_all()
+            .map_err(|error| MathError::new(format!("生成した動画を flush できません: {error}")))?;
+        Ok((hex(&hasher.finalize()), size))
+    }
+}
+
+impl Drop for PartialVideo {
+    fn drop(&mut self) {
+        // 自分が作った一時 file だけを消す。公開した hard link は別の名前なので残る。
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// file の中身の SHA-256（小文字 16 進）。一定の大きさずつ読む。
+fn file_digest(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut input = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; COPY_CHUNK];
+    loop {
+        let read = input.read(&mut buffer)?;
+        match buffer.get(..read) {
+            Some([]) | None => break,
+            Some(chunk) => hasher.update(chunk),
+        }
+    }
+    Ok(hex(&hasher.finalize()))
 }
 
 /// `request` の Scene を描く。script は描く前に同じ directory の一時 file へ写し、その写しの hash を
@@ -283,6 +386,68 @@ mod tests {
         std::fs::write(&published, b"tampered").unwrap();
         assert!(publish_video(&first, &directory).is_err());
         assert_eq!(std::fs::read(&published).unwrap(), b"tampered");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn concurrent_jobs_publishing_the_same_video_both_get_the_intact_file() {
+        let directory = std::env::temp_dir().join(format!("mvm-manim-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        // 一時 file の書き込み途中を公開すれば中身が欠けるよう、copy の 1 回分より大きくする。
+        let content: Vec<u8> = (0..(3 * COPY_CHUNK + 17))
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let expected = hex(&Sha256::digest(&content));
+        for round in 0..8 {
+            let rendered = directory.join(format!("rendered-{round}.mp4"));
+            std::fs::write(&rendered, &content).unwrap();
+            let published = directory.join(format!("{expected}.mp4"));
+            let _ = std::fs::remove_file(&published);
+            let barrier = std::sync::Barrier::new(2);
+            let results: Vec<_> = std::thread::scope(|scope| {
+                let jobs: Vec<_> = (0..2)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            publish_video(&rendered, &directory)
+                        })
+                    })
+                    .collect();
+                jobs.into_iter().map(|job| job.join().unwrap()).collect()
+            });
+            for result in results {
+                assert_eq!(result.unwrap(), published, "round {round}");
+            }
+            assert_eq!(std::fs::read(&published).unwrap(), content, "round {round}");
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("partial"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "一時 file が残りました: {leftovers:?}"
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn an_empty_render_is_not_published() {
+        let directory =
+            std::env::temp_dir().join(format!("mvm-manim-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let rendered = directory.join("empty.mp4");
+        std::fs::write(&rendered, b"").unwrap();
+        let error = publish_video(&rendered, &directory).unwrap_err();
+        assert!(error.message().contains("空"), "{error}");
+        let names: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["empty.mp4"]);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

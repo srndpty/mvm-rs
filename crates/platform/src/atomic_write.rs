@@ -372,6 +372,25 @@ mod tests {
         fs::remove_dir_all(&dir).expect("片付け");
     }
 
+    #[test]
+    fn an_approved_file_with_another_hard_link_is_replaced() {
+        let dir = scratch_dir();
+        let path = dir.join("lecture.mvm");
+        let other = dir.join("backup.mvm");
+        fs::write(&path, b"approved").expect("既存");
+        fs::hard_link(&path, &other).expect("hard link");
+        let approval = ReplaceApproval::capture(&path)
+            .expect("確かめる")
+            .expect("ある");
+        let placed =
+            replace_with(&approval, b"replaced").expect("hard link のある file の置き換え");
+        assert_eq!(fs::read(&path).expect("読み戻し"), b"replaced");
+        // 置き換えるのは対象の名前だけで、他の名前は前の中身を指したまま残る。
+        assert_eq!(fs::read(&other).expect("他の名前"), b"approved");
+        assert!(placed.is_current());
+        fs::remove_dir_all(&dir).expect("片付け");
+    }
+
     fn replace_with(
         approval: &ReplaceApproval,
         bytes: &[u8],

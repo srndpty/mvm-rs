@@ -9,8 +9,9 @@
 //! - 単一操作の置き換えは、置き換えられる file を開いている全ての handle が削除の共有を許すときだけ成功する
 //!   [事実: 2026-10-20 に NTFS で確かめた。削除の共有を拒む handle があると共有違反になる]。そのため照合中の
 //!   handle も削除（名前の変更）を共有する。照合から置き換えまでの数 µs の間に、他の process が承認した file を
-//!   別名へ移し、同じ名前で新しい file を作ると、その file を置き換えてしまう。置き換えた後に、照合した file の
-//!   名前が残っているか（link 数）で確かめ、残っていれば失敗として報告する。
+//!   別名へ移し、同じ名前で新しい file を作ると、その file を置き換えてしまう。置き換える前と後で照合した file の
+//!   名前（hard link）の数を比べ、1 つ減っていなければ失敗として報告する。対象が他にも hard link を持つ file でも、
+//!   置き換えで失うのは対象の名前 1 つなので成功と判定する。
 //! - POSIX semantics の rename に対応しない file system（FAT 系など）では、置き換えずに失敗する。
 
 use std::os::windows::ffi::OsStrExt;
@@ -121,6 +122,12 @@ pub(crate) fn replace_approved(
             target.display()
         )));
     }
+    let links_before = guard.link_count().map_err(|error| {
+        PlatformError::new(format!(
+            "置き換える file を確かめられません ({}): {error}",
+            target.display()
+        ))
+    })?;
     let incoming = Handle::open_with_retry(
         temporary,
         DELETE.0 | FILE_READ_ATTRIBUTES.0,
@@ -150,9 +157,8 @@ pub(crate) fn replace_approved(
             target.display()
         ))
     })?;
-    // 照合した file が置き換わっていれば、名前を失って link 数が 0 になっている。
     match guard.link_count() {
-        Ok(0) => Ok(()),
+        Ok(links_after) if lost_one_name(links_before, links_after) => Ok(()),
         Ok(_) => Err(PlatformError::new(format!(
             "置き換える直前に、承認した file が別の名前へ移されました。{} にあった別の file を置き換えた可能性があります",
             target.display()
@@ -162,6 +168,12 @@ pub(crate) fn replace_approved(
             target.display()
         ))),
     }
+}
+
+/// 照合した file が置き換えで対象の名前を失ったか。他の hard link は残るので、0 ではなく 1 つ減ったことを見る。
+/// 別名へ移された file は名前の数が変わらない。
+fn lost_one_name(before: u32, after: u32) -> bool {
+    before.checked_sub(1) == Some(after)
 }
 
 enum OpenError {
@@ -279,4 +291,21 @@ fn busy(error: &windows::core::Error) -> bool {
     code == HRESULT::from_win32(ERROR_ACCESS_DENIED.0)
         || code == HRESULT::from_win32(ERROR_SHARING_VIOLATION.0)
         || code == HRESULT::from_win32(ERROR_LOCK_VIOLATION.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lost_one_name;
+
+    #[test]
+    fn only_losing_exactly_one_name_counts_as_replaced() {
+        assert!(lost_one_name(1, 0));
+        assert!(lost_one_name(3, 2));
+        // 別名へ移された file（数が変わらない）や、名前が増えた file は置き換わっていない。
+        assert!(!lost_one_name(1, 1));
+        assert!(!lost_one_name(2, 2));
+        assert!(!lost_one_name(2, 3));
+        assert!(!lost_one_name(3, 1));
+        assert!(!lost_one_name(0, 0));
+    }
 }

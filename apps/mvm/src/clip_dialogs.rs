@@ -41,16 +41,14 @@ pub struct SpeedDialog {
 }
 
 impl SpeedDialog {
-    /// 選んだ clip の今の値で開く。速度を持てない clip（文字・静止画・フレーム保持）は断る。
+    /// 選んだ clip の今の値で開く。速度を持てない clip（文字・静止画・フレーム保持）は尺だけを変える
+    /// （C++ 版と同じ）。
     pub fn open(&mut self, session: &mut Session, clip_id: &str) {
         let Some(clip) = session.project().clip(clip_id) else {
             session.set_alert("速度を変える clip がありません");
             return;
         };
-        if clip.has_synthetic_source_domain() {
-            session.set_alert("この clip は速度を変えられません");
-            return;
-        }
+        let still = clip.has_synthetic_source_domain();
         let duration = match timeline_clip_duration(session.project(), clip) {
             Ok(duration) => duration,
             Err(error) => {
@@ -65,10 +63,10 @@ impl SpeedDialog {
             speed_centi: speed_centi(clip.speed),
             duration_frames: duration,
             duration_text: timecode(duration, fps),
-            input: None,
-            preserve_pitch: clip.preserve_pitch,
+            input: still.then_some(SpeedDurationInput::Duration),
+            preserve_pitch: clip.preserve_pitch && !still,
             ripple: false,
-            still: false,
+            still,
             confirm_overwrite: false,
             error: String::new(),
         };
@@ -78,15 +76,25 @@ impl SpeedDialog {
         self.clip_id.is_some()
     }
 
-    fn edit(&self, overwrite: bool) -> Option<ClipSpeedDurationEdit> {
-        Some(ClipSpeedDurationEdit {
-            input: self.input.unwrap_or(SpeedDurationInput::Speed),
-            speed: match (self.input, self.original_speed) {
-                (None, Some(original)) => original,
-                _ => Rational::new(self.speed_centi, 10_000).reduced()?,
-            },
-            duration_frames: self.duration_frames,
-            preserve_pitch: self.preserve_pitch,
+    /// 欄の値から編集を作る。尺を入力した側は欄の文字をその場で読み直し、読めなければ拒否する（最後に
+    /// 読めた古い尺では適用しない）。
+    fn edit(&self, fps: Rational, overwrite: bool) -> Result<ClipSpeedDurationEdit, String> {
+        let input = self.input.unwrap_or(SpeedDurationInput::Speed);
+        let duration_frames = match input {
+            SpeedDurationInput::Duration => parse_duration(&self.duration_text, fps)?,
+            SpeedDurationInput::Speed => self.duration_frames,
+        };
+        let speed = match (self.input, self.original_speed) {
+            (None, Some(original)) => original,
+            _ => Rational::new(self.speed_centi, 10_000)
+                .reduced()
+                .ok_or_else(|| "速度を表せません".to_owned())?,
+        };
+        Ok(ClipSpeedDurationEdit {
+            input,
+            speed,
+            duration_frames,
+            preserve_pitch: self.preserve_pitch && !self.still,
             ripple: self.ripple,
             overwrite,
         })
@@ -94,8 +102,15 @@ impl SpeedDialog {
 
     /// 入力した側から、もう一方の値を project の計算で埋める。
     fn sync(&mut self, session: &Session) {
-        let (Some(id), Some(edit)) = (self.clip_id.as_deref(), self.edit(false)) else {
+        let Some(id) = self.clip_id.as_deref() else {
             return;
+        };
+        let edit = match self.edit(session.project().timeline_fps, false) {
+            Ok(edit) => edit,
+            Err(error) => {
+                self.error = error;
+                return;
+            }
         };
         match session.preview_speed_duration(id, &edit) {
             Ok(preview) => {
@@ -126,6 +141,16 @@ fn speed_centi(speed: Rational) -> SpeedCenti {
     let scaled = i128::from(speed.num) * 10_000;
     let den = i128::from(speed.den);
     i64::try_from((scaled + den / 2) / den).unwrap_or(10_000)
+}
+
+const DURATION_FORMAT: &str = "デュレーションを 00:00:05:00 の形で入力してください";
+
+/// デュレーションの欄を frame 数にする。1 frame 未満と読めない文字は拒否する。
+fn parse_duration(text: &str, fps: Rational) -> Result<i64, String> {
+    match parse_timecode(text.trim(), fps.num, fps.den) {
+        Some(frames) if frames > 0 => Ok(frames),
+        _ => Err(DURATION_FORMAT.to_owned()),
+    }
 }
 
 fn timecode(frames: i64, fps: Rational) -> String {
@@ -175,15 +200,13 @@ pub fn show_speed(ui: &mut egui::Ui, session: &mut Session, dialog: &mut SpeedDi
             );
             if duration.changed() {
                 dialog.input = Some(SpeedDurationInput::Duration);
-                match parse_timecode(dialog.duration_text.trim(), fps.num, fps.den) {
-                    Some(frames) if frames > 0 => {
+                // 入力途中の読めない文字は理由を出すだけにする。適用は欄を読み直して拒否する。
+                match parse_duration(&dialog.duration_text, fps) {
+                    Ok(frames) => {
                         dialog.duration_frames = frames;
                         dialog.sync(session);
                     }
-                    _ => {
-                        dialog.error =
-                            "デュレーションを 00:00:05:00 の形で入力してください".to_owned()
-                    }
+                    Err(error) => dialog.error = error,
                 }
             }
             let pitch_enabled = !dialog.still && dialog.speed_centi != 10_000;
@@ -249,9 +272,12 @@ fn confirm_overwrite(ui: &mut egui::Ui, session: &mut Session, dialog: &mut Spee
 }
 
 fn apply_speed(session: &mut Session, dialog: &mut SpeedDialog, id: &str, overwrite: bool) {
-    let Some(edit) = dialog.edit(overwrite) else {
-        dialog.error = "速度を表せません".to_owned();
-        return;
+    let edit = match dialog.edit(session.project().timeline_fps, overwrite) {
+        Ok(edit) => edit,
+        Err(error) => {
+            dialog.error = error;
+            return;
+        }
     };
     // リップルしない変更が後続 clip と重なるなら、適用の前に上書きを確かめる。
     if !overwrite
@@ -556,7 +582,7 @@ mod tests {
         assert_eq!(dialog.speed_centi, 6667);
         // ピッチだけを変えても、速度は丸めた 66.67% ではなく元の 2/3 のまま。
         dialog.preserve_pitch = true;
-        let edit = dialog.edit(false).expect("編集");
+        let edit = dialog.edit(Rational::new(60, 1), false).expect("編集");
         assert_eq!(edit.speed, Rational::new(2, 3));
     }
 
@@ -567,8 +593,71 @@ mod tests {
         dialog.open(&mut session, "v");
         dialog.speed_centi = 5025;
         dialog.input = Some(SpeedDurationInput::Speed);
-        let edit = dialog.edit(false).expect("編集");
+        let edit = dialog.edit(Rational::new(60, 1), false).expect("編集");
         assert_eq!(edit.speed, Rational::new(201, 400));
+    }
+
+    #[test]
+    fn a_bad_duration_text_is_refused_instead_of_the_last_good_one() {
+        let mut session = session();
+        let mut dialog = SpeedDialog::default();
+        dialog.open(&mut session, "v");
+        let fps = Rational::new(60, 1);
+        // 尺を 1 秒にしたあと、欄を読めない文字に書き換えた（最後に読めた尺は 60 frame）。
+        dialog.input = Some(SpeedDurationInput::Duration);
+        dialog.duration_text = "00:00:01:00".to_owned();
+        assert_eq!(dialog.edit(fps, false).expect("編集").duration_frames, 60);
+        dialog.duration_frames = 60;
+        for text in ["00:00:0", "", "00:00:00:00", "abc"] {
+            dialog.duration_text = text.to_owned();
+            assert_eq!(
+                dialog.edit(fps, false),
+                Err(DURATION_FORMAT.to_owned()),
+                "{text:?} を受け付けました"
+            );
+        }
+        // 適用しても clip は変わらず、理由を出してダイアログは開いたまま。
+        let before = session.project().clone();
+        apply_speed(&mut session, &mut dialog, "v", false);
+        assert_eq!(session.project(), &before);
+        assert_eq!(dialog.error, DURATION_FORMAT);
+        assert!(dialog.is_open());
+    }
+
+    #[test]
+    fn a_still_clip_opens_to_change_only_its_duration() {
+        let mut session = Session::from_project(Project {
+            timeline_clips: vec![TimelineClip {
+                kind: TimelineClipKind::Image,
+                media_path: "still.png".into(),
+                name: "静止画".to_owned(),
+                id: "still".to_owned(),
+                source_fps: Rational::new(60, 1),
+                source_out_frame: 120,
+                track: TrackRef::video(0),
+                ..TimelineClip::default()
+            }],
+            ..Project::default()
+        });
+        let mut dialog = SpeedDialog::default();
+        dialog.open(&mut session, "still");
+        assert!(dialog.is_open(), "{:?}", session.alert());
+        assert!(dialog.still);
+        // 開いた直後から尺の入力として扱い、ピッチは持たせない。
+        dialog.preserve_pitch = true;
+        dialog.duration_text = "00:00:03:00".to_owned();
+        let edit = dialog.edit(Rational::new(60, 1), false).expect("編集");
+        assert_eq!(edit.input, SpeedDurationInput::Duration);
+        assert_eq!(edit.duration_frames, 180);
+        assert!(!edit.preserve_pitch);
+        apply_speed(&mut session, &mut dialog, "still", false);
+        assert!(!dialog.is_open(), "{}", dialog.error);
+        let clip = session.project().clip("still").expect("clip");
+        assert_eq!(
+            timeline_clip_duration(session.project(), clip).expect("尺"),
+            180
+        );
+        assert_eq!(clip.speed, Rational::new(1, 1));
     }
 
     #[test]

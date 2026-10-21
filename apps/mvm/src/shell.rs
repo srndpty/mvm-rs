@@ -2260,7 +2260,9 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_r_opens_the_speed_dialog_only_for_a_clip_with_a_source() {
+    fn ctrl_r_opens_the_speed_dialog_and_a_text_clip_changes_only_its_duration() {
+        use egui_kittest::kittest::NodeT as _;
+
         let mut harness = harness_with(vec![video_clip("映像", 0), text_clip("文字", 200)]);
         harness
             .state_mut()
@@ -2280,8 +2282,17 @@ mod tests {
             .select_only("id-文字".to_owned());
         harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::R);
         harness.run();
+        // 文字 clip も開く。速度とピッチは選べず、尺だけを変える（C++ 版と同じ）。
+        harness.get_by_label("速度・デュレーション");
+        assert!(
+            harness
+                .get_by_label("オーディオのピッチを維持")
+                .accesskit_node()
+                .is_disabled()
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run();
         assert!(harness.query_by_label("速度・デュレーション").is_none());
-        assert!(harness.state().notice.contains("速度を変えられません"));
     }
 
     #[test]

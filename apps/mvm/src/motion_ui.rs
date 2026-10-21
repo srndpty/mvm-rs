@@ -63,9 +63,12 @@ struct EffectDraft {
     original_value: f64,
 }
 
-/// キーの列・グラフでドラッグしているキー。離したときに 1 回だけ確定する。
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// キーの列・グラフでドラッグしているキー。離したときに 1 回だけ確定する。始めたときの clip と
+/// [`Session::edit_revision`] を覚え、途中で Project が変われば（undo・別の編集）preview も確定もしない。
+#[derive(Clone, Debug, PartialEq)]
 struct KeyDrag {
+    clip_id: String,
+    revision: u64,
     kind: ClipKeyKind,
     original_frame: i64,
     frame: i64,
@@ -214,6 +217,15 @@ impl MotionState {
 }
 
 impl MotionState {
+    /// `kind` でドラッグしているキー。始めた後に Project や clip が変わったドラッグは返さない。
+    fn live_drag(&self, kind: ClipKeyKind) -> Option<&KeyDrag> {
+        self.key_drag.as_ref().filter(|drag| {
+            drag.kind == kind
+                && drag.revision == self.revision
+                && self.clip_id.as_deref() == Some(drag.clip_id.as_str())
+        })
+    }
+
     pub fn wants_key_shortcuts(&self) -> bool {
         self.key_focus && self.selection.kind.is_some()
     }
@@ -744,6 +756,8 @@ fn key_lane(
             let toggle = ui.input(|input| input.modifiers.command);
             state.selection.press(kind, key.frame, toggle);
             state.key_drag = Some(KeyDrag {
+                clip_id: clip.id.clone(),
+                revision: session.edit_revision(),
                 kind,
                 original_frame: key.frame,
                 frame: key.frame,
@@ -782,7 +796,7 @@ fn key_lane(
         if let Some(drag) = state.key_drag.as_mut().filter(|drag| drag.kind == kind) {
             drag.frame = frame_at(pointer.x);
             drag.moved |= drag.frame != drag.original_frame;
-            let drag = *drag;
+            let drag = drag.clone();
             preview_key_drag(session, clip, &drag);
         } else {
             state.scrubbing = true;
@@ -810,7 +824,7 @@ fn key_lane(
         Stroke::new(1.0, theme::KEY_ACCENT),
     );
     for key in keys {
-        let frame = moved_frame(state.key_drag, kind, key.frame);
+        let frame = moved_frame(state.live_drag(kind), key.frame);
         let color = if selection.contains(kind, key.frame) {
             theme::KEY_ACCENT
         } else {
@@ -827,13 +841,9 @@ fn key_lane(
 }
 
 /// ドラッグで動かしている key は、動かした先の frame に描く。
-fn moved_frame(drag: Option<KeyDrag>, kind: ClipKeyKind, frame: i64) -> i64 {
+fn moved_frame(drag: Option<&KeyDrag>, frame: i64) -> i64 {
     match drag {
-        Some(drag)
-            if drag.kind == kind && drag.original_frame == frame && drag.handle.is_none() =>
-        {
-            drag.frame
-        }
+        Some(drag) if drag.original_frame == frame && drag.handle.is_none() => drag.frame,
         _ => frame,
     }
 }
@@ -859,6 +869,11 @@ fn preview_key_drag(session: &mut Session, clip: &TimelineClip, drag: &KeyDrag) 
     if !drag.moved {
         return;
     }
+    // 始めた後に Project が変わった（undo など）。古い位置の移動を新しい Project の上に描かない。
+    if !drag_is_current(session, clip, drag) {
+        session.cancel_preview();
+        return;
+    }
     let result = match drag.handle {
         Some(_) => {
             let Some((control1, control2)) = spline_controls(clip, drag) else {
@@ -877,38 +892,57 @@ fn preview_key_drag(session: &mut Session, clip: &TimelineClip, drag: &KeyDrag) 
     report!(session, result);
 }
 
+fn drag_is_current(session: &Session, clip: &TimelineClip, drag: &KeyDrag) -> bool {
+    drag.clip_id == clip.id && drag.revision == session.edit_revision()
+}
+
+/// 離したときに確定する。確定は始めたときの revision を Session が確かめ、変わっていれば何も書かずに
+/// 失敗する。選択は確定できたときだけ動かした先へ移す。
 fn finish_key_drag(
     session: &mut Session,
     state: &mut MotionState,
     clip: &TimelineClip,
     drag: KeyDrag,
 ) {
-    if !drag.moved {
+    if !drag.moved || drag.clip_id != clip.id {
         session.cancel_preview();
         return;
     }
-    if drag.handle.is_some() {
-        let Some((control1, control2)) = spline_controls(clip, &drag) else {
-            session.cancel_preview();
-            return;
-        };
-        report!(
-            session,
-            session.set_key_spline(&clip.id, drag.kind, drag.original_frame, control1, control2)
-        );
-        return;
-    }
-    report!(
-        session,
-        session.edit_key(
+    let result = match drag.handle {
+        Some(_) => {
+            let Some((control1, control2)) = spline_controls(clip, &drag) else {
+                session.cancel_preview();
+                return;
+            };
+            session.commit_key_spline(
+                &clip.id,
+                drag.kind,
+                drag.original_frame,
+                control1,
+                control2,
+                drag.revision,
+            )
+        }
+        None => session.commit_key_move(
             &clip.id,
             drag.kind,
-            Some(drag.original_frame),
+            drag.original_frame,
             drag.frame,
             drag.value,
-        )
-    );
-    state.selection.set(drag.kind, vec![drag.frame]);
+            drag.revision,
+        ),
+    };
+    match result {
+        Ok(()) => {
+            if drag.handle.is_none() {
+                state.selection.set(drag.kind, vec![drag.frame]);
+            }
+        }
+        Err(error) => {
+            session.cancel_preview();
+            session.set_alert(error.message());
+        }
+    }
 }
 
 /// キーの右クリック。選んだキーのコピー・カット・ペースト・削除と、補間（C++ 版と同じ並び）。
@@ -1063,7 +1097,7 @@ fn key_graph(
     let keys = clip.effects.keys(kind);
     let base = clip.effects.base(kind);
     let channel = kind.channel();
-    let (low, high) = match state.key_drag.filter(|drag| drag.kind == kind) {
+    let (low, high) = match state.live_drag(kind) {
         Some(drag) => (drag.low, drag.high),
         None => graph_range(keys),
     };
@@ -1088,6 +1122,8 @@ fn key_graph(
         });
         if let (Some(handle), Some((_, first))) = (handle, selected) {
             state.key_drag = Some(KeyDrag {
+                clip_id: clip.id.clone(),
+                revision: session.edit_revision(),
                 kind,
                 original_frame: first,
                 frame: first,
@@ -1101,6 +1137,8 @@ fn key_graph(
             let toggle = ui.input(|input| input.modifiers.command);
             state.selection.press(kind, key.frame, toggle);
             state.key_drag = Some(KeyDrag {
+                clip_id: clip.id.clone(),
+                revision: session.edit_revision(),
                 kind,
                 original_frame: key.frame,
                 frame: key.frame,
@@ -1168,7 +1206,7 @@ fn key_graph(
                 drag.value = value_at(pointer.y).clamp(channel.minimum, channel.maximum);
             }
         }
-        let drag = *drag;
+        let drag = drag.clone();
         preview_key_drag(session, clip, &drag);
     }
     if (response.drag_stopped() || ui.input(|input| input.pointer.primary_released()))
@@ -1217,9 +1255,9 @@ fn key_graph(
             egui::StrokeKind::Inside,
         );
     }
-    let drag = state.key_drag.filter(|drag| drag.kind == kind);
+    let drag = state.live_drag(kind).cloned();
     for (index, (point, _)) in handles.iter().enumerate() {
-        let point = match drag.filter(|drag| drag.handle == Some(index)) {
+        let point = match drag.as_ref().filter(|drag| drag.handle == Some(index)) {
             Some(drag) => handle_point(keys, drag.original_frame, index, drag.value, &|f, v| {
                 Pos2::new(rect.min.x + f as f32 * ppf, y_of(v))
             })
@@ -1248,11 +1286,13 @@ fn key_graph(
         );
     }
     for key in keys {
-        let (frame, value) =
-            match drag.filter(|drag| drag.handle.is_none() && drag.original_frame == key.frame) {
-                Some(drag) => (drag.frame, drag.value),
-                None => (key.frame, key.value),
-            };
+        let (frame, value) = match drag
+            .as_ref()
+            .filter(|drag| drag.handle.is_none() && drag.original_frame == key.frame)
+        {
+            Some(drag) => (drag.frame, drag.value),
+            None => (key.frame, key.value),
+        };
         let color = if state.selection.contains(kind, key.frame) {
             theme::KEY_ACCENT
         } else {
@@ -1400,6 +1440,86 @@ fn fade_rows(ui: &mut egui::Ui, session: &mut Session, clip: &TimelineClip) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 位置 X に 0 と 100 frame のキーを持つ clip。
+    fn keyed_session() -> Session {
+        let mut clip = TimelineClip {
+            kind: TimelineClipKind::Video,
+            media_path: "v.mp4".into(),
+            name: "v".to_owned(),
+            id: "v".to_owned(),
+            source_fps: mvm_core::Rational::new(60, 1),
+            source_frame_count: 120,
+            source_out_frame: 120,
+            track: mvm_project::TrackRef::video(0),
+            ..TimelineClip::default()
+        };
+        clip.effects.position_x_keys =
+            vec![ClipKeyframe::new(0, 0.0), ClipKeyframe::new(100, 50.0)];
+        Session::from_project(mvm_project::Project {
+            timeline_clips: vec![clip],
+            ..mvm_project::Project::default()
+        })
+    }
+
+    fn drag_of(session: &Session, frame: i64) -> KeyDrag {
+        KeyDrag {
+            clip_id: "v".to_owned(),
+            revision: session.edit_revision(),
+            kind: ClipKeyKind::PositionX,
+            original_frame: 100,
+            frame,
+            value: 40.0,
+            low: 0.0,
+            high: 0.0,
+            handle: None,
+            moved: true,
+        }
+    }
+
+    #[test]
+    fn a_finished_key_drag_moves_the_key_and_the_selection() {
+        let mut session = keyed_session();
+        let mut state = MotionState::default();
+        state.selection.set(ClipKeyKind::PositionX, vec![100]);
+        let drag = drag_of(&session, 90);
+        let clip = session.project().timeline_clips[0].clone();
+        finish_key_drag(&mut session, &mut state, &clip, drag);
+        let keys = &session.project().timeline_clips[0].effects.position_x_keys;
+        let frames: Vec<_> = keys.iter().map(|key| (key.frame, key.value)).collect();
+        assert_eq!(frames, [(0, 0.0), (90, 40.0)]);
+        assert_eq!(state.selection.frames, [90]);
+    }
+
+    #[test]
+    fn a_key_drag_across_an_undo_writes_nothing_and_keeps_the_selection() {
+        let mut session = keyed_session();
+        session
+            .set_effect("v", ClipKeyKind::PositionY, 5.0)
+            .expect("編集");
+        let mut state = MotionState::default();
+        state.selection.set(ClipKeyKind::PositionX, vec![100]);
+        let drag = drag_of(&session, 90);
+        // ドラッグの途中で undo した。
+        session.undo().expect("戻す");
+        let before = session.project().clone();
+        let clip = before.timeline_clips[0].clone();
+        preview_key_drag(&mut session, &clip, &drag);
+        finish_key_drag(&mut session, &mut state, &clip, drag);
+        assert_eq!(session.project(), &before);
+        assert_eq!(
+            state.selection.frames,
+            [100],
+            "失敗した移動へ選択が動きました"
+        );
+        assert!(
+            session
+                .alert()
+                .is_some_and(|alert| alert.contains("取り消しました")),
+            "{:?}",
+            session.alert()
+        );
+    }
 
     #[test]
     fn the_graph_leaves_room_around_the_key_values() {

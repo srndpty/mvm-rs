@@ -493,6 +493,35 @@ impl Session {
         self.set_effects_at(clip_id, frame, values)
     }
 
+    /// ドラッグで動かしたキーを確定する。ドラッグの途中で Project が変わっていれば（undo・別の編集）、
+    /// 古い位置の移動を新しい Project へ書かずに失敗する。
+    pub fn commit_key_move(
+        &mut self,
+        clip_id: &str,
+        kind: ClipKeyKind,
+        original_frame: i64,
+        frame: i64,
+        value: f64,
+        revision: u64,
+    ) -> Result<(), AppError> {
+        self.expect_revision(revision)?;
+        self.edit_key(clip_id, kind, Some(original_frame), frame, value)
+    }
+
+    /// グラフのハンドルのドラッグを確定する。途中で Project が変わっていれば失敗する。
+    pub fn commit_key_spline(
+        &mut self,
+        clip_id: &str,
+        kind: ClipKeyKind,
+        local_frame: i64,
+        control1: f64,
+        control2: f64,
+        revision: u64,
+    ) -> Result<(), AppError> {
+        self.expect_revision(revision)?;
+        self.set_key_spline(clip_id, kind, local_frame, control1, control2)
+    }
+
     /// ドラッグ中の effect の値で preview だけを描く（確定は [`Self::commit_effects`]）。
     pub fn preview_effects(
         &mut self,
@@ -1188,6 +1217,41 @@ mod tests {
         assert!(
             session
                 .commit_effects("v", 0, revision, &[(ClipKeyKind::PositionX, 10.0)])
+                .is_err()
+        );
+        assert_eq!(session.project(), &before);
+    }
+
+    #[test]
+    fn a_key_drag_lands_only_on_the_project_where_it_started() {
+        let mut session = animated();
+        let revision = session.edit_revision();
+        session
+            .commit_key_move("v", ClipKeyKind::PositionX, 100, 90, 40.0, revision)
+            .expect("確定");
+        let keys = &session.project().timeline_clips[0].effects.position_x_keys;
+        let frames: Vec<_> = keys.iter().map(|key| (key.frame, key.value)).collect();
+        assert_eq!(frames, [(0, 0.0), (90, 40.0)]);
+    }
+
+    #[test]
+    fn a_key_drag_started_before_an_undo_is_rejected() {
+        let mut session = animated();
+        session
+            .set_effect("v", ClipKeyKind::PositionY, 5.0)
+            .expect("編集");
+        let revision = session.edit_revision();
+        // ドラッグの途中で undo した。
+        session.undo().expect("戻す");
+        let before = session.project().clone();
+        let error = session
+            .commit_key_move("v", ClipKeyKind::PositionX, 100, 90, 40.0, revision)
+            .expect_err("古いドラッグを確定しました");
+        assert!(error.message().contains("取り消しました"), "{error}");
+        assert_eq!(session.project(), &before);
+        assert!(
+            session
+                .commit_key_spline("v", ClipKeyKind::PositionX, 0, 0.2, 0.8, revision)
                 .is_err()
         );
         assert_eq!(session.project(), &before);

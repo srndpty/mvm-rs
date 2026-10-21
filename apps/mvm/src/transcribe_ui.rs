@@ -7,7 +7,8 @@ use std::path::PathBuf;
 
 use eframe::egui::{self, Color32, Vec2};
 use mvm_app::{
-    MAXIMUM_PROMPT_CHARS, Preferences, Session, TranscriptionRequest, TranscriptionSource,
+    CandidateEdit, MAXIMUM_PROMPT_CHARS, Preferences, Session, TranscriptionRequest,
+    TranscriptionSource,
 };
 use mvm_project::{MediaKind, TimelineClipKind};
 
@@ -136,9 +137,18 @@ pub fn show(ui: &mut egui::Ui, session: &mut Session, dialog: &mut TranscribeDia
     );
     dialog.replace = replace;
     if apply {
-        match session.apply_transcription(dialog.replace) {
-            Ok(()) => dialog.open = false,
-            Err(error) => dialog.error = error.message().to_owned(),
+        // 行ごとの「更新」を押していなくても、画面に見えている値を適用する。失敗しても欄はそのまま残す。
+        let applied = candidate_edits(&dialog.drafts).and_then(|edits| {
+            session
+                .apply_transcription(&edits, dialog.replace)
+                .map_err(|error| error.message().to_owned())
+        });
+        match applied {
+            Ok(()) => {
+                dialog.error.clear();
+                dialog.open = false;
+            }
+            Err(error) => dialog.error = error,
         }
     }
     if close_requested || close {
@@ -477,7 +487,73 @@ fn candidates(ui: &mut egui::Ui, session: &mut Session, dialog: &mut TranscribeD
         }
     }
     if let Some(index) = remove {
+        // 他の行の未確定の修正を残すため、読み直さずに同じ行だけを取り除く。
         session.remove_transcription_candidate(index);
-        dialog.drafts_loaded = false;
+        if index < dialog.drafts.len() {
+            dialog.drafts.remove(index);
+        }
+    }
+}
+
+/// 画面の欄を候補の値にする。数字でない欄があれば、その行を示して拒否する。
+fn candidate_edits(drafts: &[CandidateDraft]) -> Result<Vec<CandidateEdit>, String> {
+    drafts
+        .iter()
+        .enumerate()
+        .map(
+            |(index, draft)| match (draft.start.parse::<i64>(), draft.end.parse::<i64>()) {
+                (Ok(start), Ok(end)) => Ok(CandidateEdit {
+                    start,
+                    end,
+                    content: draft.content.clone(),
+                }),
+                _ => Err(format!(
+                    "{} 行目: 開始・終了フレームを数字で入力してください",
+                    index + 1
+                )),
+            },
+        )
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn draft(start: &str, end: &str, content: &str) -> CandidateDraft {
+        CandidateDraft {
+            start: start.to_owned(),
+            end: end.to_owned(),
+            content: content.to_owned(),
+        }
+    }
+
+    #[test]
+    fn drafts_become_the_values_on_screen() {
+        let edits = candidate_edits(&[draft("5", "35", "直した"), draft("40", "70", "二行目")]);
+        assert_eq!(
+            edits,
+            Ok(vec![
+                CandidateEdit {
+                    start: 5,
+                    end: 35,
+                    content: "直した".to_owned(),
+                },
+                CandidateEdit {
+                    start: 40,
+                    end: 70,
+                    content: "二行目".to_owned(),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn an_empty_frame_field_is_refused_with_its_row() {
+        let edits = candidate_edits(&[draft("0", "30", "a"), draft("", "70", "b")]);
+        assert_eq!(
+            edits,
+            Err("2 行目: 開始・終了フレームを数字で入力してください".to_owned())
+        );
     }
 }

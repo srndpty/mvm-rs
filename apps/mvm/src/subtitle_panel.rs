@@ -1,6 +1,8 @@
 //! 左パネルの「字幕」。一覧・編集欄・共通書式・SRT の読み書き・文字起こしの入口。
 //!
 //! 一覧は表示する行だけを作る。編集欄の値は「更新」で 1 回だけ commit し、Esc で確定済みの値へ戻す。
+//! 編集欄の下書きは、編集している字幕そのもの（区間・本文）が Project で変わったときだけ読み直す。共通書式の
+//! 変更のように他の所だけが変わったときは、未確定の本文を残す。
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use mvm_app::Session;
@@ -19,9 +21,12 @@ const DEFAULT_SECONDS: i64 = 2;
 pub struct SubtitlePanel {
     /// 編集欄が指す字幕。None なら新規の入力。
     editing: Option<String>,
+    /// 編集欄を最後に確かめたときの [`Session::edit_revision`]。
     revision: u64,
-    start: i64,
-    end: i64,
+    /// 編集欄へ読んだときの字幕の区間と本文（新規の入力なら None）。Project 側のこれが変わったら読み直す。
+    loaded: Option<(i64, i64, String)>,
+    /// 編集欄を読み込み済みか。false なら次の描画で読む（開いた直後・一覧で選んだ・追加した）。
+    current: bool,
     content: String,
     /// 開始・終了の欄の文字。数字だけを受け付ける。
     start_text: String,
@@ -105,30 +110,46 @@ pub fn show(
     editor(ui, session, panel);
 }
 
-/// 選択が変わったか Project が変わったら、編集欄を選択中の字幕で読み直す。
+/// 選択が変わったか、編集している字幕が Project で変わったら（undo・更新・削除）、編集欄を読み直す。
 fn sync_editor(session: &Session, panel: &mut SubtitlePanel) {
     let selected = session.subtitle_selection().first().cloned();
-    if selected == panel.editing && panel.revision == session.edit_revision() {
-        return;
+    let revision = session.edit_revision();
+    if panel.current && selected == panel.editing {
+        if panel.revision == revision {
+            return;
+        }
+        // Project は変わったが、編集している字幕は読んだときのまま（共通書式・他の字幕の編集など）。
+        if committed(session, panel.editing.as_deref()) == panel.loaded {
+            panel.revision = revision;
+            return;
+        }
     }
-    panel.revision = session.edit_revision();
+    panel.current = true;
+    panel.revision = revision;
     panel.editing = selected;
     load_editor(session, panel);
 }
 
+/// Project にある字幕の区間と本文。
+fn committed(session: &Session, id: Option<&str>) -> Option<(i64, i64, String)> {
+    let id = id?;
+    session
+        .project()
+        .subtitles
+        .as_ref()?
+        .cues
+        .iter()
+        .find(|cue| cue.id == id)
+        .map(|cue| (cue.start_frame, cue.end_frame, cue.content.clone()))
+}
+
 fn load_editor(session: &Session, panel: &mut SubtitlePanel) {
     panel.cursor = None;
-    let cue = panel.editing.as_ref().and_then(|id| {
-        session
-            .project()
-            .subtitles
-            .as_ref()
-            .and_then(|track| track.cues.iter().find(|cue| cue.id == *id))
-    });
-    if let Some(cue) = cue {
-        panel.start = cue.start_frame;
-        panel.end = cue.end_frame;
-        panel.content = cue.content.clone();
+    panel.loaded = committed(session, panel.editing.as_deref());
+    if let Some((start, end, content)) = panel.loaded.clone() {
+        panel.start_text = start.to_string();
+        panel.end_text = end.to_string();
+        panel.content = content;
     } else {
         let fps = session.project().timeline_fps;
         let frames = if fps.den > 0 {
@@ -137,12 +158,20 @@ fn load_editor(session: &Session, panel: &mut SubtitlePanel) {
             1
         };
         panel.editing = None;
-        panel.start = session.playhead_frame();
-        panel.end = panel.start + frames.max(1);
+        let start = session.playhead_frame();
+        panel.start_text = start.to_string();
+        panel.end_text = (start + frames.max(1)).to_string();
         panel.content.clear();
     }
-    panel.start_text = panel.start.to_string();
-    panel.end_text = panel.end.to_string();
+}
+
+/// 開始・終了の欄の値。読めない・空・終了が開始以前なら理由を返す（最後に読めた古い値では確定しない）。
+fn entered_range(start: &str, end: &str) -> Result<(i64, i64), &'static str> {
+    match (start.parse::<i64>(), end.parse::<i64>()) {
+        (Ok(start), Ok(end)) if start >= 0 && end > start => Ok((start, end)),
+        (Ok(_), Ok(_)) => Err("終了フレームは開始フレームより後にしてください"),
+        _ => Err("開始・終了フレームを数字で入力してください"),
+    }
 }
 
 fn seconds(session: &Session, frame: i64) -> String {
@@ -257,7 +286,7 @@ fn cue_list(ui: &mut egui::Ui, session: &mut Session, panel: &mut SubtitlePanel)
         if !session.is_playing() {
             session.seek(start);
         }
-        panel.revision = 0;
+        panel.current = false;
     }
 }
 
@@ -285,14 +314,11 @@ fn frame_field(ui: &mut egui::Ui, text: &mut String, width: f32) -> egui::Respon
 fn editor(ui: &mut egui::Ui, session: &mut Session, panel: &mut SubtitlePanel) {
     let playing = session.is_playing();
     ui.add_enabled_ui(!playing, |ui| {
-        let parsed = (
-            panel.start_text.parse::<i64>().ok(),
-            panel.end_text.parse::<i64>().ok(),
-        );
+        let parsed = entered_range(&panel.start_text, &panel.end_text);
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("開始／終了フレーム").size(12.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if let (Some(start), Some(end)) = parsed {
+                if let Ok((start, end)) = parsed {
                     ui.label(
                         egui::RichText::new(format!(
                             "{}–{} 秒",
@@ -311,12 +337,10 @@ fn editor(ui: &mut egui::Ui, session: &mut Session, panel: &mut SubtitlePanel) {
             frame_field(ui, &mut panel.start_text, half);
             frame_field(ui, &mut panel.end_text, half);
         });
-        if let (Some(start), Some(end)) = (
-            panel.start_text.parse::<i64>().ok(),
-            panel.end_text.parse::<i64>().ok(),
-        ) {
-            panel.start = start;
-            panel.end = end;
+        // 入力した後の値で確かめる。読めなければ「更新」「追加」を押せなくし、理由を出す。
+        let range = entered_range(&panel.start_text, &panel.end_text);
+        if let Err(reason) = range {
+            ui.colored_label(Color32::from_rgb(0xef, 0x8b, 0x8b), reason);
         }
         let text = ui.add_sized(
             Vec2::new(ui.available_width(), 70.0),
@@ -336,19 +360,24 @@ fn editor(ui: &mut egui::Ui, session: &mut Session, panel: &mut SubtitlePanel) {
         let cursor = panel.cursor;
         let editing = panel.editing.clone();
         ui.horizontal_wrapped(|ui| {
-            let update = ui.add_enabled_ui(editing.is_some(), |ui| {
+            let update = ui.add_enabled_ui(editing.is_some() && range.is_ok(), |ui| {
                 widgets::dialog_button(ui, "更新", ButtonKind::Prominent)
             });
             if update.inner.clicked()
                 && let Some(id) = editing.as_deref()
-                && let Err(error) =
-                    session.update_subtitle(id, panel.start, panel.end, &panel.content)
+                && let Ok((start, end)) = range
+                && let Err(error) = session.update_subtitle(id, start, end, &panel.content)
             {
                 session.set_alert(error.message());
             }
-            if widgets::dialog_button(ui, "追加", ButtonKind::Normal).clicked() {
-                match session.add_subtitle(panel.start, panel.end, &panel.content) {
-                    Ok(_) => panel.revision = 0,
+            let add = ui.add_enabled_ui(range.is_ok(), |ui| {
+                widgets::dialog_button(ui, "追加", ButtonKind::Normal)
+            });
+            if add.inner.clicked()
+                && let Ok((start, end)) = range
+            {
+                match session.add_subtitle(start, end, &panel.content) {
+                    Ok(_) => panel.current = false,
                     Err(error) => session.set_alert(error.message()),
                 }
             }
@@ -596,4 +625,81 @@ fn align_button(ui: &mut egui::Ui, alignment: &str, current: bool, tip: &str) ->
         );
     }
     response.on_hover_text(tip)
+}
+
+#[cfg(test)]
+mod tests {
+    use mvm_project::Project;
+
+    use super::*;
+
+    #[test]
+    fn the_range_comes_from_the_fields_as_they_are_now() {
+        assert_eq!(entered_range("10", "40"), Ok((10, 40)));
+        assert_eq!(entered_range("0", "1"), Ok((0, 1)));
+        // 空・読めない欄は、前に読めた値で確定させない。
+        for (start, end) in [("", "40"), ("10", ""), ("", "")] {
+            assert_eq!(
+                entered_range(start, end),
+                Err("開始・終了フレームを数字で入力してください"),
+                "{start:?}–{end:?}"
+            );
+        }
+        for (start, end) in [("40", "40"), ("40", "10")] {
+            assert_eq!(
+                entered_range(start, end),
+                Err("終了フレームは開始フレームより後にしてください"),
+                "{start:?}–{end:?}"
+            );
+        }
+    }
+
+    fn session_with_cue() -> (Session, String) {
+        let mut session = Session::from_project(Project::default());
+        let id = session.add_subtitle(0, 30, "元の本文").expect("字幕");
+        (session, id)
+    }
+
+    #[test]
+    fn a_style_change_keeps_the_unsaved_text() {
+        let (mut session, _id) = session_with_cue();
+        let mut panel = SubtitlePanel::default();
+        sync_editor(&session, &mut panel);
+        assert_eq!(panel.content, "元の本文");
+        // 本文を直したが「更新」は押さず、共通書式を変えた。
+        panel.content = "直した本文".to_owned();
+        panel.start_text = "5".to_owned();
+        let mut style = session
+            .project()
+            .subtitles
+            .as_ref()
+            .map(|track| track.style.clone())
+            .unwrap_or_default();
+        style.font_size += 4;
+        session.set_subtitle_style(style).expect("書式");
+        sync_editor(&session, &mut panel);
+        assert_eq!(panel.content, "直した本文");
+        assert_eq!(panel.start_text, "5");
+    }
+
+    #[test]
+    fn an_undo_of_the_edited_cue_reloads_the_fields() {
+        let (mut session, id) = session_with_cue();
+        let mut panel = SubtitlePanel::default();
+        sync_editor(&session, &mut panel);
+        session
+            .update_subtitle(&id, 0, 30, "確定した本文")
+            .expect("更新");
+        sync_editor(&session, &mut panel);
+        assert_eq!(panel.content, "確定した本文");
+        // 未確定の下書きがあっても、字幕そのものが undo で変われば Project の値へ読み直す。
+        panel.content = "下書き".to_owned();
+        session.undo().expect("戻す");
+        sync_editor(&session, &mut panel);
+        assert_eq!(panel.content, "元の本文");
+        assert_eq!(
+            (panel.start_text.as_str(), panel.end_text.as_str()),
+            ("0", "30")
+        );
+    }
 }

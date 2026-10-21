@@ -18,12 +18,65 @@ use crate::error::PreviewError;
 /// time stretch へ一度に入れる素材の sample 数（100 ms）。
 const STRETCH_CHUNK: usize = 4800;
 
-/// 再生中の音量の表示。mix が書き、UI が読んで空にする。値は直前の読み出しから後の絶対値の最大。
+/// 再生中の音量の表示。mix が書き、UI が読んで 0 へ戻す。値は直前の読み出しから後の絶対値の最大。
 /// track は clip の音量・定位・track の gain を掛けた寄与の最大、master はそれらを足した mix の最大で、
 /// どちらもモニター音量を掛ける前の値（書き出しと同じ音）。値は左右の組 `[左, 右]`。
+///
+/// 音声 callback はロックもメモリ確保もしない。track 数の入れ物は再生を始める前に [`Self::prepare`] で
+/// 1 回だけ作り、callback はその atomic へ最大を書くだけ。UI の読み出しは値を 0 へ戻すだけで、入れ物は
+/// 作り直さない。ロックは入れ物を差し替える UI 側と再生の開始の間だけで取る。
 #[derive(Debug, Default)]
 pub struct AudioMeters {
-    peaks: Mutex<MeterPeaks>,
+    slots: Mutex<Arc<MeterSlots>>,
+}
+
+/// 1 回の再生の、track ごとと master の最大。f32 の bit を u32 で持つ。0 以上の有限値は bit の大小と値の
+/// 大小が一致するので、`fetch_max` で最大を取れる。
+#[derive(Debug, Default)]
+struct MeterSlots {
+    tracks: Box<[[AtomicU32; 2]]>,
+    master: [AtomicU32; 2],
+}
+
+impl MeterSlots {
+    fn new(track_count: usize) -> Self {
+        Self {
+            tracks: (0..track_count)
+                .map(|_| [AtomicU32::new(0), AtomicU32::new(0)])
+                .collect(),
+            master: [AtomicU32::new(0), AtomicU32::new(0)],
+        }
+    }
+
+    /// 音声 callback から呼ぶ。入れ物より多い track は数えない（再生の開始時に数を合わせてある）。
+    fn record(&self, tracks: &[[f32; 2]], master: [f32; 2]) {
+        for (slot, value) in self.tracks.iter().zip(tracks) {
+            raise(slot, *value);
+        }
+        raise(&self.master, master);
+    }
+
+    fn take(&self) -> MeterPeaks {
+        MeterPeaks {
+            tracks: self.tracks.iter().map(drain).collect(),
+            master: drain(&self.master),
+        }
+    }
+}
+
+fn raise(slot: &[AtomicU32; 2], value: [f32; 2]) {
+    for (cell, sample) in slot.iter().zip(value) {
+        // 値は絶対値なので 0 以上。NaN は最大を壊すので 0 として扱う。
+        let level = if sample.is_nan() { 0.0 } else { sample.abs() };
+        cell.fetch_max(level.to_bits(), Ordering::Relaxed);
+    }
+}
+
+fn drain(slot: &[AtomicU32; 2]) -> [f32; 2] {
+    [
+        f32::from_bits(slot[0].swap(0, Ordering::Relaxed)),
+        f32::from_bits(slot[1].swap(0, Ordering::Relaxed)),
+    ]
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -34,28 +87,22 @@ pub struct MeterPeaks {
 }
 
 impl AudioMeters {
-    fn record(&self, tracks: &[[f32; 2]], master: [f32; 2]) {
-        let mut peaks = self
-            .peaks
+    /// 再生を始める前（音声 callback の外）に、`track_count` 本分の入れ物を作って差し替える。
+    fn prepare(&self, track_count: usize) -> Arc<MeterSlots> {
+        let slots = Arc::new(MeterSlots::new(track_count));
+        *self
+            .slots
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if peaks.tracks.len() < tracks.len() {
-            peaks.tracks.resize(tracks.len(), [0.0; 2]);
-        }
-        for (slot, value) in peaks.tracks.iter_mut().zip(tracks) {
-            *slot = stereo_max(*slot, *value);
-        }
-        peaks.master = stereo_max(peaks.master, master);
+            .unwrap_or_else(|poison| poison.into_inner()) = Arc::clone(&slots);
+        slots
     }
 
-    /// 直前の呼び出しから後の最大を返し、0 へ戻す。
+    /// 直前の呼び出しから後の最大を返し、0 へ戻す（UI から呼ぶ）。
     pub fn take(&self) -> MeterPeaks {
-        std::mem::take(
-            &mut *self
-                .peaks
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner()),
-        )
+        self.slots
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
     }
 }
 
@@ -143,7 +190,8 @@ pub struct AudioMixer {
     spans: Vec<AudioSpan>,
     streams: HashMap<PathBuf, PcmStream>,
     stretches: Vec<Option<Stretch>>,
-    meters: Option<Arc<AudioMeters>>,
+    meters: Option<Arc<MeterSlots>>,
+    /// track ごとの、この buffer での最大。数は開いたときに決め、mix の中では作り直さない。
     track_peaks: Vec<[f32; 2]>,
 }
 
@@ -163,6 +211,11 @@ impl AudioMixer {
             streams.insert(span.path.clone(), stream);
         }
         let stretches = spans.iter().map(|_| None).collect();
+        let track_count = spans
+            .iter()
+            .map(|span| span.segment.clip.track.index + 1)
+            .max()
+            .unwrap_or(0);
         Ok(Self {
             timebase,
             fps,
@@ -170,12 +223,12 @@ impl AudioMixer {
             streams,
             stretches,
             meters: None,
-            track_peaks: Vec::new(),
+            track_peaks: vec![[0.0; 2]; track_count],
         })
     }
 
     fn with_meters(mut self, meters: Arc<AudioMeters>) -> Self {
-        self.meters = Some(meters);
+        self.meters = Some(meters.prepare(self.track_peaks.len()));
         self
     }
 
@@ -215,11 +268,10 @@ impl AudioMixer {
                 &contribution,
                 samples,
             )?;
-            let track = span.segment.clip.track.index;
-            if self.track_peaks.len() <= track {
-                self.track_peaks.resize(track + 1, [0.0; 2]);
+            // 数は開いたときに全 span の track から決めてある。
+            if let Some(slot) = self.track_peaks.get_mut(span.segment.clip.track.index) {
+                *slot = stereo_max(*slot, peak);
             }
-            self.track_peaks[track] = stereo_max(self.track_peaks[track], peak);
         }
         Ok(())
     }
@@ -586,8 +638,9 @@ mod tests {
     #[test]
     fn meters_keep_the_largest_value_until_taken() {
         let meters = AudioMeters::default();
-        meters.record(&[[0.25, 0.125], [0.5, 0.0]], [0.5, 0.25]);
-        meters.record(&[[0.0, 0.75]], [0.25, 0.375]);
+        let slots = meters.prepare(2);
+        slots.record(&[[0.25, 0.125], [0.5, 0.0]], [0.5, 0.25]);
+        slots.record(&[[0.0, 0.75]], [0.25, 0.375]);
         // 左右は別々に最大を取る（左の大きい音が右の表示を持ち上げない）。
         assert_eq!(
             meters.take(),
@@ -596,7 +649,38 @@ mod tests {
                 master: [0.5, 0.375]
             }
         );
-        assert_eq!(meters.take(), MeterPeaks::default());
+        // 読み出しは値だけを 0 へ戻し、track の数（入れ物）は残す。
+        assert_eq!(
+            meters.take(),
+            MeterPeaks {
+                tracks: vec![[0.0; 2]; 2],
+                master: [0.0; 2]
+            }
+        );
+        // 読み出した後も、callback は同じ入れ物へ書き続けられる。
+        slots.record(&[[0.0, 0.0], [0.125, 0.5]], [0.0, 0.5]);
+        assert_eq!(
+            meters.take(),
+            MeterPeaks {
+                tracks: vec![[0.0, 0.0], [0.125, 0.5]],
+                master: [0.0, 0.5]
+            }
+        );
+    }
+
+    #[test]
+    fn meters_ignore_nan_and_extra_tracks() {
+        let meters = AudioMeters::default();
+        assert_eq!(meters.take(), MeterPeaks::default(), "再生前は空");
+        let slots = meters.prepare(1);
+        slots.record(&[[f32::NAN, 0.25], [1.0, 1.0]], [f32::NAN, 0.5]);
+        assert_eq!(
+            meters.take(),
+            MeterPeaks {
+                tracks: vec![[0.0, 0.25]],
+                master: [0.0, 0.5]
+            }
+        );
     }
 
     #[test]

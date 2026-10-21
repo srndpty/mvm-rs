@@ -43,5 +43,6 @@ pub use timeline_view::{
     display_span_frames, ranges_overlap, ruler_step, visible_window,
 };
 pub use transcribe::{
-    MAXIMUM_PROMPT_CHARS, TranscriptionOutcome, TranscriptionRequest, TranscriptionSource,
+    CandidateEdit, MAXIMUM_PROMPT_CHARS, TranscriptionOutcome, TranscriptionRequest,
+    TranscriptionSource,
 };

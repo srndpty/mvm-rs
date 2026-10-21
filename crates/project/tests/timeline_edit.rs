@@ -3915,6 +3915,17 @@ fn top_video_clip_is_the_highest_enabled_clip_at_the_frame() {
         Some(0),
         "無効な clip を選びました"
     );
+    // 上の track を非表示にすると、preview に見えている下の clip を選ぶ。
+    project.timeline_clips[1].enabled = true;
+    project.video_tracks[1].muted = true;
+    assert_eq!(
+        top_video_clip_at(&project, 150),
+        Some(0),
+        "非表示の track の clip を選びました"
+    );
+    // 下も非表示なら、見えている clip は無い。
+    project.video_tracks[0].muted = true;
+    assert_eq!(top_video_clip_at(&project, 150), None);
 }
 
 // グラフのハンドルは、キーから始まる区間をスプラインにして制御値を置き換える（undo 1 回分）。

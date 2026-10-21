@@ -1,5 +1,8 @@
 //! 書き出し設定のダイアログに出す要約（C++ 版の exportSettingsSummary）。入力映像の仕様は、読み込んだときに
 //! 調べて素材に覚えている寸法と fps を使う（書き出しの前に file を開き直さない）。
+//!
+//! 静止画は C++ 版と違い、寸法を持つ入力として数える。書き出しは静止画を素材の寸法で読んで拡大・縮小する
+//! ので、出力より小さい静止画には拡大の注意を出す。fps は持たないので fps の比較には入れない。
 
 use mvm_core::Rational;
 use mvm_project::{MediaKind, Project, TimelineClipKind};
@@ -16,7 +19,8 @@ pub struct ExportSettingsSummary {
 struct Spec {
     width: i32,
     height: i32,
-    fps: Rational,
+    /// 静止画は None。
+    fps: Option<Rational>,
 }
 
 fn fps_text(fps: Rational) -> String {
@@ -30,7 +34,10 @@ fn fps_text(fps: Rational) -> String {
 }
 
 fn spec_text(spec: Spec) -> String {
-    format!("{}×{} / {}", spec.width, spec.height, fps_text(spec.fps))
+    match spec.fps {
+        Some(fps) => format!("{}×{} / {}", spec.width, spec.height, fps_text(fps)),
+        None => format!("静止画 {}×{}", spec.width, spec.height),
+    }
 }
 
 /// 書き出しに出る映像の clip（有効で、出力される track の上）から要約を作る。
@@ -39,7 +46,7 @@ pub fn export_settings_summary(project: &Project) -> ExportSettingsSummary {
     let mut failed = 0usize;
     let mut video_clips = 0usize;
     let mut file_clips = 0usize;
-    let mut counts = [0usize; 5];
+    let mut counts = [0usize; 4];
     for clip in &project.timeline_clips {
         if clip.kind == TimelineClipKind::Audio
             || !clip.enabled
@@ -48,12 +55,12 @@ pub fn export_settings_summary(project: &Project) -> ExportSettingsSummary {
             continue;
         }
         video_clips += 1;
+        // Project のデータから出力の仕様で描く clip。file を読まない。
         let slot = match clip.kind {
-            TimelineClipKind::Image => Some(0),
-            TimelineClipKind::Text => Some(1),
-            TimelineClipKind::Math => Some(2),
-            TimelineClipKind::EquationSequence => Some(3),
-            TimelineClipKind::Graph => Some(4),
+            TimelineClipKind::Text => Some(0),
+            TimelineClipKind::Math => Some(1),
+            TimelineClipKind::EquationSequence => Some(2),
+            TimelineClipKind::Graph => Some(3),
             _ => None,
         };
         if let Some(slot) = slot {
@@ -61,23 +68,27 @@ pub fn export_settings_summary(project: &Project) -> ExportSettingsSummary {
             continue;
         }
         file_clips += 1;
-        let item = project
+        let still = clip.kind == TimelineClipKind::Image;
+        let spec = project
             .media_items
             .iter()
             .find(|item| item.id == clip.media_item_id || item.media_path == clip.media_path)
-            .filter(|item| {
-                item.kind == MediaKind::Video
-                    && item.width > 0
-                    && item.height > 0
-                    && item.fps.is_positive()
-            });
-        match item {
-            Some(item) => {
-                let spec = Spec {
+            .filter(|item| item.width > 0 && item.height > 0)
+            .and_then(|item| match (still, item.kind) {
+                (true, MediaKind::Image) => Some(Spec {
                     width: item.width,
                     height: item.height,
-                    fps: item.fps,
-                };
+                    fps: None,
+                }),
+                (false, MediaKind::Video) if item.fps.is_positive() => Some(Spec {
+                    width: item.width,
+                    height: item.height,
+                    fps: Some(item.fps),
+                }),
+                _ => None,
+            });
+        match spec {
+            Some(spec) => {
                 if !specs.contains(&spec) {
                     specs.push(spec);
                 }
@@ -95,7 +106,7 @@ pub fn export_settings_summary(project: &Project) -> ExportSettingsSummary {
     let input = if video_clips == 0 {
         "入力映像: なし".to_owned()
     } else if file_clips == 0 {
-        let kinds: Vec<String> = ["静止画", "文字", "数式", "数式sequence", "グラフ"]
+        let kinds: Vec<String> = ["文字", "数式", "数式sequence", "グラフ"]
             .iter()
             .zip(counts)
             .filter(|(_, count)| *count > 0)
@@ -119,9 +130,8 @@ pub fn export_settings_summary(project: &Project) -> ExportSettingsSummary {
     let raster_up = specs
         .iter()
         .any(|spec| spec.width < project.output_width || spec.height < project.output_height);
-    let rate_up = specs.iter().any(|spec| {
-        i128::from(spec.fps.num) * i128::from(fps.den)
-            < i128::from(fps.num) * i128::from(spec.fps.den)
+    let rate_up = specs.iter().filter_map(|spec| spec.fps).any(|input| {
+        i128::from(input.num) * i128::from(fps.den) < i128::from(fps.num) * i128::from(input.den)
     });
     let mut warnings = Vec::new();
     if specs.len() > 1 {
@@ -238,6 +248,82 @@ mod tests {
             "入力映像: なし（文字 1件を出力の仕様で描きます）"
         );
         assert_eq!(summary.warning, "");
+    }
+
+    fn image(id: &str, width: i32, height: i32) -> (MediaItem, TimelineClip) {
+        let item = MediaItem {
+            id: format!("item-{id}"),
+            kind: MediaKind::Image,
+            media_path: format!("{id}.png").into(),
+            name: id.to_owned(),
+            width,
+            height,
+            ..MediaItem::default()
+        };
+        let clip = TimelineClip {
+            kind: TimelineClipKind::Image,
+            id: id.to_owned(),
+            name: id.to_owned(),
+            media_path: item.media_path.clone(),
+            media_item_id: item.id.clone(),
+            source_out_frame: 120,
+            track: TrackRef::video(0),
+            ..TimelineClip::default()
+        };
+        (item, clip)
+    }
+
+    #[test]
+    fn a_small_still_image_warns_about_upscaling_but_not_fps() {
+        let (item, clip) = image("s", 640, 480);
+        let project = Project {
+            media_items: vec![item],
+            timeline_clips: vec![clip],
+            ..Project::default()
+        };
+        let summary = export_settings_summary(&project);
+        assert_eq!(summary.input, "入力映像: 静止画 640×480");
+        // 静止画は fps を持たないので、fps の注意は出さない。
+        assert_eq!(
+            summary.warning,
+            "一部の入力映像を拡大して書き出します。\n\
+             出力の画素数やフレーム数が増えるため、元ファイルより容量が大きくなる場合があります。"
+        );
+    }
+
+    #[test]
+    fn a_full_size_still_with_text_has_no_warning_and_an_unknown_still_is_reported() {
+        let (item, clip) = image("s", 1920, 1080);
+        let text = TimelineClip {
+            kind: TimelineClipKind::Text,
+            id: "t".to_owned(),
+            track: TrackRef::video(1),
+            ..TimelineClip::default()
+        };
+        let project = Project {
+            media_items: vec![item.clone()],
+            timeline_clips: vec![clip.clone(), text],
+            ..Project::default()
+        };
+        let summary = export_settings_summary(&project);
+        assert_eq!(summary.input, "入力映像: 静止画 1920×1080");
+        assert_eq!(summary.warning, "");
+        // 寸法を覚えていない静止画（素材が無い・動画として登録されている）は確認できなかったと出す。
+        let mut wrong = item;
+        wrong.kind = MediaKind::Video;
+        for media_items in [Vec::new(), vec![wrong]] {
+            let project = Project {
+                media_items,
+                timeline_clips: vec![clip.clone()],
+                ..Project::default()
+            };
+            let summary = export_settings_summary(&project);
+            assert_eq!(summary.input, "入力映像: 仕様を取得できません");
+            assert_eq!(
+                summary.warning,
+                "1件の入力ファイルは仕様を確認できませんでした。"
+            );
+        }
     }
 
     #[test]

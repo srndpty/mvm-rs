@@ -63,12 +63,16 @@ pub fn active_clips_at(
 }
 
 /// 一番上の video track で `timeline_frame` に掛かる有効な clip（preview で見えている clip）の index。
+/// 非表示の track の clip は preview に出ないので選ばない（preview の合成と同じ判定）。
 pub fn top_video_clip_at(project: &Project, timeline_frame: i64) -> Option<usize> {
     active_clips_at(project, TrackKind::Video, timeline_frame)
         .into_iter()
         .rev()
         .flatten()
-        .find(|index| project.timeline_clips[*index].enabled)
+        .find(|index| {
+            let clip = &project.timeline_clips[*index];
+            clip.enabled && project.is_track_output_enabled(clip.track)
+        })
 }
 
 /// 文字のテロップ位置の左右の余白（画面幅の割合）と、下からの高さ（画面高の割合）。決め打ちの値で、

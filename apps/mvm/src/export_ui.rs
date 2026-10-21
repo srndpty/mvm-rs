@@ -8,6 +8,7 @@ use mvm_app::{
     ExportQuality, ExportRequest, ExportSettingsSummary, ReplaceApproval, Session,
     export_settings_summary, replace_approval,
 };
+use mvm_core::Rational;
 use mvm_core::export_eta::format_export_remaining;
 
 use crate::dialog;
@@ -262,6 +263,7 @@ fn show_progress(ui: &mut egui::Ui, session: &mut Session) {
     let Some(progress) = session.export_progress() else {
         return;
     };
+    let fps = session.project().timeline_fps;
     let mut cancel = false;
     let text = if progress.cancelling {
         "キャンセルしています…".to_owned()
@@ -270,9 +272,8 @@ fn show_progress(ui: &mut egui::Ui, session: &mut Session) {
         "準備しています…".to_owned()
     } else {
         format!(
-            "{} / {} frame ・ {}",
-            progress.completed,
-            progress.total,
+            "{} ・ {}",
+            progress_label(progress.completed, progress.total, fps),
             match progress.remaining_seconds {
                 Some(seconds) => format_export_remaining(seconds),
                 None => "残り時間を計算中…".to_owned(),
@@ -345,6 +346,19 @@ fn pick_output(current: &Path) -> Option<PathBuf> {
 }
 
 /// 拡張子が無ければ `.mp4` を付ける。別の拡張子は書き出しの計画が拒む。
+/// 書き出した位置と全体の長さ。frame と秒を併記する（UI の指針）。書き出す frame は timeline の fps で数える。
+fn progress_label(completed: i64, total: i64, fps: Rational) -> String {
+    if fps.num <= 0 || fps.den <= 0 {
+        return format!("{completed} / {total} frame");
+    }
+    let seconds = |frames: i64| frames as f64 * fps.den as f64 / fps.num as f64;
+    format!(
+        "{completed} / {total} frame（{:.1} / {:.1} 秒）",
+        seconds(completed),
+        seconds(total)
+    )
+}
+
 fn ensure_mp4(path: PathBuf) -> PathBuf {
     if path.as_os_str().is_empty() || path.extension().is_some() {
         path
@@ -356,6 +370,22 @@ fn ensure_mp4(path: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_shows_frames_and_seconds() {
+        // 60 fps の 90 frame は 1.5 秒、600 frame は 10 秒。
+        assert_eq!(
+            progress_label(90, 600, Rational::new(60, 1)),
+            "90 / 600 frame（1.5 / 10.0 秒）"
+        );
+        // 29.97 fps（30000/1001）の 300 frame は 10.01 秒。
+        assert_eq!(
+            progress_label(0, 300, Rational::new(30000, 1001)),
+            "0 / 300 frame（0.0 / 10.0 秒）"
+        );
+        // fps が不正なら秒は出さない。
+        assert_eq!(progress_label(1, 2, Rational::new(0, 1)), "1 / 2 frame");
+    }
 
     #[test]
     fn the_output_gets_the_mp4_extension_only_when_it_has_none() {

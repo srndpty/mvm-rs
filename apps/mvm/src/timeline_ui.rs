@@ -4,9 +4,9 @@
 
 use eframe::egui::{self, Align2, Color32, Label, Pos2, Rect, Sense, Stroke, Vec2};
 use mvm_app::{
-    Session, TimeWindow, display_span_frames, ranges_overlap, ruler_step, visible_window,
+    MIN_PIXELS_PER_FRAME, Session, TimeWindow, display_span_frames, ranges_overlap, ruler_step,
+    visible_window,
 };
-use mvm_core::timecode::format_timecode;
 use mvm_project::timeline::{
     BodyAction, BodyPress, ClipSpan, DragBounds, EdgeAction, GestureModifiers, PenGeometry, PenKey,
     PenPress, TOOLS, TimelineTool, TrimEdge, body_press, body_release, clip_ids_spanning_frame,
@@ -18,6 +18,7 @@ use mvm_project::{Project, TrackKind, TrackRef};
 
 use crate::project_panel::MediaDrag;
 use crate::subtitle_lane::{self, SubtitleGesture};
+use crate::{icons, theme, widgets};
 
 macro_rules! report {
     ($session:ident, $call:expr $(,)?) => {{
@@ -28,9 +29,16 @@ macro_rules! report {
     }};
 }
 
-const HEADER_WIDTH: f32 = 210.0;
-const RULER_HEIGHT: f32 = 28.0;
-pub(crate) const ROW_HEIGHT: f32 = 40.0;
+/// 左端のツール列と、track 名の列の幅。
+const TOOL_PANEL_WIDTH: f32 = 34.0;
+const HEADER_WIDTH: f32 = 96.0;
+const RULER_HEIGHT: f32 = 26.0;
+pub(crate) const ROW_HEIGHT: f32 = 54.0;
+/// clip・字幕を行の上下から離す幅。
+pub(crate) const CLIP_INSET: f32 = 3.0;
+/// 最上段の video track の上に置く「+V」の行と、最下段の audio track の下の「+A」の余白。
+const ADD_VIDEO_ROW: f32 = 28.0;
+const ADD_AUDIO_SPACE: f32 = 34.0;
 pub(crate) const EDGE_PIXELS: f32 = 8.0;
 
 /// timeline の UI 状態。ドラッグ中の操作と、shell へ渡す依頼。
@@ -44,8 +52,125 @@ pub struct TimelineState {
     pub speed_clip: Option<String>,
     /// 右クリックの「プロジェクト設定をこの素材に合わせる」で選んだ clip。
     pub match_settings_clip: Option<String>,
+    /// S1 の見出しを押した。shell が字幕のタブを開く。
+    pub open_subtitles: bool,
+    /// 倍率を変えたあと、次の frame で合わせる横スクロールの位置（px）。カーソル下の frame を動かさない。
+    scroll_to_x: Option<f32>,
+    /// 直前の frame の横スクロールの位置（px）。
+    scroll_offset_x: f32,
+    /// 目玉のドラッグ塗り。押した video track の表示を反転し、ドラッグで通った track も同じにする。
+    eye_paint: Option<EyePaint>,
     /// 空白・ルーラーを右クリックした位置（track の行の上なら track も）。
     background_menu: Option<(Option<TrackRef>, i64)>,
+}
+
+/// 目玉のドラッグ塗りの途中。離したときに通った track をまとめて確定する（1 回の undo）。
+#[derive(Clone, Debug, PartialEq)]
+struct EyePaint {
+    /// 塗る値（非表示なら true）。
+    muted: bool,
+    /// 通った video track の index。
+    painted: Vec<usize>,
+    last: usize,
+}
+
+impl EyePaint {
+    /// 押した track の今の表示を反転した値で塗り始める。
+    fn begin(index: usize, pressed_muted: bool) -> Self {
+        Self {
+            muted: !pressed_muted,
+            painted: vec![index],
+            last: index,
+        }
+    }
+
+    /// `index` まで動いた。速く動かすと move が行を飛ばすので、間の track も通ったものとして足す。
+    fn reach(&mut self, index: usize) {
+        let (low, high) = (self.last.min(index), self.last.max(index));
+        for passed in low..=high {
+            if !self.painted.contains(&passed) {
+                self.painted.push(passed);
+            }
+        }
+        self.last = index;
+    }
+
+    /// 目玉に見せる表示。塗っている最中は、通った track に塗る値を先に見せる。
+    fn shown_muted(&self, index: usize, actual: bool) -> bool {
+        if self.painted.contains(&index) {
+            self.muted
+        } else {
+            actual
+        }
+    }
+}
+
+/// 行の y（track 領域の上端から）にある video track の index。video の行の外は端の track に寄せる（audio の行や
+/// ruler へはみ出しても塗りが途切れないように）。video track が無ければ None。
+fn video_index_at(local_y: f32, video_count: usize) -> Option<usize> {
+    if video_count == 0 {
+        return None;
+    }
+    let row = (local_y / ROW_HEIGHT)
+        .floor()
+        .clamp(0.0, (video_count - 1) as f32) as usize;
+    Some(video_count - 1 - row)
+}
+
+/// track 領域の縦の並び。y は content（スクロールする領域）の上端から。
+struct Lanes {
+    rows: Vec<(TrackKind, usize, String)>,
+    /// 字幕の track があれば、その表示状態。
+    subtitles: Option<bool>,
+}
+
+impl Lanes {
+    fn new(project: &Project) -> Self {
+        Self {
+            rows: track_rows(project),
+            subtitles: project.subtitles.as_ref().map(|track| track.visible),
+        }
+    }
+
+    /// S1 の行の上端。「+V」の行の下。
+    fn subtitle_top(&self) -> f32 {
+        ADD_VIDEO_ROW
+    }
+
+    /// 最上段の track の上端。
+    fn tracks_top(&self) -> f32 {
+        ADD_VIDEO_ROW
+            + if self.subtitles.is_some() {
+                ROW_HEIGHT
+            } else {
+                0.0
+            }
+    }
+
+    fn row_top(&self, row: usize) -> f32 {
+        self.tracks_top() + row as f32 * ROW_HEIGHT
+    }
+
+    fn video_count(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|(kind, _, _)| *kind == TrackKind::Video)
+            .count()
+    }
+
+    fn height(&self) -> f32 {
+        self.row_top(self.rows.len()) + ADD_AUDIO_SPACE
+    }
+
+    /// content の y にある track の行。
+    fn row_at(&self, y: f32) -> Option<usize> {
+        let local = y - self.tracks_top();
+        if local < 0.0 {
+            return None;
+        }
+        let row = (local / ROW_HEIGHT) as usize;
+        (row < self.rows.len()).then_some(row)
+    }
 }
 
 pub struct TimelineGesture {
@@ -61,138 +186,643 @@ pub struct TimelineGesture {
 }
 
 pub fn show(ui: &mut egui::Ui, session: &mut Session, state: &mut TimelineState) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label("タイムライン");
-        if ui.button("縮小").clicked() {
-            session.zoom_by(0.5);
+    transport_row(ui, session);
+    ui.add_space(4.0);
+    egui::Frame::new()
+        .fill(theme::TIMELINE)
+        .stroke(Stroke::new(1.0, theme::TIMELINE_BORDER))
+        .corner_radius(5)
+        .inner_margin(egui::Margin::same(1))
+        .show(ui, |ui| {
+            // panel の高さいっぱいを使う。中身の高さで panel の大きさが決まると、境界をドラッグして広げた高さが
+            // 離した次の frame で中身の高さへ戻ってしまう。
+            let area = ui.available_rect_before_wrap();
+            ui.expand_to_include_rect(area);
+            let tools = Rect::from_min_size(area.min, Vec2::new(TOOL_PANEL_WIDTH, area.height()));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(tools), |ui| {
+                tool_panel(ui, session);
+            });
+            let body = Rect::from_min_max(Pos2::new(tools.max.x, area.min.y), area.max);
+            show_body(ui, session, state, body);
+        });
+}
+
+/// timeline の上の行。playhead の時刻・fps・倍率と、今のツールの使い方。
+fn transport_row(ui: &mut egui::Ui, session: &Session) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(session.playhead_label())
+                .monospace()
+                .strong()
+                .size(15.0)
+                .color(theme::TEXT),
+        );
+        let fps = session.project().timeline_fps;
+        let measured = mvm_project::is_measured_timeline_frame_rate(fps);
+        let rate = if fps.den == 1 {
+            format!("{} fps", fps.num)
+        } else if fps.den > 0 {
+            format!("{:.3} fps", fps.num as f64 / fps.den as f64)
+        } else {
+            "-- fps".to_owned()
+        };
+        let label = ui.label(
+            egui::RichText::new(format!(
+                "{rate}{}  |  zoom {}%",
+                if measured { "" } else { " (未計測)" },
+                session.zoom_percent()
+            ))
+            .color(if measured {
+                theme::TEXT_SECONDARY
+            } else {
+                theme::WARNING
+            }),
+        );
+        if !measured {
+            label.on_hover_text("この frame rate の preview は実測していません");
         }
-        ui.label(format!("{}%", session.zoom_percent()));
-        if ui.button("拡大").clicked() {
-            session.zoom_by(2.0);
-        }
-        ui.monospace(session.playhead_label());
         let rate = session.shuttle_rate();
         if rate != 0 && rate != 1 {
-            ui.label(format!("シャトル {rate} 倍速（音声なし）"));
+            ui.label(
+                egui::RichText::new(format!("シャトル {rate} 倍速（音声なし）"))
+                    .color(theme::WARNING),
+            );
         }
-        ui.label(format!("ツール {}", session.tool().spec().name));
-        if ui
-            .button("+V")
-            .on_hover_text("video トラックを追加")
-            .clicked()
-        {
-            report!(session, session.add_track(TrackKind::Video));
-        }
-        if ui
-            .button("+A")
-            .on_hover_text("audio トラックを追加")
-            .clicked()
-        {
-            report!(session, session.add_track(TrackKind::Audio));
-        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let spec = session.tool().spec();
+            ui.add(
+                Label::new(
+                    egui::RichText::new(format!(
+                        "{}: {}  |  Alt+操作: リンクの片方だけ / Space: 再生・一時停止 / Alt+ホイール: ズーム",
+                        spec.name, spec.hint
+                    ))
+                    .size(11.0)
+                    .color(theme::TEXT_DIM),
+                )
+                .truncate(),
+            );
+        });
     });
-    ui.horizontal_wrapped(|ui| {
-        for spec in TOOLS {
-            let button = egui::Button::new(spec.name).selected(session.tool() == spec.tool);
-            let response = ui
-                .add(button)
-                .on_hover_text(format!("{}  {}", spec.key, spec.hint));
-            if response.clicked() {
-                session.set_tool(spec.tool);
-            }
-        }
-    });
+}
 
-    let rows = track_rows(session.project());
+/// 左端に縦 1 列で並べるツール。種類が変わるところに区切り線を入れる。
+fn tool_panel(ui: &mut egui::Ui, session: &mut Session) {
+    let rect = ui.max_rect();
+    ui.painter().rect(
+        rect,
+        0.0,
+        theme::STRIP,
+        Stroke::new(1.0, theme::TIMELINE_BORDER),
+        egui::StrokeKind::Inside,
+    );
+    egui::ScrollArea::vertical()
+        .id_salt("timeline_tools")
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.vertical_centered(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                let mut group = None;
+                for spec in TOOLS {
+                    if group.is_some_and(|group| group != spec.group) {
+                        let (line, _) =
+                            ui.allocate_exact_size(Vec2::new(22.0, 1.0), Sense::hover());
+                        ui.painter().rect_filled(line, 0.0, theme::TIMELINE_BORDER);
+                    }
+                    group = Some(spec.group);
+                    let response = icons::button(
+                        ui,
+                        Vec2::new(28.0, 26.0),
+                        spec.name,
+                        session.tool() == spec.tool,
+                        |painter, rect, color| icons::paint_tool(painter, rect, spec.tool, color),
+                    )
+                    .on_hover_text(format!("{} ({})\n{}", spec.name, spec.key, spec.hint));
+                    if response.clicked() {
+                        session.set_tool(spec.tool);
+                    }
+                }
+            });
+        });
+}
+
+/// ルーラー・track 名・スクロールする track 領域。ルーラーは縦に、track 名は横にスクロールしない。
+fn show_body(ui: &mut egui::Ui, session: &mut Session, state: &mut TimelineState, area: Rect) {
+    let lanes = Lanes::new(session.project());
     let ppf = session.pixels_per_frame();
     let span =
         display_span_frames(session.project()).max(session.playhead_frame().saturating_add(1));
     let content_width = (span as f32).mul_add(ppf, 48.0).max(1.0);
 
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.add_space(RULER_HEIGHT);
-            for (kind, index, name) in &rows {
-                let track = TrackRef::new(*kind, *index);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(HEADER_WIDTH, ROW_HEIGHT),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        let label = ui.add(Label::new(name).sense(Sense::click()));
-                        label.context_menu(|ui| {
-                            if ui.button("このトラックを削除").clicked() {
-                                report!(session, session.remove_track(track));
-                                ui.close();
-                            }
-                        });
-                        track_buttons(ui, session, track, name);
-                    },
-                );
+    let corner = Rect::from_min_size(area.min, Vec2::new(HEADER_WIDTH, RULER_HEIGHT));
+    let ruler = Rect::from_min_max(
+        Pos2::new(corner.max.x, area.min.y),
+        Pos2::new(area.max.x, corner.max.y),
+    );
+    let headers = Rect::from_min_max(
+        Pos2::new(area.min.x, corner.max.y),
+        Pos2::new(corner.max.x, area.max.y),
+    );
+    let tracks = Rect::from_min_max(Pos2::new(ruler.min.x, ruler.max.y), area.max);
+    alt_wheel_zoom(ui, session, state, tracks);
+
+    let output = ui
+        .scope_builder(egui::UiBuilder::new().max_rect(tracks), |ui| {
+            let mut scroll = egui::ScrollArea::both()
+                .id_salt("timeline_scroll")
+                .auto_shrink([false, false])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible);
+            if let Some(x) = state.scroll_to_x.take() {
+                scroll = scroll.horizontal_scroll_offset(x);
             }
-            if let Some(visible) = session
-                .project()
-                .subtitles
-                .as_ref()
-                .map(|track| track.visible)
-            {
-                ui.allocate_ui_with_layout(
-                    Vec2::new(HEADER_WIDTH, ROW_HEIGHT),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.label("S1");
-                        let label = if visible { "S1 表示" } else { "S1 非表示" };
-                        if ui.button(label).clicked() {
-                            report!(session, session.toggle_subtitle_visible());
-                        }
-                    },
+            scroll.show_viewport(ui, |ui, viewport| {
+                let window = visible_window(viewport.min.x, viewport.width(), ppf);
+                let height = lanes.height().max(viewport.height());
+                draw_contents(
+                    ui,
+                    session,
+                    state,
+                    &lanes,
+                    Vec2::new(content_width, height),
+                    window,
+                    ppf,
                 );
+            })
+        })
+        .inner;
+    state.scroll_offset_x = output.state.offset.x;
+    let offset = output.state.offset;
+    let origin_x = tracks.min.x - offset.x;
+    let window = visible_window(offset.x, tracks.width(), ppf);
+    ui.scope_builder(egui::UiBuilder::new().max_rect(ruler), |ui| {
+        ui.set_clip_rect(ruler.intersect(ui.clip_rect()));
+        draw_ruler(ui, session, state, ruler, origin_x, window, ppf);
+    });
+    // track 名の列は track 領域と一緒に縦へスクロールし、見えている範囲の外にも部品を置く。親へ大きさを
+    // 伝えない child にする（伝えると、全 track の高さまで panel が伸びる）。
+    let mut header_ui = ui.new_child(egui::UiBuilder::new().max_rect(headers));
+    header_ui.set_clip_rect(headers.intersect(ui.clip_rect()));
+    let top = headers.min.y - offset.y;
+    draw_headers(&mut header_ui, session, state, &lanes, headers, top);
+    ui.scope_builder(egui::UiBuilder::new().max_rect(corner), |ui| {
+        ui.painter().rect_filled(corner, 0.0, theme::STRIP);
+        ui.horizontal_centered(|ui| {
+            ui.add_space(6.0);
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let size = Vec2::new(24.0, 22.0);
+            let zoom_out = icons::button(ui, size, "縮小", false, |painter, rect, color| {
+                icons::paint_zoom(painter, rect, false, color);
+            });
+            if zoom_out.on_hover_text("縮小").clicked() {
+                zoom_at(session, state, -1, ruler.width() / 2.0);
+            }
+            let zoom_in = icons::button(ui, size, "拡大", false, |painter, rect, color| {
+                icons::paint_zoom(painter, rect, true, color);
+            });
+            if zoom_in.on_hover_text("拡大").clicked() {
+                zoom_at(session, state, 1, ruler.width() / 2.0);
             }
         });
-
-        egui::ScrollArea::horizontal()
-            .id_salt("timeline_scroll")
-            .show_viewport(ui, |ui, viewport| {
-                let window = visible_window(viewport.min.x, viewport.width(), ppf);
-                draw_contents(ui, session, state, &rows, content_width, window, ppf);
-            });
     });
 }
 
-fn track_buttons(ui: &mut egui::Ui, session: &mut Session, track: TrackRef, name: &str) {
-    let Some(state) = session.project().tracks(track.kind).get(track.index) else {
+/// 倍率を `steps` 段変え、track 領域の左端から `anchor_x` px の位置にある frame を同じ位置に保つ。
+fn zoom_at(session: &mut Session, state: &mut TimelineState, steps: i32, anchor_x: f32) {
+    let before = session.pixels_per_frame();
+    session.zoom_step(steps);
+    let after = session.pixels_per_frame();
+    if before == after {
+        return;
+    }
+    let frame = (state.scroll_offset_x + anchor_x) / before;
+    state.scroll_to_x = Some((frame * after - anchor_x).max(0.0));
+}
+
+/// Alt+ホイールで、カーソルの位置を中心に拡大・縮小する。ホイールの量はスクロールに回さない。
+fn alt_wheel_zoom(
+    ui: &mut egui::Ui,
+    session: &mut Session,
+    state: &mut TimelineState,
+    tracks: Rect,
+) {
+    let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) else {
         return;
     };
-    let muted = state.muted;
-    let solo = state.solo;
-    match track.kind {
-        TrackKind::Video => {
-            let label = if muted {
-                format!("{name} 非表示")
+    if !tracks.contains(pointer) {
+        return;
+    }
+    let delta = ui.input_mut(|input| {
+        if !input.modifiers.alt {
+            return 0.0;
+        }
+        input.smooth_scroll_delta = Vec2::ZERO;
+        input
+            .raw
+            .events
+            .iter()
+            .map(|event| match event {
+                egui::Event::MouseWheel { delta, .. } => delta.x + delta.y,
+                _ => 0.0,
+            })
+            .sum::<f32>()
+    });
+    if delta != 0.0 {
+        zoom_at(
+            session,
+            state,
+            if delta > 0.0 { 1 } else { -1 },
+            pointer.x - tracks.min.x,
+        );
+    }
+}
+
+/// track 名の列。video は目玉、audio は M / S。右クリックで track を削除する。
+fn draw_headers(
+    ui: &mut egui::Ui,
+    session: &mut Session,
+    state: &mut TimelineState,
+    lanes: &Lanes,
+    area: Rect,
+    top: f32,
+) {
+    ui.painter().rect_filled(area, 0.0, theme::STRIP);
+    let add_video = Rect::from_min_size(
+        Pos2::new(area.min.x + 3.0, top + (ADD_VIDEO_ROW - 22.0) / 2.0),
+        Vec2::new(42.0, 22.0),
+    );
+    if ui.is_rect_visible(add_video)
+        && ui
+            .put(add_video, egui::Button::new("+V"))
+            .on_hover_text("video トラックを追加")
+            .clicked()
+    {
+        report!(session, session.add_track(TrackKind::Video));
+    }
+    if let Some(visible) = lanes.subtitles {
+        let row = Rect::from_min_size(
+            Pos2::new(area.min.x, top + lanes.subtitle_top()),
+            Vec2::new(HEADER_WIDTH, ROW_HEIGHT),
+        );
+        ui.painter().rect(
+            row,
+            0.0,
+            theme::SUBTITLE_HEADER,
+            Stroke::new(1.0, theme::SUBTITLE_HEADER_BORDER),
+            egui::StrokeKind::Inside,
+        );
+        let name = Rect::from_min_max(
+            row.min + Vec2::new(6.0, 0.0),
+            Pos2::new(row.max.x - 28.0, row.max.y),
+        );
+        let label = ui.put(
+            name,
+            Label::new(egui::RichText::new("S1 字幕").color(theme::SUBTITLE_HEADER_TEXT))
+                .sense(Sense::click()),
+        );
+        if label.on_hover_text("字幕の一覧を開く").clicked() {
+            state.open_subtitles = true;
+        }
+        let eye = Rect::from_center_size(
+            Pos2::new(row.max.x - 16.0, row.center().y),
+            Vec2::splat(20.0),
+        );
+        if eye_button(ui, eye, "S1", !visible).clicked() {
+            report!(session, session.toggle_subtitle_visible());
+        }
+    }
+    for (row_index, (kind, index, name)) in lanes.rows.iter().enumerate() {
+        let row = Rect::from_min_size(
+            Pos2::new(area.min.x, top + lanes.row_top(row_index)),
+            Vec2::new(HEADER_WIDTH, ROW_HEIGHT),
+        );
+        if !ui.is_rect_visible(row) {
+            continue;
+        }
+        let track = TrackRef::new(*kind, *index);
+        let Some(track_state) = session.project().tracks(*kind).get(*index) else {
+            continue;
+        };
+        let (actual_muted, solo) = (track_state.muted, track_state.solo);
+        let video = *kind == TrackKind::Video;
+        let muted = match &state.eye_paint {
+            Some(paint) if video => paint.shown_muted(*index, actual_muted),
+            _ => actual_muted,
+        };
+        ui.painter().rect(
+            row,
+            0.0,
+            if video {
+                theme::VIDEO_HEADER
             } else {
-                format!("{name} 表示")
-            };
-            if ui.button(label).clicked() {
+                theme::AUDIO_HEADER
+            },
+            Stroke::new(1.0, theme::TIMELINE_BORDER),
+            egui::StrokeKind::Inside,
+        );
+        let controls = if video { 24.0 } else { 46.0 };
+        let name_rect = Rect::from_min_max(
+            row.min + Vec2::new(6.0, 0.0),
+            Pos2::new(row.max.x - controls - 4.0, row.max.y),
+        );
+        let label = ui
+            .scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(name_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                |ui| {
+                    ui.add(
+                        Label::new(egui::RichText::new(name).font(theme::bold(12.5)).color(
+                            if muted {
+                                theme::HEADER_TEXT_MUTED
+                            } else {
+                                theme::TEXT_ICON
+                            },
+                        ))
+                        .truncate()
+                        .sense(Sense::click()),
+                    )
+                },
+            )
+            .inner;
+        label.context_menu(|ui| {
+            if ui.button("このトラックを削除").clicked() {
+                report!(session, session.remove_track(track));
+                ui.close();
+            }
+        });
+        // 名前のすぐ右に置く。
+        let controls_x = label.rect.max.x + 4.0;
+        if video {
+            let eye = Rect::from_min_size(
+                Pos2::new(controls_x, row.center().y - 10.0),
+                Vec2::splat(20.0),
+            );
+            let response = eye_button(ui, eye, name, muted);
+            if response.is_pointer_button_down_on()
+                && ui.input(|input| input.pointer.primary_pressed())
+            {
+                state.eye_paint = Some(EyePaint::begin(*index, actual_muted));
+            } else if response.clicked() && state.eye_paint.is_none() {
+                // 読み上げ・キーボードからの押下はポインタを伴わない。その track だけを切り替える。
                 report!(session, session.toggle_track_muted(track));
             }
+        } else {
+            let toggles = Rect::from_min_size(
+                Pos2::new(controls_x, row.center().y - 10.0),
+                Vec2::new(controls, 20.0),
+            );
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(toggles)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    let tip = if muted {
+                        "ミュート解除"
+                    } else {
+                        "ミュート"
+                    };
+                    if widgets::track_toggle(ui, "M", muted, theme::MUTE_ON, tip).clicked() {
+                        report!(session, session.toggle_track_muted(track));
+                    }
+                    let tip = if solo {
+                        "ソロ解除"
+                    } else {
+                        "ソロ（このトラックだけを鳴らす）"
+                    };
+                    if widgets::track_toggle(ui, "S", solo, theme::SOLO_ON, tip).clicked() {
+                        report!(session, session.toggle_track_solo(track));
+                    }
+                },
+            );
         }
-        TrackKind::Audio => {
-            let mute_label = if muted {
-                format!("{name} 消音中")
-            } else {
-                format!("{name} 消音")
-            };
-            let solo_label = if solo {
-                format!("{name} ソロ中")
-            } else {
-                format!("{name} ソロ")
-            };
-            if ui.button(mute_label).clicked() {
-                report!(session, session.toggle_track_muted(track));
+    }
+    if let Some(paint) = state.eye_paint.as_mut() {
+        if let Some(pointer) = ui.input(|input| input.pointer.interact_pos())
+            && let Some(index) =
+                video_index_at(pointer.y - top - lanes.tracks_top(), lanes.video_count())
+        {
+            paint.reach(index);
+        }
+        if ui.input(|input| input.pointer.primary_released()) {
+            let paint = state.eye_paint.take();
+            if let Some(paint) = paint {
+                let changed: Vec<usize> = paint
+                    .painted
+                    .iter()
+                    .copied()
+                    .filter(|index| {
+                        session
+                            .project()
+                            .video_tracks
+                            .get(*index)
+                            .is_some_and(|track| track.muted != paint.muted)
+                    })
+                    .collect();
+                if !changed.is_empty() {
+                    report!(
+                        session,
+                        session.set_tracks_muted(TrackKind::Video, &changed, paint.muted)
+                    );
+                }
             }
-            if ui.button(solo_label).clicked() {
-                report!(session, session.toggle_track_solo(track));
+        } else if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            state.eye_paint = None;
+        }
+    }
+    let divider = top + lanes.row_top(lanes.video_count()) - 2.0;
+    ui.painter().rect_filled(
+        Rect::from_min_size(Pos2::new(area.min.x, divider), Vec2::new(HEADER_WIDTH, 4.0)),
+        0.0,
+        theme::ROW_DIVIDER,
+    );
+    let add_audio = Rect::from_min_size(
+        Pos2::new(
+            area.min.x + 3.0,
+            top + lanes.row_top(lanes.rows.len()) + 4.0,
+        ),
+        Vec2::new(42.0, 22.0),
+    );
+    if ui.is_rect_visible(add_audio)
+        && ui
+            .put(add_audio, egui::Button::new("+A"))
+            .on_hover_text("audio トラックを追加")
+            .clicked()
+    {
+        report!(session, session.add_track(TrackKind::Audio));
+    }
+}
+
+/// 表示・非表示の目玉。読み上げ・試験からは「V1 表示」「V1 非表示」で引ける。
+fn eye_button(ui: &mut egui::Ui, rect: Rect, name: &str, hidden: bool) -> egui::Response {
+    let response = ui.interact(
+        rect,
+        ui.id().with(("track_eye", name)),
+        Sense::click_and_drag(),
+    );
+    let label = if hidden {
+        format!("{name} 非表示")
+    } else {
+        format!("{name} 表示")
+    };
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
+    if response.hovered() {
+        ui.painter().rect_filled(rect, 3.0, theme::CONTROL_HOVER);
+    }
+    icons::paint_eye(
+        ui.painter(),
+        rect.shrink(2.0),
+        hidden,
+        if hidden {
+            theme::EYE_HIDDEN
+        } else {
+            theme::TEXT_ICON
+        },
+    );
+    response.on_hover_text(if hidden {
+        "トラックを表示 (ドラッグで連続切り替え)"
+    } else {
+        "トラックを非表示 (ドラッグで連続切り替え)"
+    })
+}
+
+/// ルーラー。押す・ドラッグで playhead を動かし、マーカーの近くを押したらマーカーを選ぶ。
+/// 右クリックでマーカーとイン・アウトを消せる。
+fn draw_ruler(
+    ui: &mut egui::Ui,
+    session: &mut Session,
+    state: &mut TimelineState,
+    rect: Rect,
+    origin_x: f32,
+    window: TimeWindow,
+    ppf: f32,
+) {
+    let response = ui
+        .interact(
+            rect,
+            ui.id().with("timeline_ruler"),
+            Sense::click_and_drag(),
+        )
+        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+    if let Some(pointer) = response.interact_pointer_pos() {
+        let frame = frame_at(pointer.x, origin_x, ppf);
+        if response.secondary_clicked() {
+            state.background_menu = Some((None, frame));
+        } else if response.clicked() || response.dragged() {
+            let markers = session.project().timeline_markers.clone();
+            let local = f64::from(pointer.x - origin_x);
+            let marker = response
+                .clicked()
+                .then(|| marker_near_ruler_x(local, f64::from(ppf), &markers, 8.0))
+                .flatten();
+            if let Some(marker) = marker {
+                session.select_marker(Some(marker));
+                session.set_scrubbing(false);
+            } else {
+                session.set_scrubbing(response.dragged());
+                session.seek(frame);
             }
         }
+    }
+    if response.drag_stopped() {
+        session.set_scrubbing(false);
+    }
+    response.context_menu(|ui| background_menu(ui, session, state));
+
+    let project = session.project();
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, theme::STRIP);
+    let x_of = |frame: i64| origin_x + frame as f32 * ppf;
+    let fps = project.timeline_fps;
+    let nominal = if fps.den > 0 { fps.num / fps.den } else { 1 }.max(1);
+    let step = ruler_step(ppf, nominal);
+    if step > 0 {
+        let mut tick = window.first.saturating_div(step).saturating_mul(step);
+        if tick < window.first {
+            tick = tick.saturating_add(step);
+        }
+        let font = egui::FontId::proportional(10.0);
+        while tick < window.last {
+            let x = x_of(tick);
+            painter.line_segment(
+                [Pos2::new(x, rect.max.y - 10.0), Pos2::new(x, rect.max.y)],
+                Stroke::new(1.0, theme::RULER_TICK),
+            );
+            painter.text(
+                Pos2::new(x + 4.0, rect.min.y + 1.0),
+                Align2::LEFT_TOP,
+                ruler_label(tick, nominal),
+                font.clone(),
+                theme::RULER_TEXT,
+            );
+            let next = tick.saturating_add(step);
+            if next <= tick {
+                break;
+            }
+            tick = next;
+        }
+    }
+    for mark in [project.in_frame, project.out_frame].into_iter().flatten() {
+        painter.line_segment(
+            [
+                Pos2::new(x_of(mark), rect.min.y),
+                Pos2::new(x_of(mark), rect.max.y),
+            ],
+            Stroke::new(1.0, theme::IN_OUT),
+        );
+    }
+    if let (Some(mark_in), Some(mark_out)) = (project.in_frame, project.out_frame)
+        && mark_out > mark_in
+    {
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(x_of(mark_in), rect.max.y - 4.0),
+                Pos2::new(x_of(mark_out).max(x_of(mark_in) + 1.0), rect.max.y),
+            ),
+            0.0,
+            theme::IN_OUT,
+        );
+    }
+    for frame in &project.timeline_markers {
+        let x = x_of(*frame);
+        let selected = session.selected_marker() == Some(*frame);
+        let points = vec![
+            Pos2::new(x - 4.0, rect.min.y + 2.0),
+            Pos2::new(x + 4.0, rect.min.y + 2.0),
+            Pos2::new(x + 4.0, rect.min.y + 10.0),
+            Pos2::new(x, rect.min.y + 15.0),
+            Pos2::new(x - 4.0, rect.min.y + 10.0),
+        ];
+        let stroke = if selected {
+            Stroke::new(1.5, Color32::WHITE)
+        } else {
+            Stroke::NONE
+        };
+        painter.add(egui::Shape::convex_polygon(points, theme::MARKER, stroke));
+    }
+    let head = x_of(session.playhead_frame());
+    painter.rect_filled(
+        Rect::from_min_size(Pos2::new(head - 6.0, rect.min.y), Vec2::new(12.0, 9.0)),
+        0.0,
+        theme::PLAYHEAD,
+    );
+    painter.line_segment(
+        [Pos2::new(head, rect.min.y), Pos2::new(head, rect.max.y)],
+        Stroke::new(2.0, theme::PLAYHEAD),
+    );
+}
+
+/// ルーラーの目盛りの文字。秒の区切りは「分:秒」、その間は「分:秒+frame」。
+fn ruler_label(frame: i64, nominal_fps: i64) -> String {
+    let nominal_fps = nominal_fps.max(1);
+    let seconds = frame / nominal_fps;
+    let rest = frame % nominal_fps;
+    let text = format!("{}:{:02}", seconds / 60, seconds % 60);
+    if rest == 0 {
+        text
+    } else {
+        format!("{text}+{rest}f")
     }
 }
 
@@ -200,42 +830,44 @@ fn draw_contents(
     ui: &mut egui::Ui,
     session: &mut Session,
     state: &mut TimelineState,
-    rows: &[(TrackKind, usize, String)],
-    content_width: f32,
+    lanes: &Lanes,
+    size: Vec2,
     window: TimeWindow,
     ppf: f32,
 ) {
-    let lanes = rows.len() + usize::from(session.project().subtitles.is_some());
-    let height = RULER_HEIGHT + lanes as f32 * ROW_HEIGHT;
-    let (rect, response) = ui.allocate_exact_size(
-        Vec2::new(content_width, height.max(1.0)),
-        Sense::click_and_drag(),
-    );
-    background(ui, session, &response, rect, ppf);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+    background(ui, session, state, &response, rect, ppf);
     if response.secondary_clicked()
         && let Some(pointer) = response.interact_pointer_pos()
     {
         let frame = frame_at(pointer.x, rect.min.x, ppf);
-        let track = drop_target(pointer, rect, rows, ppf).map(|(track, _)| track);
+        let track = drop_target(pointer, rect, lanes, ppf).map(|(track, _)| track);
         state.background_menu = Some((track, frame));
     }
     response.context_menu(|ui| background_menu(ui, session, state));
 
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, Color32::from_rgb(22, 24, 28));
-    draw_ruler(ui, session, rect, window, ppf);
-
+    painter.rect_filled(rect, 0.0, theme::STRIP);
     let mut interval_failed = false;
     let mut visible = Vec::new();
-    for (row_index, (kind, track_index, _)) in rows.iter().enumerate() {
-        let y = rect.min.y + RULER_HEIGHT + row_index as f32 * ROW_HEIGHT;
+    for (row_index, (kind, track_index, _)) in lanes.rows.iter().enumerate() {
+        let y = rect.min.y + lanes.row_top(row_index);
         let row_rect = Rect::from_min_size(
             Pos2::new(rect.min.x, y),
             Vec2::new(rect.width(), ROW_HEIGHT),
         );
-        if row_index % 2 == 0 {
-            painter.rect_filled(row_rect, 0.0, Color32::from_rgb(30, 32, 36));
-        }
+        let fill = match kind {
+            TrackKind::Video if row_index % 2 == 0 => theme::VIDEO_ROW,
+            TrackKind::Video => theme::VIDEO_ROW_ALT,
+            TrackKind::Audio => theme::AUDIO_ROW,
+        };
+        painter.rect(
+            row_rect,
+            0.0,
+            fill,
+            Stroke::new(1.0, theme::ROW_BORDER),
+            egui::StrokeKind::Inside,
+        );
         for clip in &session.project().timeline_clips {
             if clip.track.kind != *kind || clip.track.index != *track_index {
                 continue;
@@ -245,6 +877,8 @@ fn draw_contents(
                     visible.push(VisibleClip {
                         id: clip.id.clone(),
                         name: clip.name.clone(),
+                        detail: clip_detail(clip, end - start),
+                        enabled: clip.enabled,
                         kind: clip.track.kind,
                         track_index: clip.track.index,
                         y,
@@ -257,25 +891,63 @@ fn draw_contents(
             }
         }
     }
-    for clip in visible {
-        draw_clip(ui, session, state, &clip, rect.min.x, ppf, rows);
+    painter.rect_filled(
+        Rect::from_min_size(
+            Pos2::new(
+                rect.min.x,
+                rect.min.y + lanes.row_top(lanes.video_count()) - 2.0,
+            ),
+            Vec2::new(rect.width(), 4.0),
+        ),
+        0.0,
+        theme::ROW_DIVIDER,
+    );
+    let project = session.project();
+    if let (Some(mark_in), Some(mark_out)) = (project.in_frame, project.out_frame)
+        && mark_out > mark_in
+    {
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(rect.min.x + mark_in as f32 * ppf, rect.min.y),
+                Pos2::new(rect.min.x + mark_out as f32 * ppf, rect.max.y),
+            ),
+            0.0,
+            Color32::from_white_alpha(18),
+        );
     }
-    if session.project().subtitles.is_some() {
-        let y = rect.min.y + RULER_HEIGHT + rows.len() as f32 * ROW_HEIGHT;
+    for clip in visible {
+        draw_clip(ui, session, state, &clip, rect.min.x, ppf, &lanes.rows);
+    }
+    if lanes.subtitles.is_some() {
         let lane = Rect::from_min_size(
-            Pos2::new(rect.min.x, y),
+            Pos2::new(rect.min.x, rect.min.y + lanes.subtitle_top()),
             Vec2::new(rect.width(), ROW_HEIGHT),
         );
         subtitle_lane::draw(ui, session, &mut state.subtitle_gesture, lane, window, ppf);
     }
     draw_playhead(ui, rect, session.playhead_frame(), ppf);
-    receive_media(ui, session, rect, rows, ppf);
+    receive_media(ui, session, rect, lanes, ppf);
     if interval_failed {
         ui.label("区間を計算できない clip があります");
     }
 }
 
-/// clip の右クリック。選択中の clip に対して働く（右クリックした clip が選択に無ければ、それだけを選ぶ）。
+/// clip の 2 行目。速度を変えていればその割合と、素材の fps・長さ。
+fn clip_detail(clip: &mvm_project::TimelineClip, frames: i64) -> String {
+    let speed = clip.speed;
+    let speed = if speed.is_positive() && speed.num != speed.den {
+        format!(
+            "{}%  |  ",
+            (speed.num as f64 / speed.den as f64 * 10_000.0).round() / 100.0
+        )
+    } else {
+        String::new()
+    };
+    let fps = clip.source_fps;
+    format!("{speed}{}/{} fps  |  {frames}f", fps.num, fps.den)
+}
+
+// clip の右クリック。選択中の clip に対して働く（右クリックした clip が選択に無ければ、それだけを選ぶ）。
 fn clip_menu(ui: &mut egui::Ui, session: &mut Session, state: &mut TimelineState, id: &str) {
     let Some(clip) = session.project().clip(id).cloned() else {
         return;
@@ -394,22 +1066,13 @@ fn background_menu(ui: &mut egui::Ui, session: &mut Session, state: &mut Timelin
     }
 }
 
-/// track の行の上の位置を、置き先の track と frame にする。ruler・字幕の行・外側は `None`。
-fn drop_target(
-    pointer: Pos2,
-    rect: Rect,
-    rows: &[(TrackKind, usize, String)],
-    ppf: f32,
-) -> Option<(TrackRef, i64)> {
+/// track の行の上の位置を、置き先の track と frame にする。字幕の行・外側は `None`。
+fn drop_target(pointer: Pos2, rect: Rect, lanes: &Lanes, ppf: f32) -> Option<(TrackRef, i64)> {
     if !rect.contains(pointer) {
         return None;
     }
-    let local = pointer.y - rect.min.y - RULER_HEIGHT;
-    if local < 0.0 {
-        return None;
-    }
-    let row = (local / ROW_HEIGHT) as usize;
-    let (kind, index, _) = rows.get(row)?;
+    let row = lanes.row_at(pointer.y - rect.min.y)?;
+    let (kind, index, _) = lanes.rows.get(row)?;
     Some((
         TrackRef::new(*kind, *index),
         frame_at(pointer.x, rect.min.x, ppf),
@@ -418,31 +1081,26 @@ fn drop_target(
 
 /// プロジェクトパネルからのドラッグを受ける。ドラッグ中は置く位置を枠で見せる。
 /// OS から落とされたファイルは受けない（ドラッグ中の pointer の位置が届かず、置く行を確かめられないため）。
-fn receive_media(
-    ui: &mut egui::Ui,
-    session: &mut Session,
-    rect: Rect,
-    rows: &[(TrackKind, usize, String)],
-    ppf: f32,
-) {
+fn receive_media(ui: &mut egui::Ui, session: &mut Session, rect: Rect, lanes: &Lanes, ppf: f32) {
     if !egui::DragAndDrop::has_payload_of_type::<MediaDrag>(ui.ctx()) {
         return;
     }
     let pointer = ui.input(|input| input.pointer.latest_pos());
-    let target = pointer.and_then(|pointer| drop_target(pointer, rect, rows, ppf));
+    let target = pointer.and_then(|pointer| drop_target(pointer, rect, lanes, ppf));
     let Some((track, frame)) = target else {
         return;
     };
-    let row = rows
+    let row = lanes
+        .rows
         .iter()
         .position(|(kind, index, _)| *kind == track.kind && *index == track.index)
         .unwrap_or_default();
     let x = rect.min.x + frame as f32 * ppf;
-    let y = rect.min.y + RULER_HEIGHT + row as f32 * ROW_HEIGHT;
+    let y = rect.min.y + lanes.row_top(row);
     ui.painter().rect_stroke(
         Rect::from_min_size(Pos2::new(x, y + 2.0), Vec2::new(48.0, ROW_HEIGHT - 4.0)),
         3.0,
-        Stroke::new(2.0, Color32::from_rgb(98, 182, 255)),
+        Stroke::new(2.0, theme::SELECTED_BORDER),
         egui::StrokeKind::Inside,
     );
     if ui.input(|input| input.pointer.any_released())
@@ -455,18 +1113,22 @@ fn receive_media(
 fn background(
     ui: &mut egui::Ui,
     session: &mut Session,
+    state: &mut TimelineState,
     response: &egui::Response,
     rect: Rect,
     ppf: f32,
 ) {
     let tool = session.tool();
     if tool == TimelineTool::Hand && response.dragged() {
-        ui.scroll_with_delta(Vec2::new(-response.drag_delta().x, 0.0));
+        ui.scroll_with_delta(response.drag_delta());
         return;
     }
     if tool == TimelineTool::Zoom && response.clicked() {
         let alt = ui.input(|input| input.modifiers.alt);
-        session.zoom_by(if alt { 0.5 } else { 2.0 });
+        let anchor = response
+            .interact_pointer_pos()
+            .map_or(0.0, |pointer| pointer.x - ui.clip_rect().min.x);
+        zoom_at(session, state, if alt { -1 } else { 1 }, anchor);
         return;
     }
     if matches!(
@@ -488,15 +1150,6 @@ fn background(
         return;
     }
     let frame = frame_at(pointer.x, rect.min.x, ppf);
-    if pointer.y - rect.min.y < RULER_HEIGHT {
-        let markers = session.project().timeline_markers.clone();
-        let local = f64::from(pointer.x - rect.min.x);
-        if let Some(marker) = marker_near_ruler_x(local, f64::from(ppf), &markers, 8.0) {
-            session.select_marker(Some(marker));
-            session.set_scrubbing(false);
-            return;
-        }
-    }
     if tool == TimelineTool::Razor && response.clicked() && ui.input(|input| input.modifiers.shift)
     {
         let ids = clip_ids_spanning_frame(session.project(), frame);
@@ -511,60 +1164,11 @@ fn background(
     }
 }
 
-fn draw_ruler(ui: &mut egui::Ui, session: &Session, rect: Rect, window: TimeWindow, ppf: f32) {
-    let project = session.project();
-    let painter = ui.painter_at(rect);
-    let ruler = Rect::from_min_size(rect.min, Vec2::new(rect.width(), RULER_HEIGHT));
-    painter.rect_filled(ruler, 0.0, Color32::from_rgb(28, 30, 34));
-    for frame in &project.timeline_markers {
-        let x = rect.min.x + *frame as f32 * ppf;
-        let selected = session.selected_marker() == Some(*frame);
-        painter.circle_filled(
-            Pos2::new(x, ruler.center().y),
-            4.0,
-            if selected {
-                Color32::from_rgb(240, 200, 80)
-            } else {
-                Color32::from_rgb(180, 150, 60)
-            },
-        );
-    }
-    let fps = project.timeline_fps;
-    let nominal = if fps.den > 0 { fps.num / fps.den } else { 1 };
-    let step = ruler_step(ppf, nominal.max(1));
-    if step <= 0 {
-        return;
-    }
-    let mut tick = window.first.saturating_div(step).saturating_mul(step);
-    if tick < window.first {
-        tick = tick.saturating_add(step);
-    }
-    let font = egui::TextStyle::Small.resolve(ui.style());
-    while tick < window.last {
-        let x = rect.min.x + tick as f32 * ppf;
-        painter.line_segment(
-            [Pos2::new(x, ruler.max.y - 8.0), Pos2::new(x, ruler.max.y)],
-            Stroke::new(1.0, Color32::from_rgb(140, 144, 150)),
-        );
-        let label = format_timecode(tick, fps.num, fps.den).unwrap_or_else(|| tick.to_string());
-        painter.text(
-            Pos2::new(x + 2.0, ruler.min.y + 2.0),
-            Align2::LEFT_TOP,
-            label,
-            font.clone(),
-            Color32::from_rgb(180, 184, 190),
-        );
-        let next = tick.saturating_add(step);
-        if next <= tick {
-            break;
-        }
-        tick = next;
-    }
-}
-
 struct VisibleClip {
     id: String,
     name: String,
+    detail: String,
+    enabled: bool,
     kind: TrackKind,
     track_index: usize,
     y: f32,
@@ -584,21 +1188,17 @@ fn draw_clip(
     let x = origin_x + clip.start as f32 * ppf;
     let width = ((clip.end - clip.start) as f32 * ppf).max(2.0);
     let rect = Rect::from_min_size(
-        Pos2::new(x, clip.y + 4.0),
-        Vec2::new(width, ROW_HEIGHT - 8.0),
+        Pos2::new(x, clip.y + CLIP_INSET),
+        Vec2::new(width, ROW_HEIGHT - 2.0 * CLIP_INSET),
     );
     let selected = session.selection().iter().any(|id| id == &clip.id);
-    ui.painter()
-        .rect_filled(rect, 3.0, clip_color(clip.kind, selected));
-    if clip.kind == TrackKind::Audio {
-        draw_waveform(ui, session, &clip.id, rect, ppf);
-    }
-    let response = ui.put(
+    let response = ui.interact(
         rect,
-        Label::new(clip.name.as_str())
-            .truncate()
-            .sense(Sense::click_and_drag()),
+        ui.id().with(("timeline_clip", &clip.id)),
+        Sense::click_and_drag(),
     );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &clip.name));
+    paint_clip(ui, session, clip, rect, selected, ppf);
     if response.secondary_clicked() && !selected {
         session.select_only(clip.id.clone());
     }
@@ -615,7 +1215,7 @@ fn draw_clip(
         };
         ui.painter().line_segment(
             [Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)],
-            Stroke::new(3.0, Color32::from_rgb(240, 200, 80)),
+            Stroke::new(3.0, theme::KEY_LINE),
         );
     }
     if let Some(active) = gesture
@@ -649,8 +1249,87 @@ fn draw_clip(
     }
 }
 
+/// clip の本体。無効にした clip は timeline に残したまま暗くする。
+fn paint_clip(
+    ui: &egui::Ui,
+    session: &mut Session,
+    clip: &VisibleClip,
+    rect: Rect,
+    selected: bool,
+    ppf: f32,
+) {
+    let opacity = if clip.enabled { 1.0 } else { 0.4 };
+    let fill = if selected {
+        theme::SELECTED
+    } else if clip.kind == TrackKind::Audio {
+        theme::CLIP_AUDIO
+    } else {
+        theme::CLIP_VIDEO
+    };
+    ui.painter().rect(
+        rect,
+        3.0,
+        fill.gamma_multiply(opacity),
+        Stroke::new(1.0, theme::SELECTED_BORDER.gamma_multiply(opacity)),
+        egui::StrokeKind::Inside,
+    );
+    if clip.kind == TrackKind::Audio {
+        draw_waveform(ui, session, &clip.id, rect, ppf, selected);
+    }
+    let tool = session.tool();
+    if edge_tool(tool) && rect.width() >= 24.0 {
+        let color = edge_handle_color(tool).gamma_multiply(opacity);
+        let handle = Vec2::new(EDGE_PIXELS, rect.height());
+        ui.painter()
+            .rect_filled(Rect::from_min_size(rect.min, handle), 2.0, color);
+        ui.painter().rect_filled(
+            Rect::from_min_size(Pos2::new(rect.max.x - EDGE_PIXELS, rect.min.y), handle),
+            2.0,
+            color,
+        );
+    }
+    if rect.width() < 40.0 {
+        return;
+    }
+    let text = ui.painter_at(rect.shrink2(Vec2::new(12.0, 0.0)));
+    let origin = rect.min + Vec2::new(12.0, 5.0);
+    text.text(
+        origin,
+        Align2::LEFT_TOP,
+        &clip.name,
+        egui::FontId::proportional(12.0),
+        Color32::WHITE.gamma_multiply(opacity),
+    );
+    if clip.kind != TrackKind::Audio {
+        text.text(
+            origin + Vec2::new(0.0, 17.0),
+            Align2::LEFT_TOP,
+            &clip.detail,
+            egui::FontId::proportional(10.0),
+            theme::CLIP_DETAIL.gamma_multiply(opacity),
+        );
+    }
+}
+
+/// 端のハンドルの色。ツールごとに端の操作が違うことを色で見せる。
+fn edge_handle_color(tool: TimelineTool) -> Color32 {
+    match tool {
+        TimelineTool::Ripple => Color32::from_rgb(0xe8, 0xc1, 0x5a),
+        TimelineTool::Rolling => Color32::from_rgb(0xe2, 0x7d, 0x6a),
+        TimelineTool::Rate => Color32::from_rgb(0xb9, 0x9a, 0xf0),
+        _ => Color32::from_rgb(0x85, 0xc4, 0xee),
+    }
+}
+
 /// 音声 clip の波形。見えている列だけを 2 pixel ごとに描く。素材の時刻は clip の素材 in と速度から求める。
-fn draw_waveform(ui: &egui::Ui, session: &mut Session, clip_id: &str, rect: Rect, ppf: f32) {
+fn draw_waveform(
+    ui: &egui::Ui,
+    session: &mut Session,
+    clip_id: &str,
+    rect: Rect,
+    ppf: f32,
+    selected: bool,
+) {
     let Some(clip) = session.project().clip(clip_id) else {
         return;
     };
@@ -671,7 +1350,11 @@ fn draw_waveform(ui: &egui::Ui, session: &mut Session, clip_id: &str, rect: Rect
         return;
     }
     let painter = ui.painter_at(rect);
-    let color = Color32::from_rgba_unmultiplied(170, 220, 190, 150);
+    let color = if selected {
+        theme::WAVEFORM_SELECTED
+    } else {
+        theme::WAVEFORM
+    };
     let middle = rect.center().y;
     let half = rect.height() / 2.0 - 2.0;
     let mut x = visible.min.x.floor();
@@ -706,7 +1389,7 @@ fn draw_ghost(ui: &egui::Ui, active: &TimelineGesture, rect: Rect) {
     let delta = active.pointer - active.origin;
     let ghost = if active.pen.is_some() {
         ui.painter()
-            .circle_filled(active.pointer, 4.0, Color32::from_rgb(240, 200, 80));
+            .circle_filled(active.pointer, 4.0, theme::KEY_LINE);
         return;
     } else if let Some(edge) = active.edge {
         match edge {
@@ -737,17 +1420,22 @@ fn draw_transitions(ui: &egui::Ui, session: &Session, clip: &VisibleClip, origin
         let first = clip.end.saturating_sub(transition.frames_before_cut);
         let last = clip.end.saturating_add(transition.frames_after_cut);
         let band = Rect::from_min_max(
-            Pos2::new(origin_x + first as f32 * ppf, clip.y + 4.0),
-            Pos2::new(origin_x + last as f32 * ppf, clip.y + ROW_HEIGHT - 4.0),
+            Pos2::new(origin_x + first as f32 * ppf, clip.y + CLIP_INSET),
+            Pos2::new(
+                origin_x + last as f32 * ppf,
+                clip.y + ROW_HEIGHT - CLIP_INSET,
+            ),
         );
-        ui.painter().rect_filled(
+        ui.painter().rect(
             band,
-            3.0,
-            Color32::from_rgba_unmultiplied(200, 170, 230, 70),
+            2.0,
+            Color32::from_rgba_unmultiplied(0xb5, 0x8a, 0x43, 110),
+            Stroke::new(1.0, Color32::from_rgb(0xb5, 0x8a, 0x43)),
+            egui::StrokeKind::Inside,
         );
         ui.painter().line_segment(
-            [band.left_top(), band.right_bottom()],
-            Stroke::new(1.0, Color32::from_rgb(200, 170, 230)),
+            [band.left_bottom(), band.right_top()],
+            Stroke::new(1.0, Color32::from_rgb(0xf0, 0xc3, 0x6a)),
         );
     }
 }
@@ -759,9 +1447,6 @@ fn draw_keys(ui: &egui::Ui, session: &Session, clip: &VisibleClip, rect: Rect, p
     };
     let kind = key_kind(item);
     let stored = item.effects.keys(kind);
-    if stored.is_empty() && session.tool() != TimelineTool::Pen {
-        return;
-    }
     let keys: Vec<PenKey> = stored
         .iter()
         .map(|key| PenKey {
@@ -780,13 +1465,21 @@ fn draw_keys(ui: &egui::Ui, session: &Session, clip: &VisibleClip, rect: Rect, p
             .iter()
             .map(|point| to_screen(point.x, point.y))
             .collect();
-    let color = Color32::from_rgb(240, 200, 80);
+    // 暗い縁取りで、明るい波形の上でも読めるようにする。
+    ui.painter().add(egui::Shape::line(
+        line.clone(),
+        Stroke::new(4.0, Color32::from_black_alpha(166)),
+    ));
     ui.painter()
-        .add(egui::Shape::line(line, Stroke::new(1.0, color)));
+        .add(egui::Shape::line(line, Stroke::new(2.0, theme::KEY_LINE)));
     for key in pen_visible_keys(&keys, &geometry, left, right) {
         let x = key.frame as f64 * geometry.pixels_per_frame;
         let y = mvm_project::timeline::pen_y(&geometry, key.value);
-        ui.painter().circle_filled(to_screen(x, y), 3.0, color);
+        ui.painter().rect_filled(
+            Rect::from_center_size(to_screen(x, y), Vec2::splat(8.0)),
+            0.0,
+            Color32::from_rgb(0x3d, 0x8b, 0xff),
+        );
     }
 }
 
@@ -867,7 +1560,7 @@ fn begin_pen(
         .collect();
     let local_x = f64::from(pointer.x - rect.min.x);
     let local_y = f64::from(pointer.y - rect.min.y);
-    let frame = (local_x / f64::from(ppf.max(0.25))).floor() as i64;
+    let frame = (local_x / f64::from(ppf.max(MIN_PIXELS_PER_FRAME))).floor() as i64;
     let press = pen_press(
         &keys,
         item.effects.base(kind),
@@ -1030,7 +1723,7 @@ fn commit_pen(
     let geometry = pen_geometry(&rect, ppf, kind);
     let x = f64::from(gesture.pointer.x - rect.min.x) + grab_offset_x;
     let y = f64::from(gesture.pointer.y - rect.min.y) + grab_offset_y;
-    let frame = (x / f64::from(ppf.max(0.25))).round() as i64;
+    let frame = (x / f64::from(ppf.max(MIN_PIXELS_PER_FRAME))).round() as i64;
     let value = pen_snap_value(pen_value_at(&geometry, y), mods);
     if let Some(release) = pen_release(pen, frame, value) {
         report!(
@@ -1217,17 +1910,8 @@ fn draw_playhead(ui: &mut egui::Ui, rect: Rect, frame: i64, ppf: f32) {
     let x = rect.min.x + frame as f32 * ppf;
     ui.painter().line_segment(
         [Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)],
-        Stroke::new(1.5, Color32::from_rgb(230, 90, 90)),
+        Stroke::new(2.0, theme::PLAYHEAD),
     );
-}
-
-fn clip_color(kind: TrackKind, selected: bool) -> Color32 {
-    match (kind, selected) {
-        (TrackKind::Video, false) => Color32::from_rgb(58, 92, 140),
-        (TrackKind::Video, true) => Color32::from_rgb(96, 140, 196),
-        (TrackKind::Audio, false) => Color32::from_rgb(46, 110, 86),
-        (TrackKind::Audio, true) => Color32::from_rgb(78, 158, 124),
-    }
 }
 
 fn track_rows(project: &Project) -> Vec<(TrackKind, usize, String)> {
@@ -1243,12 +1927,72 @@ fn track_rows(project: &Project) -> Vec<(TrackKind, usize, String)> {
 
 fn frame_at(x: f32, origin: f32, pixels_per_frame: f32) -> i64 {
     let local = f64::from((x - origin).max(0.0));
-    let frame = local / f64::from(pixels_per_frame.max(0.25));
+    let frame = local / f64::from(pixels_per_frame.max(MIN_PIXELS_PER_FRAME));
     if !frame.is_finite() || frame <= 0.0 {
         0
     } else if frame >= i64::MAX as f64 {
         i64::MAX
     } else {
         frame.floor() as i64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eye_paint_sets_every_passed_track_to_the_opposite_of_the_pressed_one() {
+        // V3 を押す（今は表示）→ 非表示で塗る。V1 まで一気に動いても V2 を飛ばさない。
+        let mut paint = EyePaint::begin(2, false);
+        assert!(paint.muted);
+        paint.reach(0);
+        assert_eq!(paint.painted, [2, 0, 1]);
+        assert!(paint.shown_muted(1, false));
+        // 通っていない track は今の表示のまま。
+        assert!(!paint.shown_muted(3, false));
+        paint.reach(2);
+        assert_eq!(paint.painted.len(), 3, "同じ track を 2 回足しました");
+    }
+
+    #[test]
+    fn the_eye_row_under_the_pointer_counts_from_the_top_video_track() {
+        // 行は上から V3・V2・V1。範囲の外は端の track。
+        assert_eq!(video_index_at(10.0, 3), Some(2));
+        assert_eq!(video_index_at(ROW_HEIGHT * 2.0 + 1.0, 3), Some(0));
+        assert_eq!(video_index_at(-40.0, 3), Some(2));
+        assert_eq!(video_index_at(ROW_HEIGHT * 9.0, 3), Some(0));
+        assert_eq!(video_index_at(10.0, 0), None);
+    }
+
+    #[test]
+    fn the_ruler_shows_minutes_and_seconds_and_frames_between_them() {
+        assert_eq!(ruler_label(0, 60), "0:00");
+        assert_eq!(ruler_label(120, 60), "0:02");
+        assert_eq!(ruler_label(3_660, 60), "1:01");
+        assert_eq!(ruler_label(75, 60), "0:01+15f");
+        // fps が 0 でも割らない。
+        assert_eq!(ruler_label(5, 0), "0:05");
+    }
+
+    #[test]
+    fn lanes_put_the_subtitles_above_the_tracks() {
+        let mut project = Project::default();
+        let without = Lanes::new(&project);
+        assert_eq!(without.tracks_top(), 28.0);
+        // 既定は V2・V1・A1 の 3 行。行の外（+V の行・+A の余白）は track ではない。
+        assert_eq!(without.row_at(27.0), None);
+        assert_eq!(without.row_at(28.0), Some(0));
+        assert_eq!(without.row_at(28.0 + 54.0 * 2.0 + 1.0), Some(2));
+        assert_eq!(without.row_at(28.0 + 54.0 * 3.0 + 1.0), None);
+        assert_eq!(without.video_count(), 2);
+
+        project.subtitles = Some(mvm_project::SubtitleTrack::default());
+        let with = Lanes::new(&project);
+        assert_eq!(with.subtitle_top(), 28.0);
+        assert_eq!(with.tracks_top(), 82.0);
+        assert_eq!(with.row_at(60.0), None, "字幕の行を track として扱いました");
+        assert_eq!(with.row_at(82.0), Some(0));
+        assert_eq!(with.height(), 82.0 + 54.0 * 3.0 + 34.0);
     }
 }

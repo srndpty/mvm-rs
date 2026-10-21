@@ -62,6 +62,55 @@ pub fn active_clips_at(
         .collect()
 }
 
+/// 一番上の video track で `timeline_frame` に掛かる有効な clip（preview で見えている clip）の index。
+/// 非表示の track の clip は preview に出ないので選ばない（preview の合成と同じ判定）。
+pub fn top_video_clip_at(project: &Project, timeline_frame: i64) -> Option<usize> {
+    active_clips_at(project, TrackKind::Video, timeline_frame)
+        .into_iter()
+        .rev()
+        .flatten()
+        .find(|index| {
+            let clip = &project.timeline_clips[*index];
+            clip.enabled && project.is_track_output_enabled(clip.track)
+        })
+}
+
+/// 文字のテロップ位置の左右の余白（画面幅の割合）と、下からの高さ（画面高の割合）。決め打ちの値で、
+/// 安全域の規格から導いたものではない（C++ 版と同じ）。
+const TEXT_PRESET_SIDE_RATIO: f64 = 0.05;
+const TEXT_PRESET_BOTTOM_RATIO: f64 = 0.15;
+
+/// 文字 block（幅・高さ、画素）を、画面の下から 15% の高さの左・中央・右へ置く左上の座標。
+/// 画面より大きな文字は左上を画面内に留める。
+pub fn text_preset_position(
+    block_width: f64,
+    block_height: f64,
+    output_width: i32,
+    output_height: i32,
+    alignment: &str,
+) -> ProjectResult<(i32, i32)> {
+    if output_width <= 0 || output_height <= 0 {
+        return fail("出力の寸法が不正です");
+    }
+    if !block_width.is_finite()
+        || !block_height.is_finite()
+        || block_width < 0.0
+        || block_height < 0.0
+    {
+        return fail("文字の大きさが不正です");
+    }
+    let width = f64::from(output_width);
+    let side = width * TEXT_PRESET_SIDE_RATIO;
+    let x = match alignment {
+        "left" => side,
+        "center" => (width - block_width) / 2.0,
+        "right" => width - side - block_width,
+        other => return fail(format!("未知の揃えです: {other}")),
+    };
+    let y = f64::from(output_height) * (1.0 - TEXT_PRESET_BOTTOM_RATIO) - block_height;
+    Ok((x.round().max(0.0) as i32, y.round().max(0.0) as i32))
+}
+
 /// track の [start, end) を上書きする。keep の clip（上に置く clip）は触らない。
 /// 丸ごと覆われた clip は消し（リンク相手は未リンクにする）、端が掛かれば削り、中に置けば 2 つに分ける。
 fn overwrite_track_range(

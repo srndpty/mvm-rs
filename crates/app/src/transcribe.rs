@@ -213,9 +213,7 @@ impl Session {
         else {
             return Err(AppError::new("直す候補がありません"));
         };
-        if end <= start || start < 0 || content.trim().is_empty() {
-            return Err(AppError::new("候補の区間または本文が不正です"));
-        }
+        check_candidate(start, end, content)?;
         cue.start_frame = start;
         cue.end_frame = end;
         cue.content = content.to_owned();
@@ -234,11 +232,22 @@ impl Session {
         self.background.transcription_result = None;
     }
 
-    /// 候補を字幕へ置換または追加する（1 回の undo）。認識の後の編集・素材の差し替えは拒否する。
-    pub fn apply_transcription(&mut self, replace: bool) -> Result<(), AppError> {
+    /// 画面で直した候補を字幕へ置換または追加する（1 回の undo）。`edits` は候補と同じ数・同じ並びで、
+    /// 画面の欄の値そのもの。1 行でも不正なら何も適用せず、候補もそのまま残す。認識の後の編集・素材の
+    /// 差し替えも拒否する。
+    pub fn apply_transcription(
+        &mut self,
+        edits: &[CandidateEdit],
+        replace: bool,
+    ) -> Result<(), AppError> {
         let Some(outcome) = self.background.transcription_result.as_ref() else {
             return Err(AppError::new("適用する文字起こしの結果がありません"));
         };
+        if edits.len() != outcome.cues.len() {
+            return Err(AppError::new(
+                "画面の候補と認識結果の数が合いません。候補を開き直してください",
+            ));
+        }
         if outcome.base_revision != self.edit_revision {
             return Err(AppError::new(
                 "文字起こしの後に Project が変わりました。もう一度認識してください",
@@ -252,21 +261,89 @@ impl Session {
         if outcome.cues.is_empty() {
             return Err(AppError::new("適用する候補がありません"));
         }
+        for (index, edit) in edits.iter().enumerate() {
+            check_candidate(edit.start, edit.end, &edit.content).map_err(|error| {
+                AppError::new(format!("{} 行目: {}", index + 1, error.message()))
+            })?;
+        }
+        check_candidate_overlaps(edits)?;
+        if !replace {
+            let existing = self
+                .project
+                .subtitles
+                .iter()
+                .flat_map(|track| track.cues.iter());
+            for cue in existing {
+                if let Some(index) = edits
+                    .iter()
+                    .position(|edit| edit.start < cue.end_frame && cue.start_frame < edit.end)
+                {
+                    return Err(AppError::new(format!(
+                        "{} 行目: 既にある字幕（{}–{} フレーム）と重なります",
+                        index + 1,
+                        cue.start_frame,
+                        cue.end_frame
+                    )));
+                }
+            }
+        }
         // 候補の仮の ID を、今の Project で一意な ID に置き換える。
         let mut factory = self.id_factory();
         let cues: Vec<SubtitleCue> = outcome
             .cues
             .iter()
-            .map(|cue| SubtitleCue {
+            .zip(edits)
+            .map(|(cue, edit)| SubtitleCue {
                 id: factory.next(),
+                start_frame: edit.start,
+                end_frame: edit.end,
+                content: edit.content.clone(),
                 ..cue.clone()
             })
             .collect();
-        self.id_serial = factory.serial;
         self.transact(move |project| apply_subtitle_cues(project, cues, replace).map(|()| None))?;
+        // 発行した ID は適用できたときだけ使ったことにする。
+        self.id_serial = factory.serial;
         self.background.transcription_result = None;
         Ok(())
     }
+}
+
+/// 画面で直した候補の 1 行。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CandidateEdit {
+    pub start: i64,
+    pub end: i64,
+    pub content: String,
+}
+
+fn check_candidate(start: i64, end: i64, content: &str) -> Result<(), AppError> {
+    if start < 0 || end <= start {
+        return Err(AppError::new(
+            "候補の区間が不正です（開始は 0 以上、終了は開始より後）",
+        ));
+    }
+    if content.trim().is_empty() {
+        return Err(AppError::new("候補の本文が空です"));
+    }
+    Ok(())
+}
+
+/// 候補どうしの重なりを、画面の行番号で示して拒否する。行の並びは時刻順とは限らないので、元の行番号を
+/// 持ったまま開始で並べ、隣どうしを比べる（どこかが重なっていれば、並べた隣どうしのどこかが重なる）。
+fn check_candidate_overlaps(edits: &[CandidateEdit]) -> Result<(), AppError> {
+    let mut order: Vec<usize> = (0..edits.len()).collect();
+    order.sort_by_key(|index| (edits[*index].start, edits[*index].end));
+    for pair in order.windows(2) {
+        let (earlier, later) = (&edits[pair[0]], &edits[pair[1]]);
+        if later.start < earlier.end {
+            let (first, second) = (pair[0].min(pair[1]) + 1, pair[0].max(pair[1]) + 1);
+            return Err(AppError::new(format!(
+                "{first} 行目と {second} 行目の区間が重なっています"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -569,6 +646,176 @@ mod tests {
         assert!(parse_whisper_json(&english_only, 7850, "en").is_ok());
     }
 
+    /// 候補をそのまま画面の値にしたもの。
+    fn edits_of(session: &Session) -> Vec<CandidateEdit> {
+        session
+            .transcription_candidates()
+            .unwrap_or_default()
+            .iter()
+            .map(|cue| CandidateEdit {
+                start: cue.start_frame,
+                end: cue.end_frame,
+                content: cue.content.clone(),
+            })
+            .collect()
+    }
+
+    fn edit(start: i64, end: i64, content: &str) -> CandidateEdit {
+        CandidateEdit {
+            start,
+            end,
+            content: content.to_owned(),
+        }
+    }
+
+    /// 2 行の候補を持つ Session。素材は確かめられるよう実在の file にする。
+    fn two_candidates(name: &str) -> (Session, PathBuf) {
+        let directory = std::env::temp_dir().join(format!("mvm-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let media = directory.join("voice.wav");
+        std::fs::write(&media, b"voice").unwrap();
+        let mut session = Session::from_project(Project::default());
+        let cue = |id: &str, start, end, content: &str| SubtitleCue {
+            id: id.to_owned(),
+            start_frame: start,
+            end_frame: end,
+            content: content.to_owned(),
+            link_clip_id: String::new(),
+        };
+        session.background.transcription_result = Some(TranscriptionOutcome {
+            cues: vec![
+                cue("candidate-1", 0, 30, "誤認識"),
+                cue("candidate-2", 40, 70, "二行目"),
+            ],
+            base_revision: session.edit_revision,
+            media: media.clone(),
+            media_probe: probe_file(&media),
+        });
+        (session, directory)
+    }
+
+    #[test]
+    fn applying_uses_the_values_on_screen_even_without_the_row_update() {
+        let (mut session, directory) = two_candidates("transcribe-screen");
+        // 1 行目は本文と区間を直し、行の「更新」は押していない（Session の候補は元のまま）。
+        let edits = [edit(5, 35, "直した本文"), edit(40, 70, "二行目")];
+        session.apply_transcription(&edits, true).unwrap();
+        let cues = &session.project().subtitles.as_ref().unwrap().cues;
+        let applied: Vec<(i64, i64, &str)> = cues
+            .iter()
+            .map(|cue| (cue.start_frame, cue.end_frame, cue.content.as_str()))
+            .collect();
+        assert_eq!(applied, [(5, 35, "直した本文"), (40, 70, "二行目")]);
+        assert!(session.transcription_candidates().is_none());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn one_bad_row_applies_nothing_and_keeps_the_candidates() {
+        let (mut session, directory) = two_candidates("transcribe-bad");
+        let original = edits_of(&session);
+        let refused = [
+            // 2 行目の終了が開始より前。
+            (
+                vec![edit(0, 30, "直した"), edit(40, 39, "二行目")],
+                "2 行目",
+            ),
+            // 1 行目の開始が負。
+            (
+                vec![edit(-1, 30, "直した"), edit(40, 70, "二行目")],
+                "1 行目",
+            ),
+            // 2 行目の本文が空白だけ。
+            (vec![edit(0, 30, "直した"), edit(40, 70, "  ")], "2 行目"),
+        ];
+        for (edits, row) in refused {
+            let error = session.apply_transcription(&edits, true).unwrap_err();
+            assert!(error.message().starts_with(row), "{error}");
+            assert!(session.project().subtitles.is_none());
+            assert_eq!(edits_of(&session), original, "失敗で候補が変わりました");
+        }
+        // 直した結果、2 行が重なる。行の順と時刻の順が逆でも、画面の行番号で示す。
+        for overlap in [
+            [edit(0, 50, "直した"), edit(40, 70, "二行目")],
+            [edit(40, 70, "直した"), edit(0, 50, "二行目")],
+        ] {
+            let error = session.apply_transcription(&overlap, true).unwrap_err();
+            assert_eq!(error.message(), "1 行目と 2 行目の区間が重なっています");
+            assert!(session.project().subtitles.is_none());
+            assert_eq!(edits_of(&session), original);
+        }
+        // 画面の行数が候補と合わない（削除が画面と Session でずれた）。
+        let error = session
+            .apply_transcription(&[edit(0, 30, "直した")], true)
+            .unwrap_err();
+        assert!(error.message().contains("数が合いません"), "{error}");
+        assert!(session.project().subtitles.is_none());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn the_overlap_names_the_rows_even_when_they_are_far_apart() {
+        // 1 行目が長く、3 行目と重なる（2 行目とは重ならない並び）。
+        let edits = [edit(0, 100, "a"), edit(200, 230, "b"), edit(90, 95, "c")];
+        let error = check_candidate_overlaps(&edits).unwrap_err();
+        assert_eq!(error.message(), "1 行目と 3 行目の区間が重なっています");
+        assert!(check_candidate_overlaps(&[edit(0, 30, "a"), edit(30, 60, "b")]).is_ok());
+    }
+
+    #[test]
+    fn a_refused_append_changes_nothing_including_the_id_serial() {
+        let (mut session, directory) = two_candidates("transcribe-serial");
+        // 認識の前から字幕がある。追加すると 2 行目と重なる。
+        let candidates = session.background.transcription_result.take();
+        session.add_subtitle(60, 90, "既存").unwrap();
+        let mut outcome = candidates.unwrap();
+        outcome.base_revision = session.edit_revision;
+        session.background.transcription_result = Some(outcome);
+        let serial = session.id_serial;
+        let project = session.project().clone();
+        let can_undo = session.can_undo();
+        let original = edits_of(&session);
+
+        let error = session
+            .apply_transcription(&original, false)
+            .expect_err("既存の字幕と重なる追加を受け付けました");
+        assert_eq!(
+            error.message(),
+            "2 行目: 既にある字幕（60–90 フレーム）と重なります"
+        );
+        assert_eq!(
+            session.id_serial, serial,
+            "失敗で ID の serial が進みました"
+        );
+        assert_eq!(session.project(), &project);
+        assert_eq!(session.can_undo(), can_undo);
+        assert_eq!(edits_of(&session), original);
+        // 置き換えなら既存の字幕は消えるので適用でき、serial はそこで初めて進む。
+        session.apply_transcription(&original, true).unwrap();
+        assert!(session.id_serial > serial);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_removed_row_and_an_edited_row_apply_together() {
+        let (mut session, directory) = two_candidates("transcribe-remove");
+        session.remove_transcription_candidate(0);
+        session
+            .apply_transcription(&[edit(45, 75, "直した二行目")], false)
+            .unwrap();
+        let cues = &session.project().subtitles.as_ref().unwrap().cues;
+        assert_eq!(cues.len(), 1);
+        assert_eq!(
+            (
+                cues[0].start_frame,
+                cues[0].end_frame,
+                cues[0].content.as_str()
+            ),
+            (45, 75, "直した二行目")
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
     #[test]
     fn candidates_are_refused_after_an_edit_or_a_replaced_source() {
         let directory =
@@ -592,17 +839,25 @@ mod tests {
         // 認識の後に素材を差し替えた（大きさが変わった）。
         session.background.transcription_result = Some(outcome(&session));
         std::fs::write(&media, b"replaced").unwrap();
-        let error = session.apply_transcription(true).unwrap_err();
+        let error = session
+            .apply_transcription(&edits_of(&session), true)
+            .unwrap_err();
         assert!(error.message().contains("素材が変わりました"), "{error}");
         assert!(session.project().subtitles.is_none());
         // 認識の後に Project を編集した。
         session.background.transcription_result = Some(outcome(&session));
         session.add_marker().unwrap();
-        assert!(session.apply_transcription(true).is_err());
+        assert!(
+            session
+                .apply_transcription(&edits_of(&session), true)
+                .is_err()
+        );
         assert!(session.project().subtitles.is_none());
         // どちらも変わっていなければ適用できる（候補の仮の ID は発行し直す）。
         session.background.transcription_result = Some(outcome(&session));
-        session.apply_transcription(true).unwrap();
+        session
+            .apply_transcription(&edits_of(&session), true)
+            .unwrap();
         let cues = &session.project().subtitles.as_ref().unwrap().cues;
         assert_eq!(cues.len(), 1);
         assert_ne!(cues[0].id, "candidate-1");

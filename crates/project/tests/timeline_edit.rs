@@ -11,7 +11,7 @@
 mod common;
 
 use common::*;
-use mvm_project::clip_effects::{ClipKeyframe, KeyInterpolation, evaluate_clip_keys};
+use mvm_project::clip_effects::{ClipKeyKind, ClipKeyframe, KeyInterpolation, evaluate_clip_keys};
 use mvm_project::timeline::*;
 use mvm_project::*;
 
@@ -3547,7 +3547,6 @@ fn manim_placement() {
 
 #[test]
 fn clip_key_editing() {
-    use mvm_project::clip_effects::ClipKeyKind;
     let mut project = Project::default();
     let mut video = clip("key-video");
     video.source_frame_count = 120;
@@ -3870,4 +3869,132 @@ fn place_media_at_drop_cases() {
     // 失敗は Project を変えない。
     assert!(place_media_at_drop(&mut base, clip("far"), None, TrackRef::video(3), 0).is_err());
     assert_eq!(base, before);
+}
+
+// テロップ位置。左右は画面幅の 5%、下は画面高の 15% の高さに block の下端を合わせる。
+#[test]
+fn text_preset_position_places_the_block_at_the_lower_third() {
+    // 1920x1080、block 400x100: 下端は 1080*0.85 = 918 なので y = 818。
+    assert_eq!(
+        text_preset_position(400.0, 100.0, 1920, 1080, "left").unwrap(),
+        (96, 818)
+    );
+    assert_eq!(
+        text_preset_position(400.0, 100.0, 1920, 1080, "center").unwrap(),
+        (760, 818)
+    );
+    assert_eq!(
+        text_preset_position(400.0, 100.0, 1920, 1080, "right").unwrap(),
+        (1424, 818)
+    );
+    // 画面より大きな block は左上を画面内に留める。
+    assert_eq!(
+        text_preset_position(3000.0, 2000.0, 1920, 1080, "right").unwrap(),
+        (0, 0)
+    );
+    assert!(text_preset_position(400.0, 100.0, 1920, 1080, "top").is_err());
+    assert!(text_preset_position(400.0, 100.0, 0, 1080, "left").is_err());
+    assert!(text_preset_position(f64::NAN, 100.0, 1920, 1080, "left").is_err());
+}
+
+// preview に見えている clip は、frame に掛かる一番上の有効な video clip。
+#[test]
+fn top_video_clip_is_the_highest_enabled_clip_at_the_frame() {
+    let mut project = Project::default();
+    let mut lower = clip_on("lower", TimelineClipKind::Video, V1);
+    lower.timeline_start_frame = 0;
+    let mut upper = clip_on("upper", TimelineClipKind::Video, V2);
+    upper.timeline_start_frame = 100;
+    project.timeline_clips = vec![lower, upper];
+    assert_eq!(top_video_clip_at(&project, 50), Some(0));
+    assert_eq!(top_video_clip_at(&project, 150), Some(1));
+    assert_eq!(top_video_clip_at(&project, 400), None);
+    project.timeline_clips[1].enabled = false;
+    assert_eq!(
+        top_video_clip_at(&project, 150),
+        Some(0),
+        "無効な clip を選びました"
+    );
+    // 上の track を非表示にすると、preview に見えている下の clip を選ぶ。
+    project.timeline_clips[1].enabled = true;
+    project.video_tracks[1].muted = true;
+    assert_eq!(
+        top_video_clip_at(&project, 150),
+        Some(0),
+        "非表示の track の clip を選びました"
+    );
+    // 下も非表示なら、見えている clip は無い。
+    project.video_tracks[0].muted = true;
+    assert_eq!(top_video_clip_at(&project, 150), None);
+}
+
+// グラフのハンドルは、キーから始まる区間をスプラインにして制御値を置き換える（undo 1 回分）。
+#[test]
+fn spline_controls_replace_the_curve_of_the_segment() {
+    let mut project = Project::default();
+    let mut value = clip("a");
+    value.effects.opacity_keys = vec![key(0, 0.0), key(100, 100.0)];
+    project.timeline_clips = vec![value];
+    set_clip_key_spline(&mut project, "id-a", ClipKeyKind::Opacity, 0, 0.0, 1.0).unwrap();
+    let first = project.timeline_clips[0].effects.opacity_keys[0];
+    assert_eq!(first.interpolation, KeyInterpolation::Spline);
+    assert_eq!((first.control1, first.control2), (0.0, 1.0));
+    // 制御値 0 と 1 の三次曲線: 中央は 3t²(1-t) + t³ = 0.5、t=1/3 で 7/27。
+    let keys = &project.timeline_clips[0].effects.opacity_keys;
+    assert!((evaluate_clip_keys(keys, 100.0, 50) - 50.0).abs() < 1e-6);
+    assert!(
+        evaluate_clip_keys(keys, 100.0, 25) < 25.0,
+        "制御値が曲線に効いていません"
+    );
+    // 範囲外の制御値、最後のキー、無いキーは断る。
+    assert!(set_clip_key_spline(&mut project, "id-a", ClipKeyKind::Opacity, 0, 1.5, 0.5).is_err());
+    assert!(
+        set_clip_key_spline(&mut project, "id-a", ClipKeyKind::Opacity, 100, 0.5, 0.5).is_err()
+    );
+    assert!(set_clip_key_spline(&mut project, "id-a", ClipKeyKind::Opacity, 7, 0.5, 0.5).is_err());
+}
+
+// キーのコピーは最初のキーを 0 とした相対位置。貼り付けは指定位置から、同じ frame は置き換える。
+#[test]
+fn effect_keys_are_copied_relative_and_pasted_at_the_playhead() {
+    let mut project = Project::default();
+    let mut value = clip("a");
+    value.effects.opacity_keys = vec![key(10, 20.0), key(40, 80.0), key(200, 50.0)];
+    project.timeline_clips = vec![value];
+    let copied = copy_clip_keys(&project.timeline_clips[0], ClipKeyKind::Opacity, &[10, 40]);
+    assert_eq!(
+        copied
+            .iter()
+            .map(|key| (key.frame, key.value))
+            .collect::<Vec<_>>(),
+        [(0, 20.0), (30, 80.0)]
+    );
+    // 170 から貼る: 170 と 200（既存の 50 を 80 で置き換え）。
+    paste_clip_keys(&mut project, "id-a", ClipKeyKind::Opacity, &copied, 170).unwrap();
+    let keys: Vec<_> = project.timeline_clips[0]
+        .effects
+        .opacity_keys
+        .iter()
+        .map(|key| (key.frame, key.value))
+        .collect();
+    assert_eq!(keys, [(10, 20.0), (40, 80.0), (170, 20.0), (200, 80.0)]);
+    // clip の尺（300 frame）を超えるなら何も変えずに断る。
+    let before = project.clone();
+    assert!(paste_clip_keys(&mut project, "id-a", ClipKeyKind::Opacity, &copied, 280).is_err());
+    assert_eq!(project, before);
+    assert!(copy_clip_keys(&project.timeline_clips[0], ClipKeyKind::Opacity, &[11]).is_empty());
+}
+
+// キーをまとめて消す。全部消えたら、消した位置の値を固定値にする。
+#[test]
+fn deleting_every_key_keeps_the_value_at_the_playhead() {
+    let mut project = Project::default();
+    let mut value = clip("a");
+    value.effects.opacity_keys = vec![key(0, 0.0), key(100, 100.0)];
+    project.timeline_clips = vec![value];
+    delete_clip_keys(&mut project, "id-a", ClipKeyKind::Opacity, &[0, 100], 25).unwrap();
+    let effects = &project.timeline_clips[0].effects;
+    assert!(effects.opacity_keys.is_empty());
+    assert!((effects.opacity_percent - 25.0).abs() < 1e-9);
+    assert!(delete_clip_keys(&mut project, "id-a", ClipKeyKind::Opacity, &[0], 0).is_err());
 }

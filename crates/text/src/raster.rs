@@ -5,13 +5,14 @@
 //! 行の高さは font size の 1.2 倍。輪郭は円に並べた字形で近似する。Qt の
 //! stroke と同じ画素にはならない。preview と、将来の書き出しは同じ関数を使う。
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
+use cosmic_text::fontdb::Database;
 use cosmic_text::{
     Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Weight, Wrap,
 };
 
-use crate::MEIRYO_PATH;
 use crate::error::TextError;
 
 /// 行内の揃え。字幕の画面上の位置もこれを使う。
@@ -56,10 +57,79 @@ pub struct SubtitlePaint {
 
 const LINE_FACTOR: f64 = 1.2;
 
-/// Meiryo で `run` を `width`×`height` の straight alpha の RGBA に描く。
+/// `run.font_family` の書体で `run` を `width`×`height` の straight alpha の RGBA に描く。
 /// 複数行は block の幅（最も長い行）の中で `run.align` に揃える。
 pub fn raster(run: &GlyphRun, width: u32, height: u32) -> Result<Vec<u8>, TextError> {
-    raster_at(run, width, height, Path::new(MEIRYO_PATH))
+    raster_at(run, width, height, system_fonts()?)
+}
+
+/// この PC に入っている書体の名前（英語名）。重複を除いて並べる。
+pub fn font_families() -> Result<Vec<String>, TextError> {
+    let mut names: Vec<String> = system_fonts()?
+        .faces()
+        .filter_map(|face| face.families.first().map(|(name, _)| name.clone()))
+        .collect();
+    names.sort_by_key(|name| name.to_lowercase());
+    names.dedup();
+    Ok(names)
+}
+
+/// 書体の一覧に出す見本。`family` の書体で `text` を `font_size` px で描いた、block の大きさちょうどの
+/// straight alpha の RGBA と幅・高さ。一覧を眺めるだけで字形を溜め込まないよう、読んだ書体は覚えない。
+pub fn font_sample(
+    family: &str,
+    text: &str,
+    font_size: i32,
+    argb: u32,
+) -> Result<(u32, u32, Vec<u8>), TextError> {
+    let database = system_fonts()?;
+    let (selected, canonical, _) = family_faces(database, family, false)?;
+    let mut fonts = Fonts {
+        system: FontSystem::new_with_locale_and_db("ja-JP".to_owned(), selected),
+        family: canonical,
+        synthetic_bold: 0,
+    };
+    let run = GlyphRun {
+        content: text.to_owned(),
+        font_family: family.to_owned(),
+        font_size,
+        origin_x: 0,
+        origin_y: 0,
+        color: argb,
+        bold: false,
+        align: Align::Left,
+        outline_color: 0,
+        outline_width: 0,
+        background: 0,
+    };
+    let (width, height) = measure(&mut fonts, &run)?;
+    let width = width.ceil().clamp(1.0, 4096.0) as u32;
+    let height = height.ceil().clamp(1.0, 4096.0) as u32;
+    let pixels = draw(&mut fonts, &run, width, height)?;
+    Ok((width, height, pixels))
+}
+
+/// OS の書体の一覧。最初に 1 回だけ読む。1 つも無ければ失敗する。
+fn system_fonts() -> Result<&'static Database, TextError> {
+    static FONTS: OnceLock<Database> = OnceLock::new();
+    let database = FONTS.get_or_init(|| {
+        let mut database = Database::new();
+        database.load_system_fonts();
+        database
+    });
+    if database.is_empty() {
+        return Err(TextError::new("OS の書体を読めません"));
+    }
+    Ok(database)
+}
+
+/// `run` を描いたときの block の幅と高さ（輪郭と余白を含む画素）。[`raster`] と同じ測り方。
+pub fn block_size(run: &GlyphRun) -> Result<(f64, f64), TextError> {
+    if run.content.is_empty() {
+        return Err(TextError::new("文字画像の本文が空です"));
+    }
+    let mut fonts = load_fonts(system_fonts()?, &run.font_family, run.bold, run.font_size)?;
+    measure(&mut fonts, run)
 }
 
 /// 字幕を折り返して下へ置き、[`raster`] と同じ画素にする。
@@ -82,7 +152,6 @@ pub fn place_subtitle(
     if paint.content.is_empty() {
         return Err(TextError::new("文字画像の本文が空です"));
     }
-    require_meiryo(&paint.font_family)?;
     if paint.font_size <= 0 {
         return Err(TextError::new("文字の大きさが不正です"));
     }
@@ -106,7 +175,12 @@ pub fn place_subtitle(
             "字幕が画面の高さを超えています。本文・サイズ・余白を調整してください",
         ));
     }
-    let mut fonts = load_meiryo(Path::new(MEIRYO_PATH), paint.bold)?;
+    let mut fonts = load_fonts(
+        system_fonts()?,
+        &paint.font_family,
+        paint.bold,
+        paint.font_size,
+    )?;
     let wrapped = wrap_paragraphs(&mut fonts, paint, available as f32)?;
     let run = GlyphRun {
         content: wrapped,
@@ -145,16 +219,21 @@ fn raster_at(
     run: &GlyphRun,
     width: u32,
     height: u32,
-    font_file: &Path,
+    database: &Database,
 ) -> Result<Vec<u8>, TextError> {
     validate_canvas(width, height)?;
     if run.content.is_empty() {
         return Err(TextError::new("文字画像の本文が空です"));
     }
-    require_meiryo(&run.font_family)?;
     if run.font_size <= 0 || run.outline_width < 0 {
         return Err(TextError::new("文字の大きさが不正です"));
     }
+    let mut fonts = load_fonts(database, &run.font_family, run.bold, run.font_size)?;
+    draw(&mut fonts, run, width, height)
+}
+
+/// 読んだ書体で `run` を描く。
+fn draw(fonts: &mut Fonts, run: &GlyphRun, width: u32, height: u32) -> Result<Vec<u8>, TextError> {
     let width_usize =
         usize::try_from(width).map_err(|_| TextError::new("文字画像の寸法が不正です"))?;
     let height_usize =
@@ -164,14 +243,13 @@ fn raster_at(
         .and_then(|pixels| pixels.checked_mul(4))
         .ok_or_else(|| TextError::new("文字画像の画素数が overflow しました"))?;
     let mut pixels = vec![0u8; bytes];
-    let mut fonts = load_meiryo(font_file, run.bold)?;
     let mut cache = SwashCache::new();
-    let (block_w, block_h) = measure(&mut fonts, run)?;
+    let (block_w, block_h) = measure(fonts, run)?;
     fill_background(&mut pixels, width, run, block_w, block_h);
     // 揃えの基準は最も長い行の幅。幅を渡さないと cosmic-text は行ごとの幅で揃え、揃えが効かない。
     let padding = run.outline_width + 2;
     let content_width = (block_w - 2.0 * f64::from(padding)) as f32;
-    let mut buffer = shape_lines(&mut fonts, run, Some(content_width), Wrap::None)?;
+    let mut buffer = shape_lines(fonts, run, Some(content_width), Wrap::None)?;
     let origin_x = run.origin_x + padding;
     let origin_y = run.origin_y + padding;
     if run.outline_width > 0 {
@@ -182,7 +260,7 @@ fn raster_at(
             while x <= radius {
                 if x * x + y * y <= radius * radius {
                     paint(
-                        &mut fonts,
+                        fonts,
                         &mut cache,
                         &mut buffer,
                         &mut pixels,
@@ -197,7 +275,7 @@ fn raster_at(
         }
     }
     paint(
-        &mut fonts,
+        fonts,
         &mut cache,
         &mut buffer,
         &mut pixels,
@@ -217,51 +295,84 @@ fn validate_canvas(width: u32, height: u32) -> Result<(), TextError> {
     }
 }
 
-fn require_meiryo(family: &str) -> Result<(), TextError> {
-    if family == "Meiryo" {
-        Ok(())
-    } else {
-        Err(TextError::new(format!(
-            "指定フォントが見つかりません: {family}"
-        )))
-    }
+/// 描く書体。太字の字形が無い書体で太字を頼まれたら、字形を横にずらして重ねる幅（px）を持つ（Qt と同じく
+/// 太字を合成する。別の書体へは置き換えない）。
+struct Fonts {
+    system: FontSystem,
+    family: String,
+    synthetic_bold: i32,
 }
 
-fn load_meiryo(path: &Path, bold: bool) -> Result<FontSystem, TextError> {
-    if !path.is_file() {
-        return Err(TextError::new(format!(
-            "指定フォントが見つかりません: {}",
-            path.display()
-        )));
+/// `family` の書体だけを集めた database と、英語名・太字の字形があるか。
+type FamilyFaces = (Database, String, bool);
+
+/// `database` から `family` の字形を読む。読んだ字形は共有の Arc に置き、同じ書体を 2 回目からは読み直さない
+/// （preview は frame ごとに文字を描く）。
+fn family_faces(
+    database: &Database,
+    family: &str,
+    remember: bool,
+) -> Result<FamilyFaces, TextError> {
+    static CACHE: OnceLock<Mutex<HashMap<(usize, String), FamilyFaces>>> = OnceLock::new();
+    let key = (std::ptr::from_ref(database) as usize, family.to_owned());
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(found) = cache
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get(&key)
+    {
+        return Ok(found.clone());
     }
-    let mut database = cosmic_text::fontdb::Database::new();
-    database
-        .load_font_file(path)
-        .map_err(|error| TextError::new(format!("Meiryo を読めません: {error}")))?;
-    let mut regular = false;
+    let mut selected = Database::new();
+    let mut canonical = None;
     let mut heavy = false;
     for face in database.faces() {
-        let named = face.families.iter().any(|(name, _)| name == "Meiryo");
-        if !named {
+        if !face.families.iter().any(|(name, _)| name == family) {
             continue;
         }
-        let weight = face.weight.0;
-        if (300..=500).contains(&weight) {
-            regular = true;
+        if canonical.is_none() {
+            canonical = face.families.first().map(|(name, _)| name.clone());
         }
-        if (600..=800).contains(&weight) {
-            heavy = true;
-        }
+        heavy |= face.weight.0 >= 600;
+        let data = database
+            .with_face_data(face.id, |data, _| data.to_vec())
+            .ok_or_else(|| TextError::new(format!("書体を読めません: {family}")))?;
+        selected.load_font_data(data);
     }
-    if !regular || (bold && !heavy) {
-        return Err(TextError::new(
-            "指定フォントが見つかりません: Meiryo".to_owned(),
-        ));
+    let Some(canonical) = canonical else {
+        return Err(TextError::new(format!(
+            "指定フォントが見つかりません: {family}"
+        )));
+    };
+    let faces = (selected, canonical, heavy);
+    if !remember {
+        return Ok(faces);
     }
-    Ok(FontSystem::new_with_locale_and_db(
-        "ja-JP".to_owned(),
-        database,
-    ))
+    cache
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(key, faces.clone());
+    Ok(faces)
+}
+
+/// `database` から `family` の書体だけを読む。名前は英語名・各言語の名前のどれでもよい。無ければ失敗する。
+fn load_fonts(
+    database: &Database,
+    family: &str,
+    bold: bool,
+    font_size: i32,
+) -> Result<Fonts, TextError> {
+    let (selected, canonical, heavy) = family_faces(database, family, true)?;
+    let synthetic_bold = if bold && !heavy {
+        (font_size / 32).max(1)
+    } else {
+        0
+    };
+    Ok(Fonts {
+        system: FontSystem::new_with_locale_and_db("ja-JP".to_owned(), selected),
+        family: canonical,
+        synthetic_bold,
+    })
 }
 
 fn metrics(font_size: i32) -> Result<Metrics, TextError> {
@@ -284,8 +395,8 @@ fn cosmic_align(align: Align) -> cosmic_text::Align {
     }
 }
 
-fn attrs(bold: bool) -> Attrs<'static> {
-    Attrs::new().family(Family::Name("Meiryo")).weight(if bold {
+fn attrs(family: &str, bold: bool) -> Attrs<'_> {
+    Attrs::new().family(Family::Name(family)).weight(if bold {
         Weight::BOLD
     } else {
         Weight::NORMAL
@@ -293,25 +404,31 @@ fn attrs(bold: bool) -> Attrs<'static> {
 }
 
 fn shape_lines(
-    fonts: &mut FontSystem,
+    fonts: &mut Fonts,
     run: &GlyphRun,
     width: Option<f32>,
     wrap: Wrap,
 ) -> Result<Buffer, TextError> {
-    let mut buffer = Buffer::new(fonts, metrics(run.font_size)?);
-    buffer.set_size(fonts, width, None);
-    buffer.set_wrap(fonts, wrap);
-    buffer.set_text(fonts, &run.content, &attrs(run.bold), Shaping::Advanced);
+    let system = &mut fonts.system;
+    let mut buffer = Buffer::new(system, metrics(run.font_size)?);
+    buffer.set_size(system, width, None);
+    buffer.set_wrap(system, wrap);
+    buffer.set_text(
+        system,
+        &run.content,
+        &attrs(&fonts.family, run.bold),
+        Shaping::Advanced,
+    );
     let align = Some(cosmic_align(run.align));
     for line in &mut buffer.lines {
         line.set_align(align);
     }
-    buffer.shape_until_scroll(fonts, false);
+    buffer.shape_until_scroll(system, false);
     Ok(buffer)
 }
 
 fn wrap_paragraphs(
-    fonts: &mut FontSystem,
+    fonts: &mut Fonts,
     paint: &SubtitlePaint,
     available: f32,
 ) -> Result<String, TextError> {
@@ -352,7 +469,7 @@ fn wrap_paragraphs(
     Ok(lines.join("\n"))
 }
 
-fn measure(fonts: &mut FontSystem, run: &GlyphRun) -> Result<(f64, f64), TextError> {
+fn measure(fonts: &mut Fonts, run: &GlyphRun) -> Result<(f64, f64), TextError> {
     let buffer = shape_lines(fonts, run, None, Wrap::None)?;
     let mut max_width = 0f32;
     let mut lines = 0i32;
@@ -366,7 +483,7 @@ fn measure(fonts: &mut FontSystem, run: &GlyphRun) -> Result<(f64, f64), TextErr
     let padding = f64::from(run.outline_width.max(0) + 2);
     let line = f64::from(run.font_size) * LINE_FACTOR;
     Ok((
-        f64::from(max_width) + 2.0 * padding,
+        f64::from(max_width) + f64::from(fonts.synthetic_bold) + 2.0 * padding,
         f64::from(lines) * line + 2.0 * padding,
     ))
 }
@@ -395,7 +512,7 @@ fn fill_background(pixels: &mut [u8], width: u32, run: &GlyphRun, block_w: f64, 
 }
 
 fn paint(
-    fonts: &mut FontSystem,
+    fonts: &mut Fonts,
     cache: &mut SwashCache,
     buffer: &mut Buffer,
     pixels: &mut [u8],
@@ -407,22 +524,29 @@ fn paint(
     for layout in buffer.layout_runs() {
         for glyph in layout.glyphs.iter() {
             let physical = glyph.physical((0.0, 0.0), 1.0);
-            let base_x = origin.0 + physical.x;
             let base_y = origin.1 + layout.line_y as i32 + physical.y;
-            cache.with_pixels(fonts, physical.cache_key, color, |x, y, pixel| {
-                blend(
-                    pixels,
-                    width,
-                    base_x + x,
-                    base_y + y,
-                    premultiply(
-                        u32::from(pixel.a()) << 24
-                            | u32::from(pixel.r()) << 16
-                            | u32::from(pixel.g()) << 8
-                            | u32::from(pixel.b()),
-                    ),
+            for shift in 0..=fonts.synthetic_bold {
+                let base_x = origin.0 + physical.x + shift;
+                cache.with_pixels(
+                    &mut fonts.system,
+                    physical.cache_key,
+                    color,
+                    |x, y, pixel| {
+                        blend(
+                            pixels,
+                            width,
+                            base_x + x,
+                            base_y + y,
+                            premultiply(
+                                u32::from(pixel.a()) << 24
+                                    | u32::from(pixel.r()) << 16
+                                    | u32::from(pixel.g()) << 8
+                                    | u32::from(pixel.b()),
+                            ),
+                        );
+                    },
                 );
-            });
+            }
         }
     }
 }
@@ -519,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_text_unknown_family_and_a_missing_file() {
+    fn rejects_empty_text_an_unknown_family_and_a_missing_font() {
         let error = raster(
             &GlyphRun {
                 content: String::new(),
@@ -556,7 +680,7 @@ mod tests {
             },
             32,
             32,
-            Path::new(r"C:\missing\meiryo.ttc"),
+            &Database::new(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("NotAFont"), "{error}");
@@ -577,10 +701,16 @@ mod tests {
             },
             32,
             32,
-            Path::new(r"C:\missing\meiryo.ttc"),
+            &Database::new(),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("meiryo.ttc"), "{error}");
+        // 書体の無い一覧からは引けない（別の書体へ置き換えない）。
+        assert!(
+            error
+                .to_string()
+                .contains("指定フォントが見つかりません: Meiryo"),
+            "{error}"
+        );
     }
 
     fn run(content: &str, align: Align, background: u32) -> GlyphRun {
@@ -707,6 +837,56 @@ mod tests {
 
         let error = place_subtitle(&paint, 0, 100).unwrap_err();
         assert!(error.to_string().contains("寸法"), "{error}");
+    }
+
+    fn ink(image: &[u8]) -> usize {
+        image.chunks(4).filter(|pixel| pixel[3] > 128).count()
+    }
+
+    #[test]
+    #[ignore = "workstation"]
+    fn os_fonts_are_listed_and_drawn_by_name() {
+        let families = font_families().expect("OS の書体");
+        assert!(families.iter().any(|name| name == "Meiryo"), "{families:?}");
+        assert!(
+            families.iter().any(|name| name == "MS Gothic"),
+            "{families:?}"
+        );
+        // 日本語の名前でも同じ書体を引ける。
+        let mut gothic = run("あ", Align::Left, 0);
+        gothic.font_family = "ＭＳ ゴシック".to_owned();
+        let localized = raster(&gothic, 128, 128).expect("ＭＳ ゴシック");
+        gothic.font_family = "MS Gothic".to_owned();
+        assert_eq!(localized, raster(&gothic, 128, 128).expect("MS Gothic"));
+    }
+
+    #[test]
+    #[ignore = "workstation"]
+    fn a_font_sample_is_cut_to_its_block() {
+        let (width, height, pixels) =
+            font_sample("Meiryo", "文字もじモジ", 14, 0xFFFF_FFFF).expect("Meiryo");
+        assert_eq!(pixels.len(), (width * height * 4) as usize);
+        // 6 文字 × 14 px に余白 2 px ずつ。行の高さは 1.2 倍。
+        assert!((84..=96).contains(&width), "{width}");
+        assert_eq!(height, 21);
+        assert!(ink(&pixels) > 0);
+        assert!(font_sample("NotAFont", "あ", 14, 0xFFFF_FFFF).is_err());
+    }
+
+    #[test]
+    #[ignore = "workstation"]
+    fn bold_is_synthesized_for_a_family_without_a_bold_face() {
+        // MS Gothic には太字の字形が無い。Qt と同じく字形を太らせて描く（Meiryo へ置き換えない）。
+        let mut regular = run("あいう", Align::Left, 0);
+        regular.font_family = "MS Gothic".to_owned();
+        let mut bold = regular.clone();
+        bold.bold = true;
+        let thin = ink(&raster(&regular, 512, 128).expect("MS Gothic"));
+        let thick = ink(&raster(&bold, 512, 128).expect("MS Gothic"));
+        assert!(
+            thick > thin + thin / 10,
+            "太字が太くなりません: {thin} → {thick}"
+        );
     }
 
     #[test]

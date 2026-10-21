@@ -50,7 +50,71 @@ pub struct AudioAdjustmentOutcome {
     base_revision: u64,
 }
 
+impl AudioAdjustmentOutcome {
+    /// 解析の結果で clip に入る ducking のキー（clip 内 frame・dB）。
+    pub fn ducking_keys(&self, clip_id: &str) -> &[mvm_project::clip_effects::ClipKeyframe] {
+        self.candidate
+            .clip(clip_id)
+            .map_or(&[], |clip| clip.effects.ducking_keys.as_slice())
+    }
+
+    /// 声を検出した区間（秒）。
+    pub fn range_seconds(&self) -> Vec<(f64, f64)> {
+        self.ranges
+            .iter()
+            .map(|range| {
+                (
+                    range.start_sample as f64 / ADJUSTMENT_SAMPLE_RATE,
+                    range.end_sample as f64 / ADJUSTMENT_SAMPLE_RATE,
+                )
+            })
+            .collect()
+    }
+}
+
+/// 解析の sample の時刻（Hz）。
+const ADJUSTMENT_SAMPLE_RATE: f64 = 48_000.0;
+
 impl Session {
+    /// 解析の結果の音で、再生ヘッドから再生する（試聴）。Project は変えない。止めると元の音へ戻る。
+    pub fn audition_audio_adjustment(&mut self) -> Result<(), AppError> {
+        let Some(outcome) = self.background.audio_adjust_result.as_ref() else {
+            return Err(AppError::new("試聴する解析の結果がありません"));
+        };
+        if outcome.base_revision != self.edit_revision {
+            return Err(AppError::new(
+                "解析の後に Project が変わりました。もう一度解析してください",
+            ));
+        }
+        let candidate = outcome.candidate.clone();
+        if self.is_playing() {
+            self.pause_playback();
+        }
+        self.preview_edit(move |project| {
+            *project = candidate;
+            Ok(None)
+        })?;
+        self.auditioning = true;
+        self.start_playback();
+        Ok(())
+    }
+
+    /// 試聴を止め、Project の音へ戻す。試聴が終わっていた（末尾まで再生した・止めた）ときも片付ける。
+    pub fn stop_audition(&mut self) {
+        if !self.auditioning {
+            return;
+        }
+        self.auditioning = false;
+        if self.is_playing() {
+            self.pause_playback();
+        }
+        self.cancel_preview();
+    }
+
+    pub fn is_auditioning(&self) -> bool {
+        self.auditioning && self.is_playing()
+    }
+
     /// dialog の初期値。最後に適用した設定が読めればそれ、無ければ A1 を声・最後の track を BGM にする。
     pub fn audio_adjustment_defaults(&self) -> AudioAdjustmentSettings {
         let tracks = self.project.audio_tracks.len() as i32;
@@ -125,6 +189,14 @@ impl Session {
             }
             Err(error) => Err(error),
         })
+    }
+
+    /// 解析の後に Project が変わり、結果をそのままでは適用できない。
+    pub fn audio_adjustment_is_stale(&self) -> bool {
+        self.background
+            .audio_adjust_result
+            .as_ref()
+            .is_some_and(|outcome| outcome.base_revision != self.edit_revision)
     }
 
     pub fn audio_adjustment_result(&self) -> Option<&AudioAdjustmentOutcome> {
@@ -657,6 +729,33 @@ mod tests {
             0.0,
             "1 回の undo で戻りません"
         );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn an_audition_plays_the_result_without_changing_the_project() {
+        let directory = std::env::temp_dir().join(format!("mvm-adjust-l-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut session = Session::from_project(fixture(&directory));
+        let outcome = analyze_audio_adjustment(
+            session.project.clone(),
+            settings(),
+            session.edit_revision,
+            &JobControl::default(),
+        )
+        .unwrap();
+        assert!(!outcome.ducking_keys("bgm").is_empty());
+        assert!(outcome.ducking_keys("voice").is_empty());
+        let candidate = outcome.candidate.clone();
+        session.background.audio_adjust_result = Some(outcome);
+        let before = session.project.clone();
+        session.audition_audio_adjustment().unwrap();
+        assert_eq!(session.project, before, "試聴で Project が変わりました");
+        assert_eq!(*session.previewed_project(), candidate);
+        session.stop_audition();
+        assert!(!session.is_auditioning());
+        assert_eq!(*session.previewed_project(), before);
+        assert!(!session.can_undo());
         std::fs::remove_dir_all(&directory).unwrap();
     }
 }

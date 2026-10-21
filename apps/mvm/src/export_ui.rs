@@ -1,39 +1,66 @@
-//! 書き出しの設定 dialog と、書き出し中の進捗・取消。
+//! 書き出し。書き出し設定のダイアログで書き出し先と品質を決めて始める（OS のダイアログは「参照…」を押したとき
+//! だけ開く）。書き出し中は進み具合と取消、失敗したら理由を出す。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use eframe::egui;
-use mvm_app::{ExportQuality, ExportRequest, ReplaceApproval, Session, replace_approval};
+use mvm_app::{
+    ExportQuality, ExportRequest, ExportSettingsSummary, ReplaceApproval, Session,
+    export_settings_summary, replace_approval,
+};
 use mvm_core::Rational;
 use mvm_core::export_eta::format_export_remaining;
-use mvm_project::timeline::timeline_end_frame;
+
+use crate::dialog;
+use crate::widgets::{self, ButtonKind};
 
 /// dialog の入力。閉じても次に開くまで値を覚える。
-#[derive(Default)]
 pub struct ExportDialog {
     open: bool,
+    /// 書き出し先の欄の文字。
     path: String,
     quality: ExportQuality,
     burn_subtitles: bool,
+    summary: Option<ExportSettingsSummary>,
     error: String,
     /// 書き出し先に既にある file を置き換えるかの確認中。確認を出した時点の実体を持つ。
     overwrite: Option<ReplaceApproval>,
-    /// 直前の書き出しの結果。成功は通常の色、失敗は shell の notice に出す。
+    /// 失敗した書き出しの理由。閉じるまでダイアログで見せる。
+    failure: Option<String>,
+    /// 直前の書き出しの結果。
     pub finished: String,
 }
 
+impl Default for ExportDialog {
+    fn default() -> Self {
+        Self {
+            open: false,
+            path: String::new(),
+            quality: ExportQuality::default(),
+            burn_subtitles: true,
+            summary: None,
+            error: String::new(),
+            overwrite: None,
+            failure: None,
+            finished: String::new(),
+        }
+    }
+}
+
 impl ExportDialog {
-    /// dialog を開く。書き出し先が空なら Project の隣を勧める。
+    /// 書き出し設定のダイアログを開く。書き出し先が空なら Project の隣を勧める。
     pub fn open(&mut self, session: &Session) {
         if session.is_exporting() {
             return;
         }
         if self.path.is_empty() {
             self.path = session.default_export_path().display().to_string();
-            self.burn_subtitles = true;
         }
         self.error.clear();
         self.overwrite = None;
+        // 品質は書き出しごとに選ぶ（開くたびに既定へ戻す）。
+        self.quality = ExportQuality::default();
+        self.summary = Some(export_settings_summary(session.project()));
         self.open = true;
     }
 
@@ -42,13 +69,8 @@ impl ExportDialog {
     }
 }
 
-/// 書き出しの終わりを拾い、dialog と進捗を出す。失敗は `notice` へ書く。
-pub fn show(
-    ui: &mut egui::Ui,
-    session: &mut Session,
-    dialog: &mut ExportDialog,
-    notice: &mut String,
-) {
+/// 書き出しの終わりを拾い、dialog と進捗を出す。
+pub fn show(ui: &mut egui::Ui, session: &mut Session, dialog: &mut ExportDialog) {
     if let Some(result) = session.poll_export() {
         match result {
             Ok(summary) => {
@@ -61,12 +83,14 @@ pub fn show(
             }
             Err(error) => {
                 dialog.finished.clear();
-                *notice = error.to_string();
+                dialog.failure = Some(error.to_string());
             }
         }
     }
     if session.is_exporting() {
         show_progress(ui, session);
+    } else if dialog.failure.is_some() {
+        show_failure(ui, dialog);
     } else if dialog.open {
         show_settings(ui, session, dialog);
     }
@@ -76,88 +100,123 @@ fn show_settings(ui: &mut egui::Ui, session: &mut Session, dialog: &mut ExportDi
     let mut start = false;
     let mut cancel = false;
     let mut replace = None;
-    let project = session.project();
-    let fps = project.timeline_fps;
-    let has_subtitles = project
+    let has_subtitles = session
+        .project()
         .subtitles
         .as_ref()
         .is_some_and(|track| !track.cues.is_empty());
-    let length = timeline_end_frame(project);
-    let (width, height) = (project.output_width, project.output_height);
-    egui::Modal::new(egui::Id::new("export")).show(ui.ctx(), |ui| {
-        ui.heading("書き出し");
-        match length {
-            Ok(frames) => {
-                ui.label(format!(
-                    "{width}×{height}・{} fps・{}",
-                    fps_label(fps),
-                    length_label(frames, fps)
-                ));
+    let summary = dialog.summary.clone();
+    let confirming = dialog.overwrite.is_some();
+    let width = (ui.ctx().content_rect().width() - 40.0).clamp(300.0, 640.0);
+    let ((), close) = dialog::show(
+        ui.ctx(),
+        "export",
+        "書き出し設定",
+        width,
+        |ui| {
+            if let Some(summary) = &summary {
+                ui.label(&summary.input);
+                ui.label(&summary.output);
+                if !summary.warning.is_empty() {
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(0x3a, 0x30, 0x20))
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgb(0xb5, 0x8a, 0x43),
+                        ))
+                        .corner_radius(4)
+                        .inner_margin(egui::Margin::same(10))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(
+                                egui::RichText::new(&summary.warning)
+                                    .color(egui::Color32::from_rgb(0xf0, 0xc3, 0x6a)),
+                            );
+                        });
+                }
             }
-            Err(error) => {
-                ui.colored_label(egui::Color32::from_rgb(230, 120, 120), error.to_string());
-            }
-        }
-        ui.add_space(6.0);
-        ui.label("書き出し先（MP4）");
-        ui.horizontal(|ui| {
-            let edited = ui
-                .add(egui::TextEdit::singleline(&mut dialog.path).desired_width(360.0))
-                .changed();
-            if ui.button("参照").clicked()
-                && let Some(path) = pick_output(&dialog.path)
-            {
-                dialog.path = path.display().to_string();
-                dialog.overwrite = None;
-            }
-            if edited {
-                dialog.overwrite = None;
-            }
-        });
-        ui.add_space(6.0);
-        ui.label("画質");
-        for quality in ExportQuality::ALL {
-            ui.radio_value(
-                &mut dialog.quality,
-                quality,
-                format!("{}（{}）", quality.label(), quality.detail()),
-            );
-        }
-        ui.add_space(6.0);
-        ui.add_enabled(
-            has_subtitles,
-            egui::Checkbox::new(&mut dialog.burn_subtitles, "字幕を焼き込む"),
-        );
-        if !dialog.error.is_empty() {
-            ui.colored_label(egui::Color32::from_rgb(230, 120, 120), &dialog.error);
-        }
-        ui.add_space(6.0);
-        if let Some(approval) = &dialog.overwrite {
-            ui.label(format!(
-                "{} は既にあります。置き換えますか？",
-                approval.path().display()
-            ));
+            ui.label(egui::RichText::new("書き出し先（MP4）").strong());
             ui.horizontal(|ui| {
-                if ui.button("置き換えて書き出す").clicked() {
+                let field_width = (ui.available_width() - 96.0).max(120.0);
+                let field = ui.add_sized(
+                    egui::vec2(field_width, 34.0),
+                    egui::TextEdit::singleline(&mut dialog.path).margin(egui::vec2(10.0, 8.0)),
+                );
+                if field.changed() {
+                    dialog.overwrite = None;
+                }
+                if widgets::dialog_button(ui, "参照…", ButtonKind::Normal).clicked()
+                    && let Some(path) = pick_output(Path::new(dialog.path.trim()))
+                {
+                    dialog.path = path.display().to_string();
+                    dialog.overwrite = None;
+                }
+            });
+            ui.label(egui::RichText::new("エンコード品質").strong());
+            ui.add_enabled_ui(has_subtitles, |ui| {
+                widgets::dialog_check(ui, &mut dialog.burn_subtitles, "字幕を焼き込む");
+            });
+            let options: Vec<String> = ExportQuality::ALL
+                .iter()
+                .map(|quality| format!("{}（{}）", quality.label(), quality.detail()))
+                .collect();
+            let labels: Vec<&str> = options.iter().map(String::as_str).collect();
+            let current = ExportQuality::ALL
+                .iter()
+                .position(|quality| *quality == dialog.quality)
+                .unwrap_or(0);
+            if let Some(index) = widgets::choice_box(
+                ui,
+                egui::Id::new("export_quality"),
+                &labels,
+                current,
+                ui.available_width(),
+            ) && let Some(quality) = ExportQuality::ALL.get(index)
+            {
+                dialog.quality = *quality;
+            }
+            ui.label(
+                egui::RichText::new(
+                    "品質は圧縮率だけを変更します。出力の解像度とfpsはプロジェクト設定のままです。",
+                )
+                .color(egui::Color32::from_rgb(0xae, 0xb4, 0xbf)),
+            );
+            if !dialog.error.is_empty() {
+                ui.colored_label(egui::Color32::from_rgb(0xef, 0x8b, 0x8b), &dialog.error);
+            }
+            if let Some(approval) = &dialog.overwrite {
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xf0, 0xc3, 0x6a),
+                    format!(
+                        "{} は既にあります。置き換えて書き出しますか？",
+                        approval.path().display()
+                    ),
+                );
+            }
+        },
+        |ui| {
+            if confirming {
+                if widgets::dialog_button(ui, "置き換えて書き出す", ButtonKind::Destructive)
+                    .clicked()
+                {
                     replace = Some(true);
                 }
-                if ui.button("やめる").clicked() {
+                if widgets::dialog_button(ui, "やめる", ButtonKind::Normal).clicked() {
                     replace = Some(false);
                 }
-            });
-        } else {
-            ui.horizontal(|ui| {
-                if ui.button("書き出す").clicked() {
+            } else {
+                if widgets::dialog_button(ui, "書き出す", ButtonKind::Prominent).clicked() {
                     start = true;
                 }
-                if ui.button("キャンセル").clicked() {
+                if widgets::dialog_button(ui, "キャンセル", ButtonKind::Normal).clicked() {
                     cancel = true;
                 }
-            });
-        }
-    });
-    if cancel {
+            }
+        },
+    );
+    if cancel || close {
         dialog.open = false;
+        dialog.overwrite = None;
         return;
     }
     let output_path = ensure_mp4(PathBuf::from(dialog.path.trim()));
@@ -186,7 +245,7 @@ fn show_settings(ui: &mut egui::Ui, session: &mut Session, dialog: &mut ExportDi
     let request = ExportRequest {
         output_path,
         quality: dialog.quality,
-        burn_subtitles: dialog.burn_subtitles,
+        burn_subtitles: dialog.burn_subtitles && has_subtitles,
         replace: approval,
     };
     match session.start_export(&request) {
@@ -206,68 +265,77 @@ fn show_progress(ui: &mut egui::Ui, session: &mut Session) {
     };
     let fps = session.project().timeline_fps;
     let mut cancel = false;
-    egui::Modal::new(egui::Id::new("export-progress")).show(ui.ctx(), |ui| {
-        ui.heading("書き出し中");
-        let fraction = if progress.total > 0 {
-            progress.completed as f32 / progress.total as f32
-        } else {
-            0.0
-        };
-        ui.add(
-            egui::ProgressBar::new(fraction)
-                .desired_width(360.0)
-                .show_percentage(),
-        );
-        ui.label(format!(
-            "{} / {}",
-            length_label(progress.completed, fps),
-            length_label(progress.total, fps)
-        ));
-        ui.label(match progress.remaining_seconds {
-            Some(seconds) => format_export_remaining(seconds),
-            None => "残り時間を計測しています".to_owned(),
-        });
-        let label = if progress.cancelling {
-            "取り消しています"
-        } else {
-            "取り消す"
-        };
-        if ui
-            .add_enabled(!progress.cancelling, egui::Button::new(label))
-            .clicked()
-        {
-            cancel = true;
-        }
-    });
+    let text = if progress.cancelling {
+        "キャンセルしています…".to_owned()
+    } else if progress.total <= 0 || progress.completed == 0 && progress.remaining_seconds.is_none()
+    {
+        "準備しています…".to_owned()
+    } else {
+        format!(
+            "{} ・ {}",
+            progress_label(progress.completed, progress.total, fps),
+            match progress.remaining_seconds {
+                Some(seconds) => format_export_remaining(seconds),
+                None => "残り時間を計算中…".to_owned(),
+            }
+        )
+    };
+    let fraction = (progress.total > 0 && progress.completed > 0)
+        .then(|| progress.completed as f32 / progress.total as f32);
+    let width = (ui.ctx().content_rect().width() - 40.0).clamp(300.0, 460.0);
+    dialog::show(
+        ui.ctx(),
+        "export-progress",
+        "動画を書き出しています",
+        width,
+        |ui| {
+            ui.vertical_centered(|ui| ui.label(&text));
+            dialog::progress_bar(ui, fraction);
+        },
+        |ui| {
+            let label = if progress.cancelling {
+                "キャンセル中…"
+            } else {
+                "キャンセル"
+            };
+            let button = ui.add_enabled_ui(!progress.cancelling, |ui| {
+                widgets::dialog_button(ui, label, ButtonKind::Normal)
+            });
+            if button.inner.clicked() {
+                cancel = true;
+            }
+        },
+    );
     if cancel {
         session.cancel_export();
     }
 }
 
-fn length_label(frames: i64, fps: Rational) -> String {
-    if fps.is_positive() {
-        let seconds = frames as f64 * fps.den as f64 / fps.num as f64;
-        format!("{frames} frame（{seconds:.2} 秒）")
-    } else {
-        format!("{frames} frame")
+fn show_failure(ui: &mut egui::Ui, dialog: &mut ExportDialog) {
+    let message = dialog.failure.clone().unwrap_or_default();
+    let width = (ui.ctx().content_rect().width() - 40.0).clamp(300.0, 560.0);
+    let mut ok = false;
+    let ((), close) = dialog::show(
+        ui.ctx(),
+        "export-failure",
+        "書き出しに失敗しました",
+        width,
+        |ui| {
+            ui.label(&message);
+        },
+        |ui| {
+            ok = widgets::dialog_button(ui, "OK", ButtonKind::Prominent).clicked();
+        },
+    );
+    if ok || close {
+        dialog.failure = None;
     }
 }
 
-fn fps_label(fps: Rational) -> String {
-    if fps.den == 1 {
-        fps.num.to_string()
-    } else if fps.is_positive() {
-        format!("{:.3}", fps.num as f64 / fps.den as f64)
-    } else {
-        "?".to_owned()
-    }
-}
-
-fn pick_output(current: &str) -> Option<PathBuf> {
+fn pick_output(current: &Path) -> Option<PathBuf> {
     let mut dialog = rfd::FileDialog::new()
-        .set_title("書き出し先")
+        .set_title("書き出し先を指定")
         .add_filter("MP4", &["mp4"]);
-    let current = PathBuf::from(current);
     if let Some(parent) = current.parent().filter(|parent| parent.is_dir()) {
         dialog = dialog.set_directory(parent);
     }
@@ -278,6 +346,19 @@ fn pick_output(current: &str) -> Option<PathBuf> {
 }
 
 /// 拡張子が無ければ `.mp4` を付ける。別の拡張子は書き出しの計画が拒む。
+/// 書き出した位置と全体の長さ。frame と秒を併記する（UI の指針）。書き出す frame は timeline の fps で数える。
+fn progress_label(completed: i64, total: i64, fps: Rational) -> String {
+    if fps.num <= 0 || fps.den <= 0 {
+        return format!("{completed} / {total} frame");
+    }
+    let seconds = |frames: i64| frames as f64 * fps.den as f64 / fps.num as f64;
+    format!(
+        "{completed} / {total} frame（{:.1} / {:.1} 秒）",
+        seconds(completed),
+        seconds(total)
+    )
+}
+
 fn ensure_mp4(path: PathBuf) -> PathBuf {
     if path.as_os_str().is_empty() || path.extension().is_some() {
         path
@@ -291,13 +372,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn labels_show_frames_and_seconds() {
+    fn progress_shows_frames_and_seconds() {
+        // 60 fps の 90 frame は 1.5 秒、600 frame は 10 秒。
         assert_eq!(
-            length_label(90, Rational::new(60, 1)),
-            "90 frame（1.50 秒）"
+            progress_label(90, 600, Rational::new(60, 1)),
+            "90 / 600 frame（1.5 / 10.0 秒）"
         );
-        assert_eq!(fps_label(Rational::new(30000, 1001)), "29.970");
-        assert_eq!(fps_label(Rational::new(60, 1)), "60");
+        // 29.97 fps（30000/1001）の 300 frame は 10.01 秒。
+        assert_eq!(
+            progress_label(0, 300, Rational::new(30000, 1001)),
+            "0 / 300 frame（0.0 / 10.0 秒）"
+        );
+        // fps が不正なら秒は出さない。
+        assert_eq!(progress_label(1, 2, Rational::new(0, 1)), "1 / 2 frame");
+    }
+
+    #[test]
+    fn the_output_gets_the_mp4_extension_only_when_it_has_none() {
         assert_eq!(ensure_mp4(PathBuf::from("a")), PathBuf::from("a.mp4"));
         assert_eq!(ensure_mp4(PathBuf::from("a.mov")), PathBuf::from("a.mov"));
         assert_eq!(ensure_mp4(PathBuf::new()), PathBuf::new());

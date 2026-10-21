@@ -7,21 +7,33 @@ use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, TextureHandle};
 use mvm_app::{AppError, ExistingFile, RecoveryPrompt, ReplaceApproval, Session, replace_approval};
 use mvm_project::timeline::TimelineTool;
 
+use crate::dialog;
+use crate::widgets::{self, ButtonKind};
 use crate::{
     audio_adjust_ui, clip_dialogs, export_ui, inspector, math_ui, mixer_ui, preview_ui,
-    project_panel, subtitle_panel, timeline_ui, transcribe_ui,
+    project_panel, subtitle_panel, theme, timeline_ui, transcribe_ui,
 };
+
+/// 下段の timeline の初めの高さと、縮められる下限。
+/// 初めの高さは窓の残りの高さに対する割合（C++ 版は上段 42%・timeline 48%）。
+const TIMELINE_DEFAULT_SHARE: f32 = 0.53;
+const TIMELINE_MINIMUM_HEIGHT: f32 = 200.0;
+const LEFT_PANEL_DEFAULT_WIDTH: f32 = 520.0;
+/// preview の右のマスターの帯（フェーダー 43 + メーター 29 + 余白）。
+const MASTER_STRIP_WIDTH: f32 = 106.0;
 
 /// 自動保存と外部変更の検査は入力が無くても進める。egui は入力が無いと描き直さないので、この間隔で起こす。
 const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(250);
 
-/// 左パネルの表示。
+/// 左パネルの表示。premiere と同じく、同じ領域をタブで切り替える。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LeftTab {
+    /// 選択中の clip・編集点・マーカー（インスペクタ）。
     #[default]
+    Effects,
     Project,
-    Subtitles,
     Mixer,
+    Subtitles,
 }
 
 #[derive(Clone, Copy)]
@@ -82,6 +94,13 @@ pub struct MvmApp {
 }
 
 impl MvmApp {
+    /// 起動引数で渡された Project を開く。開けなければ空の Project のまま、理由を知らせる。
+    pub fn open_at_start(&mut self, path: &std::path::Path) {
+        if let Err(error) = self.session.open_project(path) {
+            self.notice = format!("{} を開けません: {}", path.display(), error.message());
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             session: Session::new(),
@@ -278,24 +297,32 @@ impl MvmApp {
         };
         let path = pending.approval.path().display().to_string();
         let mut replace = None;
-        egui::Modal::new(egui::Id::new("overwrite")).show(ui.ctx(), |ui| {
-            ui.label(format!("{path} は既にあります。置き換えますか？"));
-            ui.horizontal(|ui| {
-                if ui.button("置き換える").clicked() {
+        let width = (ui.ctx().content_rect().width() - 40.0).clamp(300.0, 520.0);
+        let ((), close) = dialog::show(
+            ui.ctx(),
+            "overwrite",
+            "ファイルを置き換え",
+            width,
+            |ui| {
+                ui.label(format!("{path} は既にあります。置き換えますか？"));
+            },
+            |ui| {
+                if widgets::dialog_button(ui, "置き換える", ButtonKind::Destructive).clicked()
+                {
                     replace = Some(true);
                 }
-                if ui.button("キャンセル").clicked() {
+                if widgets::dialog_button(ui, "キャンセル", ButtonKind::Normal).clicked() {
                     replace = Some(false);
                 }
-            });
-        });
+            },
+        );
         match replace {
             Some(true) => self.approve_overwrite(),
             Some(false) => self.overwrite = None,
+            None if close => self.overwrite = None,
             None => {}
         }
     }
-
     fn note(&mut self, result: Result<(), AppError>) {
         self.notice = match result {
             Ok(()) => String::new(),
@@ -416,6 +443,8 @@ impl MvmApp {
     }
 
     fn handle_edit_shortcuts(&mut self, ui: &mut egui::Ui) {
+        // エフェクトコントロールでキーを押した後は、コピー・カット・ペースト・削除をキーへ向ける。
+        let keys = self.left_tab == LeftTab::Effects && self.inspector.wants_key_shortcuts();
         let command = ui.input_mut(|input| {
             if input.consume_shortcut(&KeyboardShortcut::new(
                 Modifiers::COMMAND | Modifiers::SHIFT,
@@ -425,11 +454,17 @@ impl MvmApp {
                 EditCommand::Redo
             } else if input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Z)) {
                 EditCommand::Undo
-            } else if input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::C)) {
+            } else if !keys
+                && input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::C))
+            {
                 EditCommand::Copy
-            } else if input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::X)) {
+            } else if !keys
+                && input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::X))
+            {
                 EditCommand::Cut
-            } else if input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::V)) {
+            } else if !keys
+                && input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::V))
+            {
                 EditCommand::Paste
             } else if input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::D)) {
                 EditCommand::Duplicate
@@ -474,8 +509,9 @@ impl MvmApp {
                 EditCommand::VolumeUp
             } else if input.consume_key(Modifiers::NONE, Key::CloseBracket) {
                 EditCommand::VolumeDown
-            } else if input.consume_key(Modifiers::NONE, Key::Delete)
-                || input.consume_key(Modifiers::NONE, Key::Backspace)
+            } else if !keys
+                && (input.consume_key(Modifiers::NONE, Key::Delete)
+                    || input.consume_key(Modifiers::NONE, Key::Backspace))
             {
                 EditCommand::Delete
             } else if input.modifiers.command || input.modifiers.alt {
@@ -573,205 +609,406 @@ impl MvmApp {
         }
     }
 
+    /// メニュー。項目の名前・並び・ショートカットの表示は C++ 版と同じにする。
     fn menu(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("ファイル", |ui| {
-                // 書き出し中は Project を切り替えない（書き出しは開始時の Project を書き続ける）。
-                // 名前を付けて保存も session を入れ直すので同じ扱いにする。
-                let switchable = !self.session.is_exporting();
-                if ui
-                    .add_enabled(switchable, egui::Button::new("新規プロジェクト"))
-                    .clicked()
-                {
-                    self.request(FileAction::New);
-                    ui.close();
-                }
-                if ui
-                    .add_enabled(switchable, egui::Button::new("開く"))
-                    .clicked()
-                {
-                    self.request(FileAction::Open);
-                    ui.close();
-                }
-                if ui
-                    .add_enabled(self.session.dirty(), egui::Button::new("保存"))
-                    .clicked()
-                {
-                    self.save();
-                    ui.close();
-                }
-                if ui
-                    .add_enabled(switchable, egui::Button::new("名前を付けて保存"))
-                    .clicked()
-                {
-                    self.save_as();
-                    ui.close();
-                }
-                ui.separator();
-                if ui.button("メディアを追加…").clicked() {
-                    ui.close();
-                    if let Some(path) = pick_media_file() {
-                        self.perform_edit(|session| session.add_media_file_at_playhead(&path));
-                    }
-                }
-                if ui.button("素材を読み込み…").clicked() {
-                    ui.close();
-                    if let Some(paths) = project_panel::pick_media() {
-                        project_panel::import(&mut self.session, &paths, "");
-                        self.left_tab = LeftTab::Project;
-                    }
-                }
-                if ui.button("プロジェクト設定…").clicked() {
+            ui.menu_button("ファイル(F)", |ui| self.file_menu(ui));
+            ui.menu_button("編集(E)", |ui| self.edit_menu(ui));
+            ui.menu_button("再生(L)", |ui| self.playback_menu(ui));
+            ui.menu_button("プロジェクト(P)", |ui| {
+                if ui.button("プロジェクト設定").clicked() {
                     self.settings.open(&self.session);
-                    ui.close();
-                }
-                ui.separator();
-                if ui
-                    .add_enabled(!self.session.is_exporting(), egui::Button::new("書き出し"))
-                    .clicked()
-                {
-                    self.export.open(&self.session);
-                    ui.close();
-                }
-                ui.separator();
-                if ui.button("終了").clicked() {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            });
-            ui.menu_button("再生", |ui| {
-                let now = now_ms(ui);
-                let mut seek = Seek::None;
-                for (label, key, action) in [
-                    ("再生 / 停止", "Space", Seek::Play),
-                    ("左へシャトル", "J", Seek::Shuttle(-1)),
-                    ("停止", "K", Seek::Stop),
-                    ("右へシャトル", "L", Seek::Shuttle(1)),
-                    ("1 フレーム前へ", "←", Seek::By(-1)),
-                    ("1 フレーム先へ", "→", Seek::By(1)),
-                    ("5 フレーム前へ", "Shift+←", Seek::By(-5)),
-                    ("5 フレーム先へ", "Shift+→", Seek::By(5)),
-                    ("前の編集点へ", "↑", Seek::Edit(-1)),
-                    ("次の編集点へ", "↓", Seek::Edit(1)),
-                    ("先頭へ", "Home", Seek::Start),
-                ] {
-                    if ui
-                        .add(egui::Button::new(label).shortcut_text(key))
-                        .clicked()
-                    {
-                        seek = action;
-                        ui.close();
-                    }
-                }
-                ui.separator();
-                for (label, key, edit) in [
-                    (
-                        "マーカーを追加",
-                        "M",
-                        Session::add_marker as fn(&mut Session) -> _,
-                    ),
-                    ("インをマーク", "I", Session::mark_in),
-                    ("アウトをマーク", "O", Session::mark_out),
-                    ("インとアウトを消去", "Alt+X", Session::clear_marks),
-                ] {
-                    if ui
-                        .add(egui::Button::new(label).shortcut_text(key))
-                        .clicked()
-                    {
-                        self.perform_edit(edit);
-                        ui.close();
-                    }
-                }
-                self.run_seek(seek, now);
-            });
-            ui.menu_button("挿入", |ui| {
-                if ui.button("数式").clicked() {
-                    self.perform_edit(Session::add_math_clip);
-                    ui.close();
-                }
-                if ui.button("数式列").clicked() {
-                    self.perform_edit(Session::add_equation_sequence_clip);
-                    ui.close();
-                }
-                if ui.button("グラフ").clicked() {
-                    self.perform_edit(Session::add_graph_clip);
-                    ui.close();
-                }
-                if ui.button("Manim clip").clicked() {
-                    self.manim.open();
-                    ui.close();
-                }
-            });
-            ui.menu_button("音声", |ui| {
-                if ui
-                    .add_enabled(
-                        !self.audio_adjust.is_open(),
-                        egui::Button::new("自動音量調整"),
-                    )
-                    .clicked()
-                {
-                    self.audio_adjust.open(&self.session);
-                    ui.close();
-                }
-                if ui.button("オーディオミキサー").clicked() {
-                    self.left_tab = LeftTab::Mixer;
-                    ui.close();
-                }
-            });
-            ui.menu_button("編集", |ui| {
-                if ui
-                    .add_enabled(self.session.can_undo(), egui::Button::new("元に戻す"))
-                    .clicked()
-                {
-                    self.perform_edit(Session::undo);
-                    ui.close();
-                }
-                if ui
-                    .add_enabled(self.session.can_redo(), egui::Button::new("やり直し"))
-                    .clicked()
-                {
-                    self.perform_edit(Session::redo);
-                    ui.close();
-                }
-                if ui.button("コピー").clicked() {
-                    self.perform_edit(Session::copy_selection);
-                    ui.close();
-                }
-                if ui.button("ペースト").clicked() {
-                    self.perform_edit(Session::paste);
-                    ui.close();
-                }
-                if ui.button("削除").clicked() {
-                    self.perform_edit(Session::delete_selection);
-                    ui.close();
-                }
-                if ui.button("リップル削除（全トラック）").clicked() {
-                    self.perform_edit(Session::ripple_delete_selection);
-                    ui.close();
-                }
-                ui.separator();
-                if ui
-                    .add(egui::Button::new("速度・デュレーション…").shortcut_text("Ctrl+R"))
-                    .clicked()
-                {
-                    self.open_speed();
-                    ui.close();
-                }
-                if ui.button("フレーム保持を挿入").clicked() {
-                    if let Some(id) = self.session.selected_clip().map(str::to_owned) {
-                        self.perform_edit(|session| session.insert_frame_hold(&id));
-                    } else {
-                        self.session
-                            .set_alert("フレーム保持を挿入する clip を選んでください");
-                    }
                     ui.close();
                 }
             });
         });
-        if !self.notice.is_empty() {
-            ui.colored_label(egui::Color32::from_rgb(230, 120, 120), &self.notice);
-        } else if !self.export.finished.is_empty() {
-            ui.label(&self.export.finished);
+    }
+
+    fn file_menu(&mut self, ui: &mut egui::Ui) {
+        // 書き出し中は Project を切り替えない（書き出しは開始時の Project を書き続ける）。
+        // 名前を付けて保存も session を入れ直すので同じ扱いにする。
+        let switchable = !self.session.is_exporting();
+        if ui
+            .add_enabled(switchable, egui::Button::new("新規プロジェクト"))
+            .clicked()
+        {
+            self.request(FileAction::New);
+            ui.close();
         }
+        if ui
+            .add_enabled(
+                switchable,
+                egui::Button::new("プロジェクトを開く").shortcut_text("Ctrl+O"),
+            )
+            .clicked()
+        {
+            self.request(FileAction::Open);
+            ui.close();
+        }
+        ui.separator();
+        if ui
+            .add_enabled(
+                self.session.dirty(),
+                egui::Button::new("保存").shortcut_text("Ctrl+S"),
+            )
+            .clicked()
+        {
+            self.save();
+            ui.close();
+        }
+        if ui
+            .add_enabled(
+                switchable,
+                egui::Button::new("名前を付けて保存").shortcut_text("Ctrl+Shift+S"),
+            )
+            .clicked()
+        {
+            self.save_as();
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("メディアを追加").clicked() {
+            ui.close();
+            if let Some(path) = pick_media_file() {
+                self.perform_edit(|session| session.add_media_file_at_playhead(&path));
+            }
+        }
+        if ui.button("Manim script clip…").clicked() {
+            self.manim.open();
+            ui.close();
+        }
+        for (label, add) in [
+            (
+                "数式 clip を追加",
+                Session::add_math_clip as fn(&mut Session) -> _,
+            ),
+            ("数式 sequence を追加", Session::add_equation_sequence_clip),
+            ("グラフ clip を追加", Session::add_graph_clip),
+        ] {
+            if ui.button(label).clicked() {
+                self.perform_edit(add);
+                // 置いた clip の中身はエフェクトコントロールで書く。
+                self.left_tab = LeftTab::Effects;
+                ui.close();
+            }
+        }
+        ui.separator();
+        if ui
+            .add_enabled(
+                !self.session.is_exporting(),
+                egui::Button::new("メディアを書き出し").shortcut_text("Ctrl+M"),
+            )
+            .clicked()
+        {
+            self.export.open(&self.session);
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("終了").clicked() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    fn edit_menu(&mut self, ui: &mut egui::Ui) {
+        let mut command = EditCommand::None;
+        let mut item =
+            |ui: &mut egui::Ui, label: &str, key: &str, enabled: bool, run: EditCommand| {
+                if ui
+                    .add_enabled(enabled, egui::Button::new(label).shortcut_text(key))
+                    .clicked()
+                {
+                    command = run;
+                    ui.close();
+                }
+            };
+        let selected = !self.session.selection().is_empty();
+        item(
+            ui,
+            "元に戻す",
+            "Ctrl+Z",
+            self.session.can_undo(),
+            EditCommand::Undo,
+        );
+        item(
+            ui,
+            "やり直し",
+            "Ctrl+Shift+Z",
+            self.session.can_redo(),
+            EditCommand::Redo,
+        );
+        ui.separator();
+        item(
+            ui,
+            "クリップをコピー",
+            "Ctrl+C",
+            selected,
+            EditCommand::Copy,
+        );
+        item(ui, "クリップをカット", "Ctrl+X", selected, EditCommand::Cut);
+        item(
+            ui,
+            "クリップをペースト",
+            "Ctrl+V",
+            self.session.has_clipboard(),
+            EditCommand::Paste,
+        );
+        item(
+            ui,
+            "クリップを複製",
+            "Ctrl+D",
+            selected,
+            EditCommand::Duplicate,
+        );
+        item(
+            ui,
+            "速度・デュレーション...",
+            "Ctrl+R",
+            selected,
+            EditCommand::SpeedDuration,
+        );
+        if ui
+            .add_enabled(
+                !self.audio_adjust.is_open(),
+                egui::Button::new("自動音量調整…"),
+            )
+            .clicked()
+        {
+            self.audio_adjust.open(&self.session);
+            ui.close();
+        }
+        ui.separator();
+        item(ui, "編集点を追加", "Ctrl+K", selected, EditCommand::Split);
+        item(
+            ui,
+            "編集点をすべてのトラックに追加",
+            "Ctrl+Shift+K",
+            true,
+            EditCommand::SplitAll,
+        );
+        item(ui, "すべてを選択", "Ctrl+A", true, EditCommand::SelectAll);
+        ui.separator();
+        item(
+            ui,
+            "クリップの音量を上げる",
+            "[",
+            selected,
+            EditCommand::VolumeUp,
+        );
+        item(
+            ui,
+            "クリップの音量を下げる",
+            "]",
+            selected,
+            EditCommand::VolumeDown,
+        );
+        item(
+            ui,
+            "有効/無効を切り換え",
+            "Shift+E",
+            selected,
+            EditCommand::ToggleEnabled,
+        );
+        item(
+            ui,
+            "デフォルトのトランジションを適用",
+            "Shift+D",
+            true,
+            EditCommand::Transition,
+        );
+        if ui
+            .add_enabled(
+                self.session.selected_edge().is_some(),
+                egui::Button::new("数式の変形を適用"),
+            )
+            .clicked()
+        {
+            self.perform_edit(Session::apply_math_transform);
+            ui.close();
+        }
+        ui.separator();
+        item(
+            ui,
+            "クリップを削除",
+            "Delete",
+            selected,
+            EditCommand::Delete,
+        );
+        self.run_edit(command);
+    }
+
+    fn playback_menu(&mut self, ui: &mut egui::Ui) {
+        let now = now_ms(ui);
+        let mut seek = Seek::None;
+        let verb = if self.session.is_playing() {
+            "一時停止"
+        } else {
+            "再生"
+        };
+        if ui
+            .add(egui::Button::new(verb).shortcut_text("Space"))
+            .clicked()
+        {
+            seek = Seek::Play;
+            ui.close();
+        }
+        ui.separator();
+        let mut command = EditCommand::None;
+        for (label, key, run) in [
+            ("マーカーを追加", "M", EditCommand::Marker),
+            ("次のマーカーへ移動", "Shift+M", EditCommand::NextMarker),
+            (
+                "前のマーカーへ移動",
+                "Ctrl+Shift+M",
+                EditCommand::PreviousMarker,
+            ),
+            ("インをマーク", "I", EditCommand::MarkIn),
+            ("アウトをマーク", "O", EditCommand::MarkOut),
+            ("インへ移動", "Shift+I", EditCommand::JumpIn),
+            ("アウトへ移動", "Shift+O", EditCommand::JumpOut),
+            ("インとアウトを消去", "Alt+X", EditCommand::ClearMarks),
+        ] {
+            if ui
+                .add(egui::Button::new(label).shortcut_text(key))
+                .clicked()
+            {
+                command = run;
+                ui.close();
+            }
+        }
+        ui.separator();
+        for (label, key, action) in [
+            ("左へシャトル", "J", Seek::Shuttle(-1)),
+            ("停止", "K", Seek::Stop),
+            ("右へシャトル", "L", Seek::Shuttle(1)),
+        ] {
+            if ui
+                .add(egui::Button::new(label).shortcut_text(key))
+                .clicked()
+            {
+                seek = action;
+                ui.close();
+            }
+        }
+        ui.separator();
+        for (label, key, action) in [
+            ("1フレーム前へ", "←", Seek::By(-1)),
+            ("1フレーム先へ", "→", Seek::By(1)),
+            ("5フレーム前へ", "Shift+←", Seek::By(-5)),
+            ("5フレーム先へ", "Shift+→", Seek::By(5)),
+        ] {
+            if ui
+                .add(egui::Button::new(label).shortcut_text(key))
+                .clicked()
+            {
+                seek = action;
+                ui.close();
+            }
+        }
+        ui.separator();
+        for (label, key, action) in [
+            ("前の編集点へ", "↑", Seek::Edit(-1)),
+            ("次の編集点へ", "↓", Seek::Edit(1)),
+        ] {
+            if ui
+                .add(egui::Button::new(label).shortcut_text(key))
+                .clicked()
+            {
+                seek = action;
+                ui.close();
+            }
+        }
+        self.run_edit(command);
+        self.run_seek(seek, now);
+    }
+
+    /// 窓の上端の作業状態。知らせ（失敗・書き出しの完了）が無ければ、preview に見えているもの。
+    fn status(&mut self, ui: &mut egui::Ui) {
+        let (message, color) = if !self.notice.is_empty() {
+            (self.notice.clone(), theme::ERROR)
+        } else if !self.export.finished.is_empty() {
+            (self.export.finished.clone(), theme::TEXT)
+        } else if self.session.is_playing() {
+            ("再生中".to_owned(), theme::TEXT)
+        } else {
+            let shown = self
+                .session
+                .effect_target()
+                .map(|clip| format!("{} を表示しています", clip.name))
+                .unwrap_or_else(|| "timeline gapを表示しています".to_owned());
+            (shown, theme::TEXT)
+        };
+        ui.add(egui::Label::new(egui::RichText::new(message).color(color)).truncate());
+    }
+    /// 左パネルのタブ。選んでいるタブは太字と下線で示す。
+    fn tabs(&mut self, ui: &mut egui::Ui) {
+        let project = self
+            .session
+            .path()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "無題".to_owned());
+        let tabs = [
+            (LeftTab::Effects, "エフェクトコントロール".to_owned()),
+            (LeftTab::Project, format!("プロジェクト: {project}")),
+            (LeftTab::Mixer, "オーディオミキサー".to_owned()),
+            (LeftTab::Subtitles, "字幕".to_owned()),
+        ];
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            // 収まるなら各タブを名前の幅に余りを等分して足した幅にし、収まらなければ名前の幅の比で縮める。
+            // 等分すると、短い名前の余りを使えずに長い名前だけが切れる。
+            let font = egui::FontId::proportional(12.0);
+            let natural: Vec<f32> = tabs
+                .iter()
+                .map(|(_, label)| {
+                    ui.painter()
+                        .layout_no_wrap(label.clone(), font.clone(), theme::TEXT)
+                        .size()
+                        .x
+                        + 16.0
+                })
+                .collect();
+            let total: f32 = natural.iter().sum();
+            let available = ui.available_width();
+            let extra = (available - total).max(0.0) / natural.len() as f32;
+            let scale = (available / total).min(1.0);
+            for ((tab, label), natural) in tabs.into_iter().zip(natural) {
+                let active = self.left_tab == tab;
+                let width = natural * scale + extra;
+                let text = egui::RichText::new(label).size(12.0).color(if active {
+                    theme::TEXT
+                } else {
+                    theme::TEXT_TAB
+                });
+                let text = if active { text.strong() } else { text };
+                let response = ui.add_sized(
+                    [width, 24.0],
+                    egui::Label::new(text)
+                        .truncate()
+                        .sense(egui::Sense::click()),
+                );
+                if active {
+                    let line = egui::Rect::from_min_max(
+                        egui::pos2(response.rect.min.x, response.rect.max.y - 2.0),
+                        response.rect.max,
+                    );
+                    ui.painter().rect_filled(line, 0.0, theme::ACCENT);
+                }
+                if response
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    self.left_tab = tab;
+                }
+            }
+        });
+        let y = ui.cursor().min.y;
+        ui.painter().hline(
+            ui.max_rect().x_range(),
+            y,
+            egui::Stroke::new(1.0, theme::PANEL_BORDER),
+        );
+        ui.add_space(6.0);
     }
 
     fn confirm_unsaved(&mut self, ui: &mut egui::Ui) {
@@ -779,24 +1016,28 @@ impl MvmApp {
             return;
         };
         let mut choice = None;
-        egui::Modal::new(egui::Id::new("unsaved")).show(ui.ctx(), |ui| {
-            ui.label("保存していない変更があります");
-            ui.horizontal(|ui| {
-                if ui.button("変更を保存").clicked() {
+        let width = (ui.ctx().content_rect().width() - 40.0).clamp(300.0, 420.0);
+        dialog::show(
+            ui.ctx(),
+            "unsaved",
+            "未保存の変更",
+            width,
+            |ui| {
+                ui.label("プロジェクトへの変更を保存しますか？");
+            },
+            |ui| {
+                if widgets::dialog_button(ui, "保存", ButtonKind::Prominent).clicked() {
                     choice = Some(UnsavedChoice::Save);
                 }
-                let discard = match action {
-                    FileAction::Close => "破棄して終了",
-                    FileAction::New | FileAction::Open => "破棄して続ける",
-                };
-                if ui.button(discard).clicked() {
+                if widgets::dialog_button(ui, "保存しない", ButtonKind::Destructive).clicked()
+                {
                     choice = Some(UnsavedChoice::Discard);
                 }
-                if ui.button("キャンセル").clicked() {
+                if widgets::dialog_button(ui, "キャンセル", ButtonKind::Normal).clicked() {
                     choice = Some(UnsavedChoice::Cancel);
                 }
-            });
-        });
+            },
+        );
         match choice {
             Some(UnsavedChoice::Save) => match self.save_current(action) {
                 Ok(SaveOutcome::Saved) => {
@@ -825,7 +1066,6 @@ impl MvmApp {
             None => {}
         }
     }
-
     fn recovery_visible(&self) -> bool {
         self.session.recovery_prompt().is_some() && !self.recovery_closed
     }
@@ -841,33 +1081,73 @@ impl MvmApp {
         if self.recovery_closed {
             return;
         }
+        let path = self
+            .session
+            .path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        let (title, text) = match prompt {
+            RecoveryPrompt::Corrupt => (
+                "自動復旧データを読めません",
+                format!(
+                    "自動復旧データが壊れているため、最後に保存したProjectを開きました。復旧fileは残しています。\n{path}"
+                ),
+            ),
+            RecoveryPrompt::Foreign => (
+                "別のProjectの自動復旧データです",
+                format!(
+                    "この自動復旧データは、今開いているProjectのものではありません。fileは残しています。\n{path}"
+                ),
+            ),
+            RecoveryPrompt::CanonicalChanged => (
+                "Project fileが外部で変更されています",
+                format!(
+                    "自動保存のあとでProject fileの内容が変わっています。復元すると、その変更は明示保存するまでfileへ書き込まれません。\n{path}"
+                ),
+            ),
+            RecoveryPrompt::Restorable => (
+                "自動保存された編集があります",
+                format!(
+                    "前回、正常に保存されなかった編集が見つかりました。\n{path}\n\n自動保存された編集を復元しますか？"
+                ),
+            ),
+        };
         let mut choice = None;
-        egui::Modal::new(egui::Id::new("recovery")).show(ui.ctx(), |ui| {
-            ui.label(match prompt {
-                RecoveryPrompt::Restorable => "自動復旧データがあります",
-                RecoveryPrompt::CanonicalChanged => {
-                    "Project file が変わったあとの自動復旧データがあります"
-                }
-                RecoveryPrompt::Corrupt => "自動復旧データを読めません",
-                RecoveryPrompt::Foreign => "別の Project の自動復旧データがあります",
-            });
-            ui.horizontal(|ui| {
-                match prompt {
-                    RecoveryPrompt::Restorable | RecoveryPrompt::CanonicalChanged => {
-                        if ui.button("復元する").clicked() {
-                            choice = Some(RecoveryChoice::Restore);
-                        }
-                        if ui.button("破棄する").clicked() {
-                            choice = Some(RecoveryChoice::Discard);
-                        }
+        let width = (ui.ctx().content_rect().width() - 40.0).clamp(300.0, 620.0);
+        dialog::show(
+            ui.ctx(),
+            "recovery",
+            title,
+            width,
+            |ui| {
+                ui.label(&text);
+            },
+            |ui| match prompt {
+                RecoveryPrompt::Restorable | RecoveryPrompt::CanonicalChanged => {
+                    if widgets::dialog_button(ui, "復元する", ButtonKind::Prominent).clicked() {
+                        choice = Some(RecoveryChoice::Restore);
                     }
-                    RecoveryPrompt::Corrupt | RecoveryPrompt::Foreign => {}
+                    let discard = if prompt == RecoveryPrompt::CanonicalChanged {
+                        "現在のProjectを開く"
+                    } else {
+                        "最後の保存状態を使う"
+                    };
+                    if widgets::dialog_button(ui, discard, ButtonKind::Destructive).clicked() {
+                        choice = Some(RecoveryChoice::Discard);
+                    }
+                    if prompt == RecoveryPrompt::CanonicalChanged
+                        && widgets::dialog_button(ui, "キャンセル", ButtonKind::Normal).clicked()
+                    {
+                        choice = Some(RecoveryChoice::Close);
+                    }
                 }
-                if ui.button("閉じる").clicked() {
-                    choice = Some(RecoveryChoice::Close);
+                RecoveryPrompt::Corrupt | RecoveryPrompt::Foreign => {
+                    if widgets::dialog_button(ui, "OK", ButtonKind::Prominent).clicked() {
+                        choice = Some(RecoveryChoice::Close);
+                    }
                 }
-            });
-        });
+            },
+        );
         match choice {
             Some(RecoveryChoice::Restore) => self.perform_edit(Session::restore_recovery),
             Some(RecoveryChoice::Discard) => {
@@ -884,30 +1164,47 @@ impl MvmApp {
             None => {}
         }
     }
-
     fn confirm_external(&mut self, ui: &mut egui::Ui) {
         if !self.external_visible() {
             return;
         }
         let mut choice = None;
-        egui::Modal::new(egui::Id::new("external")).show(ui.ctx(), |ui| {
-            ui.label("Project file が外部で変更されています");
-            ui.horizontal(|ui| {
-                if ui.button("読み直す").clicked() {
-                    choice = Some(ExternalChoice::Reload);
-                }
-                if ui.button("上書き保存").clicked() {
+        let width = (ui.ctx().content_rect().width() - 40.0).clamp(300.0, 620.0);
+        dialog::show(
+            ui.ctx(),
+            "external",
+            "Project fileが外部で変更されています",
+            width,
+            |ui| {
+                ui.label(
+                    "このProjectを開いたあとで、fileの内容が変わっています。このまま保存すると、その変更を上書きします。",
+                );
+            },
+            |ui| {
+                if widgets::dialog_button(ui, "上書きする", ButtonKind::Destructive).clicked()
+                {
                     choice = Some(ExternalChoice::Overwrite);
                 }
-                if ui.button("キャンセル").clicked() {
+                if widgets::dialog_button(ui, "名前を付けて保存", ButtonKind::Normal).clicked()
+                {
+                    choice = Some(ExternalChoice::SaveAs);
+                }
+                if widgets::dialog_button(ui, "読み直す", ButtonKind::Normal).clicked() {
+                    choice = Some(ExternalChoice::Reload);
+                }
+                if widgets::dialog_button(ui, "キャンセル", ButtonKind::Normal).clicked() {
                     choice = Some(ExternalChoice::Cancel);
                 }
-            });
-        });
+            },
+        );
         match choice {
             Some(ExternalChoice::Reload) => self.perform_edit(Session::reload_project),
             Some(ExternalChoice::Overwrite) => {
                 self.perform_edit(Session::save_overwriting_external);
+            }
+            Some(ExternalChoice::SaveAs) => {
+                self.external_closed = true;
+                self.save_as();
             }
             Some(ExternalChoice::Cancel) => self.external_closed = true,
             None => {}
@@ -979,6 +1276,7 @@ enum ExternalChoice {
     Reload,
     Overwrite,
     Cancel,
+    SaveAs,
 }
 
 enum Command {
@@ -1061,13 +1359,43 @@ impl MvmApp {
             self.shown_title = Some(title);
         }
         self.handle_shortcuts(ui);
-        egui::Panel::top("menu").show(ui, |ui| self.menu(ui));
+        egui::Panel::top("menu")
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::WINDOW)
+                    .inner_margin(egui::Margin::symmetric(6, 2)),
+            )
+            .show(ui, |ui| self.menu(ui));
+        egui::Panel::top("status")
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::WINDOW)
+                    .inner_margin(egui::Margin::symmetric(10, 4)),
+            )
+            .show(ui, |ui| self.status(ui));
+        self.mixer.update(ui, &mut self.session);
         egui::Panel::bottom("timeline")
             .resizable(true)
-            .default_size(280.0)
+            .default_size(
+                (ui.available_height() * TIMELINE_DEFAULT_SHARE).max(TIMELINE_MINIMUM_HEIGHT),
+            )
+            .size_range(TIMELINE_MINIMUM_HEIGHT..=f32::INFINITY)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::WINDOW)
+                    .inner_margin(egui::Margin {
+                        left: 10,
+                        right: 10,
+                        top: 6,
+                        bottom: 10,
+                    }),
+            )
             .show(ui, |ui| {
                 timeline_ui::show(ui, &mut self.session, &mut self.timeline);
             });
+        if std::mem::take(&mut self.timeline.open_subtitles) {
+            self.left_tab = LeftTab::Subtitles;
+        }
         // OS から落とされたファイルはプロジェクトパネルへ読み込む。Windows の OLE のドラッグ中は窓に pointer の
         // 位置が届かず、どの行に落としたかを確かめられないので、timeline へは置かない。
         let dropped: Vec<PathBuf> = ui.input(|input| {
@@ -1082,54 +1410,87 @@ impl MvmApp {
             project_panel::import(&mut self.session, &dropped, "");
             self.left_tab = LeftTab::Project;
         }
-        egui::Panel::left("project")
+        egui::Panel::left("left_panel")
             .resizable(true)
-            .default_size(260.0)
+            .default_size(LEFT_PANEL_DEFAULT_WIDTH)
+            .size_range(240.0..=f32::INFINITY)
+            .frame(theme::panel_frame().outer_margin(egui::Margin {
+                left: 10,
+                right: 4,
+                top: 0,
+                bottom: 4,
+            }))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.left_tab, LeftTab::Project, "プロジェクト");
-                    ui.selectable_value(&mut self.left_tab, LeftTab::Subtitles, "字幕");
-                    ui.selectable_value(&mut self.left_tab, LeftTab::Mixer, "ミキサー");
-                });
-                ui.separator();
+                self.tabs(ui);
                 match self.left_tab {
+                    LeftTab::Effects => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("inspector_scroll")
+                            .show(ui, |ui| {
+                                inspector::show(ui, &mut self.session, &mut self.inspector);
+                            });
+                    }
                     LeftTab::Project => {
                         project_panel::show(ui, &mut self.session, &mut self.project_panel);
                     }
-                    LeftTab::Subtitles => subtitle_panel::show(
-                        ui,
-                        &mut self.session,
-                        &mut self.subtitle_panel,
-                        &mut self.transcribe,
-                    ),
                     LeftTab::Mixer => mixer_ui::show(ui, &mut self.session, &mut self.mixer),
+                    LeftTab::Subtitles => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("subtitle_scroll")
+                            .show(ui, |ui| {
+                                subtitle_panel::show(
+                                    ui,
+                                    &mut self.session,
+                                    &mut self.subtitle_panel,
+                                    &mut self.transcribe,
+                                );
+                            });
+                    }
                 }
             });
-        egui::Panel::right("inspector")
-            .resizable(true)
-            .default_size(280.0)
+        egui::Panel::right("master")
+            .resizable(false)
+            .exact_size(MASTER_STRIP_WIDTH)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::WINDOW)
+                    .inner_margin(egui::Margin {
+                        left: 8,
+                        right: 10,
+                        top: 0,
+                        bottom: 4,
+                    }),
+            )
             .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("inspector_scroll")
-                    .show(ui, |ui| {
-                        inspector::show(ui, &mut self.session, &mut self.inspector);
-                    });
+                mixer_ui::show_master_strip(ui, &mut self.session, &mut self.mixer);
             });
-        egui::CentralPanel::default().show(ui, |ui| {
-            preview_ui::show(
-                ui,
-                &mut self.session,
-                &mut self.preview_texture,
-                &mut self.text_draft,
-                &mut self.notice,
-                &mut self.preview_drag,
-            );
-        });
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::PREVIEW)
+                    .stroke(egui::Stroke::new(1.0, theme::PANEL_BORDER))
+                    .outer_margin(egui::Margin {
+                        left: 0,
+                        right: 0,
+                        top: 0,
+                        bottom: 4,
+                    }),
+            )
+            .show(ui, |ui| {
+                preview_ui::show(
+                    ui,
+                    &mut self.session,
+                    &mut self.preview_texture,
+                    &mut self.text_draft,
+                    &mut self.notice,
+                    &mut self.preview_drag,
+                );
+            });
         self.confirm_unsaved(ui);
         self.confirm_overwrite(ui);
         self.confirm_recovery(ui);
         self.confirm_external(ui);
-        export_ui::show(ui, &mut self.session, &mut self.export, &mut self.notice);
+        export_ui::show(ui, &mut self.session, &mut self.export);
         audio_adjust_ui::show(ui, &mut self.session, &mut self.audio_adjust);
         if let Some(clip_id) = self.timeline.transcribe_clip.take() {
             self.transcribe.open(&self.session, Some(clip_id));
@@ -1161,10 +1522,42 @@ mod tests {
 
     use super::*;
 
+    /// 左パネルで tab を開いた app。既定はエフェクトコントロール。
+    fn on_tab(tab: LeftTab) -> MvmApp {
+        let mut app = MvmApp::new();
+        app.left_tab = tab;
+        app
+    }
+
     fn harness(app: MvmApp) -> Harness<'static, MvmApp> {
-        Harness::builder()
-            .with_size(egui::vec2(1200.0, 800.0))
-            .build_ui_state(|ui, app| app.show(ui), app)
+        harness_sized(app, egui::vec2(1200.0, 800.0))
+    }
+
+    fn harness_sized(app: MvmApp, size: egui::Vec2) -> Harness<'static, MvmApp> {
+        // preview の worker は描き終えるたびに画面を起こす。描き直しが続く間も run が待ち切れるよう、step の
+        // 上限を既定（4）より広げる（試験の時計は進まないので、待っても遅くならない）。
+        let mut harness = Harness::builder()
+            .with_size(size)
+            .with_max_steps(64)
+            .build_ui_state(
+                |ui, app| {
+                    // フォントは次の pass から効く。太字の family が揃うまでは描かない。
+                    let ready = ui.ctx().fonts(|fonts| {
+                        fonts
+                            .families()
+                            .contains(&egui::FontFamily::Name("bold".into()))
+                    });
+                    if ready {
+                        app.show(ui);
+                    } else {
+                        theme::install_test_fonts(ui.ctx());
+                        ui.ctx().request_repaint();
+                    }
+                },
+                app,
+            );
+        harness.run();
+        harness
     }
 
     fn text_clip(name: &str, start: i64) -> TimelineClip {
@@ -1185,31 +1578,38 @@ mod tests {
     #[test]
     fn shell_shows_the_default_project_and_the_file_menu() {
         let mut harness = harness(MvmApp::new());
-        harness.get_by_label("ファイル");
+        harness.get_by_label("ファイル(F)");
         harness.get_by_label("V1");
         harness.get_by_label("V2");
         harness.get_by_label("A1");
-        harness.get_by_label("停止");
-        harness.get_by_label("100%");
+        harness.get_by_label("timeline gapを表示しています");
+        harness.get_by_label_contains("zoom 150%");
         assert!(
             harness
                 .query_all_by_label_contains("00:00:00:00")
                 .next()
                 .is_some()
         );
-        harness.get_by_label("素材がありません");
+        // 左パネルは既定でエフェクトコントロール。プロジェクトのタブへ切り替えられる。
+        harness.get_by_label("エフェクトコントロール");
+        harness.get_by_label("プロジェクト: 無題").click();
+        harness.run();
+        harness.get_by_label("ファイルをここへドロップするか「読み込み…」で素材を追加");
 
-        harness.get_by_label("ファイル").click();
+        harness.get_by_label("ファイル(F)").click();
         harness.run();
         for label in [
             "新規プロジェクト",
-            "開く",
+            "プロジェクトを開く",
             "保存",
             "名前を付けて保存",
-            "書き出し",
+            "メディアを書き出し",
             "終了",
         ] {
-            harness.get_by_label(label);
+            assert!(
+                harness.query_all_by_label_contains(label).next().is_some(),
+                "{label} がありません"
+            );
         }
     }
 
@@ -1218,19 +1618,26 @@ mod tests {
         use egui_kittest::kittest::NodeT as _;
 
         let mut harness = harness(MvmApp::new());
-        harness.get_by_label("ファイル").click();
+        harness.get_by_label("ファイル(F)").click();
         harness.run();
-        harness.get_by_label("書き出し").click();
+        harness.get_by_label_contains("メディアを書き出し").click();
         harness.run();
         assert!(harness.state().export.is_open(), "dialog が開きません");
-        harness.get_by_label_contains("1920×1080・60 fps・0 frame（0.00 秒）");
-        for label in [
-            "高品質（CRF 18・容量大）",
-            "標準（CRF 23）",
-            "容量優先（CRF 28・画質低下）",
-        ] {
-            harness.get_by_label(label);
-        }
+        // 書き出し設定は入力映像と出力の仕様、映像の無い Project の注意を出す（C++ 版と同じ）。
+        harness.get_by_label("入力映像: なし");
+        harness.get_by_label("出力: 1920×1080 / 60 fps");
+        harness.get_by_label("映像クリップがないため、映像は黒になります。");
+        // 品質は一覧から選ぶ。既定は標準。
+        harness.get_by_label("標準（CRF 23）").click();
+        harness.run();
+        harness.get_by_label("容量優先（CRF 28・画質低下）");
+        harness.get_by_label("高品質（CRF 18・容量大）").click();
+        harness.run();
+        assert!(
+            harness.state().export.is_open(),
+            "品質を選んで dialog が閉じました"
+        );
+        harness.get_by_label("高品質（CRF 18・容量大）");
         // 字幕の無い Project では焼き込みを選べない。
         assert!(
             harness
@@ -1239,18 +1646,59 @@ mod tests {
                 .is_disabled()
         );
 
-        harness.get_by_label("書き出す").click();
-        harness.run();
-        harness.get_by_label_contains("書き出し先が指定されていません");
-        assert!(!harness.state().session.is_exporting());
-        assert!(
-            harness.state().export.is_open(),
-            "失敗で dialog が閉じました"
-        );
-
         harness.get_by_label("キャンセル").click();
         harness.run();
         assert!(!harness.state().export.is_open());
+    }
+
+    #[test]
+    fn export_without_an_output_path_keeps_the_dialog_and_says_why() {
+        let mut harness = harness(MvmApp::new());
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::M);
+        harness.run();
+        // OS のダイアログを経由せず、そのまま書き出し設定が開く。保存前の Project では書き出し先は空。
+        assert!(harness.state().export.is_open());
+        harness.get_by_label("書き出す").click();
+        harness.run();
+        harness.get_by_label("書き出し先が指定されていません");
+        assert!(harness.state().export.is_open());
+        assert!(!harness.state().session.is_exporting());
+    }
+
+    #[test]
+    fn export_to_an_existing_file_asks_before_replacing_it() {
+        let dir = std::env::temp_dir().join(format!("mvm-export-ask-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("試験用の folder");
+        let existing = dir.join("既存.mp4");
+        std::fs::write(&existing, b"keep").expect("試験用の file");
+
+        let mut harness = harness(MvmApp::new());
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::M);
+        harness.run();
+        let field = harness.get_by_role(egui::accesskit::Role::TextInput);
+        field.click();
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .type_text(&existing.display().to_string());
+        harness.run();
+        harness.get_by_label("書き出す").click();
+        harness.run();
+        // 書き出さずに確認を出す。
+        harness.get_by_label(&format!(
+            "{} は既にあります。置き換えて書き出しますか？",
+            existing.display()
+        ));
+        assert!(!harness.state().session.is_exporting());
+        harness.get_by_label("置き換えて書き出す");
+        harness.get_by_label("やめる").click();
+        harness.run();
+        // やめると元の設定に戻り、file はそのまま残る。
+        assert!(harness.state().export.is_open());
+        harness.get_by_label("書き出す");
+        assert!(harness.query_by_label("置き換えて書き出す").is_none());
+        assert_eq!(std::fs::read(&existing).expect("残った file"), b"keep");
+        std::fs::remove_dir_all(&dir).expect("試験用の folder の片付け");
     }
 
     #[test]
@@ -1260,6 +1708,7 @@ mod tests {
         harness.run();
         assert!(harness.state().export.is_open());
         harness.get_by_label("書き出す");
+        harness.get_by_label("書き出し設定");
     }
 
     #[test]
@@ -1277,9 +1726,9 @@ mod tests {
 
     #[test]
     fn scrolling_the_timeline_draws_the_clips_that_come_into_view() {
-        // 400 frame は 100% で 3200px。最初の画面には入らない。
+        // 2200 frame は 150% で 3300 px。最初の画面には入らず、3000 px 送ると入る。
         let project = Project {
-            timeline_clips: vec![text_clip("Near", 0), text_clip("Far", 400)],
+            timeline_clips: vec![text_clip("Near", 0), text_clip("Far", 2200)],
             ..Project::default()
         };
         let mut harness = harness(MvmApp::new());
@@ -1317,18 +1766,18 @@ mod tests {
             }],
             ..Project::default()
         };
-        let mut harness = harness(MvmApp::new());
+        let mut harness = harness(on_tab(LeftTab::Project));
         harness.state_mut().session = Session::from_project(project);
+        harness.run();
+        // フォルダは閉じて始まる（C++ 版と同じ）。開閉の印で開く。
+        assert!(harness.query_by_label("背景").is_none());
+        harness.get_by_label("素材フォルダ を開閉").click();
         harness.run();
         let folder = harness.get_by_label("素材フォルダ").rect();
         let item = harness.get_by_label("背景").rect();
-        assert!(
-            item.min.x > folder.min.x,
-            "素材がフォルダの中に字下げされていません"
-        );
         assert!(item.min.y > folder.min.y);
-
-        harness.get_by_label("素材フォルダ").click();
+        // 字下げは名前の位置で見る（行の矩形は列の幅いっぱい）。開閉の印も字下げされる。
+        harness.get_by_label("素材フォルダ を開閉").click();
         harness.run();
         assert!(
             harness.query_by_label("背景").is_none(),
@@ -1347,11 +1796,11 @@ mod tests {
             }],
             ..Project::default()
         };
-        let mut harness = harness(MvmApp::new());
+        let mut harness = harness(on_tab(LeftTab::Project));
         harness.state_mut().session = Session::from_project(project);
         harness.run();
         harness.get_by_label("導入");
-        harness.get_by_label("映像");
+        harness.get_by_label("1 項目");
         assert!(harness.query_by_label("無い素材").is_none());
     }
 
@@ -1360,8 +1809,8 @@ mod tests {
         let mut harness = harness(MvmApp::new());
         harness.get_by_label("拡大").click();
         harness.run();
-        harness.get_by_label("200%");
-        assert!(harness.query_by_label("100%").is_none());
+        harness.get_by_label_contains("zoom 200%");
+        assert!(harness.query_by_label_contains("zoom 100%").is_none());
     }
 
     #[test]
@@ -1370,8 +1819,8 @@ mod tests {
         harness.state_mut().session.mark_changed();
         harness.state_mut().request_new();
         harness.run();
-        harness.get_by_label("保存していない変更があります");
-        harness.get_by_label("破棄して続ける");
+        harness.get_by_label("未保存の変更");
+        harness.get_by_label("保存しない");
         harness.get_by_label("キャンセル");
     }
 
@@ -1433,8 +1882,9 @@ mod tests {
         let ctx = harness.ctx.clone();
         harness.state_mut().handle_close_request(&ctx);
         harness.run();
-        harness.get_by_label("保存していない変更があります");
-        harness.get_by_label("破棄して終了");
+        harness.get_by_label("未保存の変更");
+        harness.get_by_label("プロジェクトへの変更を保存しますか？");
+        harness.get_by_label("保存しない");
         assert!(
             !harness.state().close_approved,
             "確認の前に終了を認めました"
@@ -1468,6 +1918,86 @@ mod tests {
             modifiers: egui::Modifiers::NONE,
         });
         harness.run();
+    }
+
+    #[test]
+    fn the_timeline_keeps_the_height_it_was_dragged_to() {
+        // 境界を上へドラッグして広げた timeline が、離した次の frame で中身の高さへ戻らない。
+        let mut harness = harness(MvmApp::new());
+        let top = |harness: &Harness<'static, MvmApp>| harness.get_by_label("+V").rect().min.y;
+        let before = top(&harness);
+        // timeline の panel の上端は、時刻の行の上の余白（6 px）の上。
+        let edge = harness
+            .query_all_by_label_contains("00:00:00:00")
+            .next()
+            .expect("時刻の表示")
+            .rect()
+            .min
+            .y
+            - 6.0;
+        press_and_release(
+            &mut harness,
+            egui::pos2(600.0, edge),
+            egui::pos2(600.0, edge - 150.0),
+        );
+        harness.run_steps(5);
+        let after = top(&harness);
+        assert!(
+            (before - after - 150.0).abs() < 4.0,
+            "timeline の上端が {before} から {after} へ動きました（150 上がるはず）"
+        );
+    }
+
+    #[test]
+    fn many_tracks_scroll_inside_the_timeline_instead_of_growing_it() {
+        // track 名の列は全 track の分の部品を置く。それが panel の大きさに数えられると、track が多いほど
+        // timeline が伸びて preview を押しつぶす。
+        let top = |harness: &Harness<'static, MvmApp>| harness.get_by_label("+V").rect().min.y;
+        let mut few = harness(MvmApp::new());
+        few.run();
+        let mut project = Project::default();
+        let track = project.video_tracks[0].clone();
+        project.video_tracks = vec![track; 12];
+        let mut many = harness(MvmApp::new());
+        many.state_mut().session = Session::from_project(project);
+        many.run_steps(5);
+        assert_eq!(
+            top(&many),
+            top(&few),
+            "track の数で timeline の高さが変わりました"
+        );
+        // 下の track は見えていないので、スクロールしないと出ない。
+        assert!(many.query_by_label("+A").is_none());
+    }
+
+    #[test]
+    fn dragging_across_the_eyes_hides_every_passed_track_in_one_undo() {
+        // 押した V2 の表示を反転し、ドラッグで通った V1 も同じにする（Photoshop の目玉と同じ）。
+        let mut harness = harness(MvmApp::new());
+        let from = harness.get_by_label("V2 表示").rect().center();
+        let to = harness.get_by_label("V1 表示").rect().center();
+        press_and_release(&mut harness, from, to);
+        let muted: Vec<bool> = harness
+            .state()
+            .session
+            .project()
+            .video_tracks
+            .iter()
+            .map(|track| track.muted)
+            .collect();
+        assert_eq!(muted, [true, true]);
+        harness.get_by_label("V1 非表示");
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+        harness.run();
+        let muted: Vec<bool> = harness
+            .state()
+            .session
+            .project()
+            .video_tracks
+            .iter()
+            .map(|track| track.muted)
+            .collect();
+        assert_eq!(muted, [false, false], "1 回の undo で戻りません");
     }
 
     fn harness_with(clips: Vec<TimelineClip>) -> Harness<'static, MvmApp> {
@@ -1536,12 +2066,12 @@ mod tests {
         let mut harness = harness_with_placed_text("動かす文字");
         let rect = harness.get_by_label("動かす文字").rect();
         let at = egui::pos2(rect.min.x + 80.0, rect.center().y);
-        // 100% は 1 frame 8px。80px 右は 10 frame。
+        // 150% は 1 frame 1.5 px。80 px 右は 53 frame（切り捨て）。
         press_and_release(&mut harness, at, at + egui::vec2(80.0, 0.0));
         let session = &harness.state().session;
         assert_eq!(
             session.project().timeline_clips[0].timeline_start_frame,
-            10,
+            53,
             "{:?}",
             session.alert()
         );
@@ -1550,10 +2080,12 @@ mod tests {
     #[test]
     fn tool_button_track_visibility_and_undo_are_reachable() {
         let mut harness = harness(MvmApp::new());
-        harness.get_by_label("ツール 選択");
+        // ツールはアイコンだけのボタンで、名前で引ける。押したツールに切り替わる。
+        assert_eq!(harness.state().session.tool(), TimelineTool::Select);
         harness.get_by_label("レーザー").click();
         harness.run();
-        harness.get_by_label("ツール レーザー");
+        assert_eq!(harness.state().session.tool(), TimelineTool::Razor);
+        harness.get_by_label_contains("レーザー: ");
 
         harness.get_by_label("V1 表示").click();
         harness.run();
@@ -1583,7 +2115,7 @@ mod tests {
         harness.run();
         harness.get_by_label("字幕がありません");
         harness.get_by_label("自動文字起こし");
-        harness.get_by_label("SRT 読み込み");
+        harness.get_by_label("SRT読込");
         // 本文を入れて「追加」すると、一覧と S1 レーンに出る。
         harness.state_mut().subtitle_panel_draft("最初の字幕");
         harness.run();
@@ -1609,21 +2141,23 @@ mod tests {
     #[test]
     fn the_mixer_tab_shows_one_strip_per_audio_track_and_the_master() {
         let mut harness = harness(MvmApp::new());
-        harness.get_by_label("ミキサー").click();
+        harness.get_by_label("オーディオミキサー").click();
         harness.run();
         // A1 はタイムラインの行名にも出るので、ミキサー側の名前を 1 つ以上あることで数える。
         assert!(harness.query_all_by_label("A1").count() >= 2);
         harness.get_by_label("マスター");
-        harness.get_by_label("モニター");
-        assert!(harness.query_all_by_label("消音").count() >= 1);
+        harness.get_by_label("再生の出口");
+        // M / S は timeline の行と、ミキサーの帯の両方にある。
+        assert_eq!(harness.query_all_by_label("M").count(), 2);
+        assert_eq!(harness.query_all_by_label("S").count(), 2);
     }
 
     #[test]
     fn the_insert_menu_places_a_math_clip_and_the_inspector_edits_it() {
         let mut harness = harness(MvmApp::new());
-        harness.get_by_label("挿入").click();
+        harness.get_by_label("ファイル(F)").click();
         harness.run();
-        harness.get_by_label("数式").click();
+        harness.get_by_label("数式 clip を追加").click();
         // 数式を置くと描画の service が動き、確認・描画のたびに画面を起こす。描画の完了は待たないので、
         // 決まった回数だけ進める（run は repaint が止むまで待つ）。
         harness.run_steps(3);
@@ -1638,12 +2172,14 @@ mod tests {
     #[test]
     fn the_audio_menu_opens_the_automatic_adjustment_dialog() {
         let mut harness = harness(MvmApp::new());
-        harness.get_by_label("音声").click();
+        harness.get_by_label("編集(E)").click();
         harness.run();
-        harness.get_by_label("自動音量調整").click();
+        harness.get_by_label("自動音量調整…").click();
         harness.run();
-        harness.get_by_label("ラウドネスを揃える");
-        harness.get_by_label("解析する");
+        harness.get_by_label("BGM の自動音量調整");
+        harness.get_by_label("ラウドネス正規化");
+        harness.get_by_label("解析・カーブ生成");
+        harness.get_by_label("音声を試聴");
     }
 
     fn video_clip(name: &str, start: i64) -> TimelineClip {
@@ -1663,7 +2199,7 @@ mod tests {
 
     #[test]
     fn the_project_panel_creates_a_folder_and_starts_renaming_it() {
-        let mut harness = harness(MvmApp::new());
+        let mut harness = harness(on_tab(LeftTab::Project));
         harness.get_by_label("読み込み…");
         harness.get_by_label("新規フォルダ").click();
         harness.run();
@@ -1701,9 +2237,9 @@ mod tests {
     #[test]
     fn the_settings_dialog_changes_the_frame_rate_in_one_undo() {
         let mut harness = harness(MvmApp::new());
-        harness.get_by_label("ファイル").click();
+        harness.get_by_label("プロジェクト(P)").click();
         harness.run();
-        harness.get_by_label("プロジェクト設定…").click();
+        harness.get_by_label("プロジェクト設定").click();
         harness.run();
         harness.get_by_label("プロジェクト設定");
         harness.get_by_value("60 fps").click();
@@ -1724,7 +2260,9 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_r_opens_the_speed_dialog_only_for_a_clip_with_a_source() {
+    fn ctrl_r_opens_the_speed_dialog_and_a_text_clip_changes_only_its_duration() {
+        use egui_kittest::kittest::NodeT as _;
+
         let mut harness = harness_with(vec![video_clip("映像", 0), text_clip("文字", 200)]);
         harness
             .state_mut()
@@ -1744,8 +2282,17 @@ mod tests {
             .select_only("id-文字".to_owned());
         harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::R);
         harness.run();
+        // 文字 clip も開く。速度とピッチは選べず、尺だけを変える（C++ 版と同じ）。
+        harness.get_by_label("速度・デュレーション");
+        assert!(
+            harness
+                .get_by_label("オーディオのピッチを維持")
+                .accesskit_node()
+                .is_disabled()
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run();
         assert!(harness.query_by_label("速度・デュレーション").is_none());
-        assert!(harness.state().notice.contains("速度を変えられません"));
     }
 
     #[test]
@@ -1753,7 +2300,12 @@ mod tests {
         let mut harness = harness_with(vec![video_clip("映像", 0)]);
         harness.state_mut().session.seek(30);
         harness.run();
-        harness.get_by_label("映像").click_secondary();
+        harness
+            .get_by(|node| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.label().as_deref() == Some("映像")
+            })
+            .click_secondary();
         harness.run();
         harness.get_by_label("速度・デュレーション…");
         harness.get_by_label("プロジェクト設定をこの素材に合わせる");
@@ -1784,12 +2336,7 @@ mod tests {
         harness.get_by_label("位置 X");
         harness.get_by_label("縦横比を固定");
         assert!(harness.query_by_label("音量").is_none());
-        // 1 つ目の「アニメ」は位置 X。
-        harness
-            .query_all_by_label("アニメ")
-            .next()
-            .expect("アニメの切り替え")
-            .click();
+        harness.get_by_label("位置 X のアニメーション").click();
         harness.run();
         assert_eq!(harness.state().notice, "");
         let keys = &harness.state().session.project().timeline_clips[0]
@@ -1798,7 +2345,7 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].frame, 30);
         // キーのある channel は前後の移動とキーの切り替えを出す。
-        harness.get_by_label("キー").click();
+        harness.get_by_label("位置 X のキー").click();
         harness.run();
         let effects = &harness.state().session.project().timeline_clips[0].effects;
         assert!(effects.position_x_keys.is_empty());
@@ -1809,9 +2356,7 @@ mod tests {
         let mut heading = text_clip("見出し", 0);
         heading.text.content = "見出し".to_owned();
         // 書式の欄が全て見えるよう、縦に長い窓で開く。
-        let mut harness = Harness::builder()
-            .with_size(egui::vec2(1200.0, 1600.0))
-            .build_ui_state(|ui, app| app.show(ui), MvmApp::new());
+        let mut harness = harness_sized(MvmApp::new(), egui::vec2(1200.0, 1600.0));
         harness.state_mut().session = Session::from_project(Project {
             timeline_clips: vec![heading],
             ..Project::default()
@@ -1837,7 +2382,7 @@ mod tests {
                 .content,
             "見出し"
         );
-        harness.get_by_label("文字を適用").click();
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Enter);
         harness.run();
         let clip = &harness.state().session.project().timeline_clips[0];
         assert_eq!(clip.text.content, "見出しを直す");
@@ -1854,7 +2399,7 @@ mod tests {
         harness.run();
         harness.get_by_label("音量");
         harness.get_by_label("ダッキング");
-        harness.get_by_label("フェードイン");
+        harness.get_by_label("フェードイン (素材f)");
         assert!(harness.query_by_label("位置 X").is_none());
     }
 
@@ -1886,7 +2431,7 @@ mod tests {
     fn the_playback_menu_lists_the_transport_with_its_keys() {
         let mut harness = harness(MvmApp::new());
         harness
-            .query_all_by_label("再生")
+            .query_all_by_label("再生(L)")
             .next()
             .expect("再生のメニュー")
             .click();
@@ -1915,7 +2460,7 @@ mod tests {
             node.role() == egui::accesskit::Role::SpinButton
                 && node.value().is_some_and(|value| value.starts_with("15"))
         };
-        harness.get_by(field).focus();
+        harness.get_by(field).click();
         harness.run();
         harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
         harness.get_by(|node| node.is_focused()).type_text("12");
@@ -1998,7 +2543,7 @@ mod tests {
         harness.state_mut().session.seek(30);
         harness.run();
         // 30 frame の位置 X（15%）の欄に入り、値を変えずに再生ヘッドを動かしてから抜ける。
-        harness.get_by(spin_starting_with("15")).focus();
+        harness.get_by(spin_starting_with("15")).click();
         harness.run();
         harness.state_mut().session.seek(80);
         harness.run();
@@ -2022,7 +2567,7 @@ mod tests {
         harness.state_mut().session.select_only("id-一".to_owned());
         harness.state_mut().session.seek(30);
         harness.run();
-        harness.get_by(spin_starting_with("15")).focus();
+        harness.get_by(spin_starting_with("15")).click();
         harness.run();
         harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
         harness.get_by(|node| node.is_focused()).type_text("40");
@@ -2049,7 +2594,7 @@ mod tests {
             media_folders: vec![folder("a", "フォルダA"), folder("b", "フォルダB")],
             ..Project::default()
         };
-        let mut harness = harness(MvmApp::new());
+        let mut harness = harness(on_tab(LeftTab::Project));
         harness.state_mut().session = Session::from_project(project);
         harness.run();
         let from = harness.get_by_label("フォルダA").rect().center();
@@ -2063,7 +2608,7 @@ mod tests {
         assert_eq!(parent(&harness), "b", "フォルダをフォルダへ移せません");
         // 開いたフォルダB の中の A を、パネル下の空白（root）へ戻す。
         let from = harness.get_by_label("フォルダA").rect().center();
-        let empty = harness.get_by_label("フォルダB").rect().center() + egui::vec2(0.0, 300.0);
+        let empty = harness.get_by_label("フォルダB").rect().center() + egui::vec2(0.0, 120.0);
         press_and_release(&mut harness, from, empty);
         assert_eq!(parent(&harness), "", "root へ戻せません");
     }

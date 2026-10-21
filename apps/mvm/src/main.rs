@@ -4,7 +4,9 @@
 
 mod audio_adjust_ui;
 mod clip_dialogs;
+mod dialog;
 mod export_ui;
+mod icons;
 mod inspector;
 mod math_ui;
 mod mixer_ui;
@@ -14,20 +16,24 @@ mod project_panel;
 mod shell;
 mod subtitle_lane;
 mod subtitle_panel;
+mod text_style_ui;
+mod theme;
 mod timeline_ui;
 mod transcribe_ui;
 mod widgets;
 
-use std::path::Path;
-use std::sync::Arc;
+use std::path::PathBuf;
 
 use eframe::egui;
 
-/// 日本語を表示するための UI フォント。無ければ起動を失敗させる（代替フォントは探さない）。
-const UI_FONT_PATH: &str = r"C:\Windows\Fonts\meiryo.ttc";
-const UI_FONT_NAME: &str = "meiryo";
-
 fn main() -> eframe::Result {
+    let project = match parse_arguments(std::env::args().skip(1)) {
+        Ok(project) => project,
+        Err(message) => {
+            eprintln!("{message}\nusage: mvm [--project <path>]");
+            std::process::exit(2);
+        }
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("mvm")
@@ -39,28 +45,52 @@ fn main() -> eframe::Result {
         "mvm",
         options,
         Box::new(|creation| {
-            install_ui_font(&creation.egui_ctx, Path::new(UI_FONT_PATH))?;
-            creation.egui_ctx.set_theme(egui::Theme::Dark);
-            Ok(Box::new(shell::MvmApp::new()))
+            theme::install_fonts(&creation.egui_ctx)?;
+            theme::apply(&creation.egui_ctx);
+            let mut app = shell::MvmApp::new();
+            if let Some(path) = project {
+                app.open_at_start(&path);
+            }
+            Ok(Box::new(app))
         }),
     )
 }
 
-fn install_ui_font(ctx: &egui::Context, path: &Path) -> Result<(), String> {
-    let bytes = std::fs::read(path)
-        .map_err(|error| format!("UI フォントを読めません ({}): {error}", path.display()))?;
-    let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        UI_FONT_NAME.to_owned(),
-        Arc::new(egui::FontData::from_owned(bytes)),
-    );
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .insert(0, UI_FONT_NAME.to_owned());
+/// 起動引数。C++ 版と同じく `--project <path>` で開く Project を渡す。知らない引数は受け付けない。
+fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<PathBuf>, String> {
+    let mut arguments = arguments;
+    let mut project = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--project" => {
+                let path = arguments
+                    .next()
+                    .ok_or_else(|| "--project の後に Project のパスがありません".to_owned())?;
+                project = Some(PathBuf::from(path));
+            }
+            other => return Err(format!("知らない引数です: {other}")),
+        }
     }
-    ctx.set_fonts(fonts);
-    Ok(())
+    Ok(project)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(arguments: &[&str]) -> Result<Option<PathBuf>, String> {
+        parse_arguments(arguments.iter().map(|argument| (*argument).to_owned()))
+    }
+
+    #[test]
+    fn the_project_argument_names_the_file_to_open() {
+        assert_eq!(parse(&[]), Ok(None));
+        assert_eq!(
+            parse(&["--project", r"C:\demo\project.mvm"]),
+            Ok(Some(PathBuf::from(r"C:\demo\project.mvm")))
+        );
+        assert!(parse(&["--project"]).is_err());
+        assert!(parse(&["project.mvm"]).is_err());
+        assert!(parse(&["--manim-executable", "manim.exe"]).is_err());
+    }
 }

@@ -181,8 +181,8 @@ impl Session {
         let start = target.start_frame;
         let mut factory = self.id_factory();
         let clip_id = factory.next();
-        self.id_serial = factory.serial;
-        Some(self.transact(move |project| {
+        let serial = factory.serial;
+        let result = self.transact(move |project| {
             let video = outcome.asset.generated_video_path.clone();
             let replaced =
                 install_manim_asset(project, outcome.asset.clone(), outcome.fps, outcome.frames)?;
@@ -219,7 +219,11 @@ impl Session {
                 start,
                 TrackRef::video(track),
             )
-        }))
+        });
+        if result.is_ok() {
+            self.id_serial = serial;
+        }
+        Some(result)
     }
 }
 

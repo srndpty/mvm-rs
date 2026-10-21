@@ -55,11 +55,11 @@ impl Session {
             .find(|cue| cue.id == id)
     }
 
-    fn fresh_cue_id(&mut self) -> String {
+    /// 未使用の字幕 ID と、それを使った後の serial。serial は編集が確定してから Session へ書く。
+    fn fresh_cue_id(&self) -> (String, u64) {
         let mut factory = self.id_factory();
         let id = factory.next();
-        self.id_serial = factory.serial;
-        id
+        (id, factory.serial)
     }
 
     /// 字幕を 1 つ足し、それを選ぶ。重なり・空の本文・0 frame は project が拒否する。
@@ -69,7 +69,7 @@ impl Session {
         end: i64,
         content: &str,
     ) -> Result<String, AppError> {
-        let id = self.fresh_cue_id();
+        let (id, serial) = self.fresh_cue_id();
         let cue = SubtitleCue {
             id: id.clone(),
             start_frame: start,
@@ -78,6 +78,7 @@ impl Session {
             link_clip_id: String::new(),
         };
         self.transact(move |project| edit_subtitle(project, cue).map(|()| None))?;
+        self.id_serial = serial;
         self.select_subtitles(vec![id.clone()]);
         Ok(id)
     }
@@ -124,11 +125,13 @@ impl Session {
         text_break: Option<usize>,
     ) -> Result<(), AppError> {
         let frame = self.playhead_frame;
-        let new_id = self.fresh_cue_id();
+        let (new_id, serial) = self.fresh_cue_id();
         let id = id.to_owned();
         self.transact(move |project| {
             split_subtitle(project, &id, frame, &new_id, text_break).map(|()| None)
-        })
+        })?;
+        self.id_serial = serial;
+        Ok(())
     }
 
     pub fn merge_subtitle_with_next(&mut self, id: &str) -> Result<(), AppError> {
@@ -210,8 +213,8 @@ impl Session {
                 ..cue
             });
         }
-        self.id_serial = factory.serial;
         self.transact(move |project| apply_subtitle_cues(project, cues, true).map(|()| None))?;
+        self.id_serial = factory.serial;
         self.select_subtitles(moved_ids);
         Ok(())
     }
@@ -271,9 +274,9 @@ impl Session {
                 link_clip_id: String::new(),
             })
             .collect();
-        self.id_serial = factory.serial;
         let ids: Vec<String> = placed.iter().map(|cue| cue.id.clone()).collect();
         self.transact(move |project| apply_subtitle_cues(project, placed, false).map(|()| None))?;
+        self.id_serial = factory.serial;
         self.select_subtitles(ids);
         Ok(())
     }
@@ -287,9 +290,9 @@ impl Session {
         let mut factory = self.id_factory();
         let cues = parse_srt(&text, self.project.timeline_fps, &mut || factory.next())
             .map_err(|error| AppError::new(error.to_string()))?;
-        self.id_serial = factory.serial;
         let count = cues.len();
         self.transact(move |project| apply_subtitle_cues(project, cues, replace).map(|()| None))?;
+        self.id_serial = factory.serial;
         Ok(count)
     }
 
@@ -367,6 +370,7 @@ mod tests {
         session.add_subtitle(0, 30, "a").unwrap();
         let second = session.add_subtitle(30, 60, "b").unwrap();
         let before = session.project().clone();
+        let serial = session.id_serial;
         assert!(session.add_subtitle(20, 40, "c").is_err());
         assert!(session.update_subtitle(&second, 10, 60, "b").is_err());
         assert!(
@@ -374,7 +378,18 @@ mod tests {
                 .move_subtitles(std::slice::from_ref(&second), -5, false)
                 .is_err()
         );
+        // 複製・貼り付けも重なれば拒否する。
+        session.select_subtitle(&second, false);
+        session.seek(10);
+        assert!(session.duplicate_subtitles().is_err());
+        assert!(
+            session
+                .split_subtitle_at_playhead("無い字幕", None)
+                .is_err()
+        );
         assert_eq!(session.project(), &before);
+        // 失敗した操作は ID の serial も進めない。
+        assert_eq!(session.id_serial, serial);
         // 先頭より前への移動は 0 で止まる（a を動かす余地がある場合）。
         let first = session.project().subtitles.as_ref().unwrap().cues[0]
             .id

@@ -177,12 +177,12 @@ impl Session {
                 Err(error) => report.failures.push(format!("{name}: {}", error.message())),
             }
         }
-        self.id_serial = factory.serial;
         if report.imported > 0 {
             self.transact(|project| {
                 *project = candidate;
                 Ok(None)
             })?;
+            self.id_serial = factory.serial;
         }
         if report.imported == 0 && report.skipped == 0 {
             return Err(AppError::new(if report.failures.is_empty() {
@@ -298,13 +298,13 @@ impl Session {
             .unwrap_or_default();
         let mut factory = self.id_factory();
         let id = factory.next();
-        self.id_serial = factory.serial;
         let folder = MediaFolder {
             id: id.clone(),
             name,
             parent_id: parent_id.to_owned(),
         };
         self.transact(|project| add_media_folder(project, folder).map(|()| None))?;
+        self.id_serial = factory.serial;
         Ok(id)
     }
 

@@ -266,6 +266,27 @@ impl Session {
                 AppError::new(format!("{} 行目: {}", index + 1, error.message()))
             })?;
         }
+        check_candidate_overlaps(edits)?;
+        if !replace {
+            let existing = self
+                .project
+                .subtitles
+                .iter()
+                .flat_map(|track| track.cues.iter());
+            for cue in existing {
+                if let Some(index) = edits
+                    .iter()
+                    .position(|edit| edit.start < cue.end_frame && cue.start_frame < edit.end)
+                {
+                    return Err(AppError::new(format!(
+                        "{} 行目: 既にある字幕（{}–{} フレーム）と重なります",
+                        index + 1,
+                        cue.start_frame,
+                        cue.end_frame
+                    )));
+                }
+            }
+        }
         // 候補の仮の ID を、今の Project で一意な ID に置き換える。
         let mut factory = self.id_factory();
         let cues: Vec<SubtitleCue> = outcome
@@ -280,8 +301,9 @@ impl Session {
                 ..cue.clone()
             })
             .collect();
-        self.id_serial = factory.serial;
         self.transact(move |project| apply_subtitle_cues(project, cues, replace).map(|()| None))?;
+        // 発行した ID は適用できたときだけ使ったことにする。
+        self.id_serial = factory.serial;
         self.background.transcription_result = None;
         Ok(())
     }
@@ -303,6 +325,23 @@ fn check_candidate(start: i64, end: i64, content: &str) -> Result<(), AppError> 
     }
     if content.trim().is_empty() {
         return Err(AppError::new("候補の本文が空です"));
+    }
+    Ok(())
+}
+
+/// 候補どうしの重なりを、画面の行番号で示して拒否する。行の並びは時刻順とは限らないので、元の行番号を
+/// 持ったまま開始で並べ、隣どうしを比べる（どこかが重なっていれば、並べた隣どうしのどこかが重なる）。
+fn check_candidate_overlaps(edits: &[CandidateEdit]) -> Result<(), AppError> {
+    let mut order: Vec<usize> = (0..edits.len()).collect();
+    order.sort_by_key(|index| (edits[*index].start, edits[*index].end));
+    for pair in order.windows(2) {
+        let (earlier, later) = (&edits[pair[0]], &edits[pair[1]]);
+        if later.start < earlier.end {
+            let (first, second) = (pair[0].min(pair[1]) + 1, pair[0].max(pair[1]) + 1);
+            return Err(AppError::new(format!(
+                "{first} 行目と {second} 行目の区間が重なっています"
+            )));
+        }
     }
     Ok(())
 }
@@ -695,17 +734,65 @@ mod tests {
             assert!(session.project().subtitles.is_none());
             assert_eq!(edits_of(&session), original, "失敗で候補が変わりました");
         }
-        // 直した結果、2 行が重なる。
-        let overlap = [edit(0, 50, "直した"), edit(40, 70, "二行目")];
-        assert!(session.apply_transcription(&overlap, true).is_err());
-        assert!(session.project().subtitles.is_none());
-        assert_eq!(edits_of(&session), original);
+        // 直した結果、2 行が重なる。行の順と時刻の順が逆でも、画面の行番号で示す。
+        for overlap in [
+            [edit(0, 50, "直した"), edit(40, 70, "二行目")],
+            [edit(40, 70, "直した"), edit(0, 50, "二行目")],
+        ] {
+            let error = session.apply_transcription(&overlap, true).unwrap_err();
+            assert_eq!(error.message(), "1 行目と 2 行目の区間が重なっています");
+            assert!(session.project().subtitles.is_none());
+            assert_eq!(edits_of(&session), original);
+        }
         // 画面の行数が候補と合わない（削除が画面と Session でずれた）。
         let error = session
             .apply_transcription(&[edit(0, 30, "直した")], true)
             .unwrap_err();
         assert!(error.message().contains("数が合いません"), "{error}");
         assert!(session.project().subtitles.is_none());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn the_overlap_names_the_rows_even_when_they_are_far_apart() {
+        // 1 行目が長く、3 行目と重なる（2 行目とは重ならない並び）。
+        let edits = [edit(0, 100, "a"), edit(200, 230, "b"), edit(90, 95, "c")];
+        let error = check_candidate_overlaps(&edits).unwrap_err();
+        assert_eq!(error.message(), "1 行目と 3 行目の区間が重なっています");
+        assert!(check_candidate_overlaps(&[edit(0, 30, "a"), edit(30, 60, "b")]).is_ok());
+    }
+
+    #[test]
+    fn a_refused_append_changes_nothing_including_the_id_serial() {
+        let (mut session, directory) = two_candidates("transcribe-serial");
+        // 認識の前から字幕がある。追加すると 2 行目と重なる。
+        let candidates = session.background.transcription_result.take();
+        session.add_subtitle(60, 90, "既存").unwrap();
+        let mut outcome = candidates.unwrap();
+        outcome.base_revision = session.edit_revision;
+        session.background.transcription_result = Some(outcome);
+        let serial = session.id_serial;
+        let project = session.project().clone();
+        let can_undo = session.can_undo();
+        let original = edits_of(&session);
+
+        let error = session
+            .apply_transcription(&original, false)
+            .expect_err("既存の字幕と重なる追加を受け付けました");
+        assert_eq!(
+            error.message(),
+            "2 行目: 既にある字幕（60–90 フレーム）と重なります"
+        );
+        assert_eq!(
+            session.id_serial, serial,
+            "失敗で ID の serial が進みました"
+        );
+        assert_eq!(session.project(), &project);
+        assert_eq!(session.can_undo(), can_undo);
+        assert_eq!(edits_of(&session), original);
+        // 置き換えなら既存の字幕は消えるので適用でき、serial はそこで初めて進む。
+        session.apply_transcription(&original, true).unwrap();
+        assert!(session.id_serial > serial);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

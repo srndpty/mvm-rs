@@ -150,6 +150,8 @@ pub struct MotionState {
     key_drag: Option<KeyDrag>,
     /// 文字 clip の本文の下書き。欄を抜けたときに確定する。
     content: String,
+    /// 下書きを読んだときの clip の本文（確定済みの値）。Project 側のこれが変わったときだけ下書きを読み直す。
+    loaded_content: String,
     /// clip を選び直すたびに増やし、欄の id に含める。入力途中の欄を別の clip・戻った clip へ持ち越さない。
     epoch: u64,
     scrubbing: bool,
@@ -170,6 +172,7 @@ impl Default for MotionState {
             key_focus: false,
             key_drag: None,
             content: String::new(),
+            loaded_content: String::new(),
             epoch: 0,
             scrubbing: false,
         }
@@ -185,7 +188,8 @@ impl MotionState {
 
     /// Project・再生ヘッド・clip が変わったら、表示する値を Project から読み直す。
     fn load(&mut self, session: &Session, clip: &TimelineClip) {
-        if self.clip_id.as_deref() != Some(clip.id.as_str()) {
+        let other_clip = self.clip_id.as_deref() != Some(clip.id.as_str());
+        if other_clip {
             // 別の clip の下書きは捨てる（戻ってきたときに古い未確定の値を出さない）。
             self.draft = None;
             self.key_drag = None;
@@ -212,7 +216,13 @@ impl MotionState {
         }
         self.clip_id = Some(clip.id.clone());
         self.revision = session.edit_revision();
-        self.content = clip.text.content.clone();
+        // 本文の下書きは、別の clip に移ったときと、この clip の本文そのものが変わったとき（確定・undo）だけ
+        // 読み直す。他の編集（effect・別の clip・マーカー）では入力途中の本文を残す。本文が undo などで
+        // 変われば下書きは新しい本文に置き換わるので、古い下書きを確定することはない。
+        if other_clip || clip.text.content != self.loaded_content {
+            self.content = clip.text.content.clone();
+            self.loaded_content = clip.text.content.clone();
+        }
     }
 }
 
@@ -1475,6 +1485,50 @@ mod tests {
             handle: None,
             moved: true,
         }
+    }
+
+    fn text_session() -> Session {
+        let mut session = Session::from_project(mvm_project::Project::default());
+        session.place_text("元の本文").expect("文字 clip");
+        session
+    }
+
+    fn text_clip(session: &Session) -> TimelineClip {
+        session.project().timeline_clips[0].clone()
+    }
+
+    #[test]
+    fn an_unrelated_edit_keeps_the_text_being_typed() {
+        let mut session = text_session();
+        let mut state = MotionState::default();
+        state.load(&session, &text_clip(&session));
+        assert_eq!(state.content, "元の本文");
+        // 本文を入力中（未確定）に、別の編集で Project が変わった。
+        state.content = "入力中".to_owned();
+        session.add_marker().expect("マーカー");
+        let id = text_clip(&session).id;
+        session
+            .set_effect(&id, ClipKeyKind::Opacity, 50.0)
+            .expect("effect");
+        state.load(&session, &text_clip(&session));
+        assert_eq!(state.content, "入力中");
+    }
+
+    #[test]
+    fn an_undo_of_the_text_replaces_the_stale_draft() {
+        let mut session = text_session();
+        let mut state = MotionState::default();
+        let clip = text_clip(&session);
+        let mut text = clip.text.clone();
+        text.content = "確定した本文".to_owned();
+        session.edit_text(&clip.id, text).expect("本文");
+        state.load(&session, &text_clip(&session));
+        assert_eq!(state.content, "確定した本文");
+        // 下書きがあっても、本文そのものが undo で変われば Project の本文へ読み直す。
+        state.content = "古い下書き".to_owned();
+        session.undo().expect("戻す");
+        state.load(&session, &text_clip(&session));
+        assert_eq!(state.content, "元の本文");
     }
 
     #[test]

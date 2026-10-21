@@ -1043,12 +1043,13 @@ impl Session {
         edit: impl FnOnce(&mut Project, &mut dyn FnMut() -> String) -> ProjectResult<Option<usize>>,
     ) -> Result<(), AppError> {
         let mut factory = self.id_factory();
-        let result = self.transact(|project| {
+        self.transact(|project| {
             let mut next = || factory.next();
             edit(project, &mut next)
-        });
+        })?;
+        // 発行した ID は編集が確定したときだけ使ったことにする（失敗した操作は状態を変えない）。
         self.id_serial = factory.serial;
-        result
+        Ok(())
     }
 
     pub(crate) fn id_factory(&self) -> IdFactory {

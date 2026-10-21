@@ -66,8 +66,12 @@ impl MeterSlots {
 
 fn raise(slot: &[AtomicU32; 2], value: [f32; 2]) {
     for (cell, sample) in slot.iter().zip(value) {
-        // 値は絶対値なので 0 以上。NaN は最大を壊すので 0 として扱う。
-        let level = if sample.is_nan() { 0.0 } else { sample.abs() };
+        // 0 以上の有限値だけを数える。NaN・±∞ は最大を壊すので 0 として扱う。
+        let level = if sample.is_finite() {
+            sample.abs()
+        } else {
+            0.0
+        };
         cell.fetch_max(level.to_bits(), Ordering::Relaxed);
     }
 }
@@ -669,17 +673,29 @@ mod tests {
     }
 
     #[test]
-    fn meters_ignore_nan_and_extra_tracks() {
+    fn meters_ignore_non_finite_values_and_extra_tracks() {
         let meters = AudioMeters::default();
         assert_eq!(meters.take(), MeterPeaks::default(), "再生前は空");
-        let slots = meters.prepare(1);
-        slots.record(&[[f32::NAN, 0.25], [1.0, 1.0]], [f32::NAN, 0.5]);
+        let slots = meters.prepare(2);
+        slots.record(
+            &[[f32::NAN, 0.25], [f32::INFINITY, -0.5], [1.0, 1.0]],
+            [f32::NEG_INFINITY, 0.5],
+        );
+        let peaks = meters.take();
         assert_eq!(
-            meters.take(),
+            peaks,
             MeterPeaks {
-                tracks: vec![[0.0, 0.25]],
+                tracks: vec![[0.0, 0.25], [0.0, 0.5]],
                 master: [0.0, 0.5]
             }
+        );
+        assert!(
+            peaks
+                .tracks
+                .iter()
+                .flatten()
+                .chain(&peaks.master)
+                .all(|level| level.is_finite())
         );
     }
 

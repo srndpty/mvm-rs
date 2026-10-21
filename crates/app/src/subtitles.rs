@@ -147,6 +147,17 @@ impl Session {
         })
     }
 
+    /// 変えている途中の共通書式で preview だけを描く（確定は [`Self::set_subtitle_style`]）。
+    pub fn preview_subtitle_style(&mut self, style: SubtitleStyle) -> Result<(), AppError> {
+        self.preview_edit(move |project| {
+            project
+                .subtitles
+                .get_or_insert_with(SubtitleTrack::default)
+                .style = style;
+            validate_subtitles(project).map(|()| None)
+        })
+    }
+
     /// 選択した字幕を `delta` frame 動かす（`duplicate` なら元を残して写す）。先頭より前へは 0 で止める。
     /// 他の字幕と重なる移動は全体を拒否する。
     pub fn move_subtitles(

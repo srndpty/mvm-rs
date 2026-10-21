@@ -19,7 +19,7 @@ pub use error::PreviewError;
 pub use mix::{AudioMeters, AudioMixer, MeterPeaks, MonitorVolume};
 pub use mvm_math::MathLibrary;
 pub use plan::{
-    FramePlan, GraphSource, PlannedLayer, PlannedSource, PreviewImage, black_image, output_size,
-    plan_frame,
+    FramePlan, GraphSource, PlannedLayer, PlannedSource, PreviewImage, black_image, font_families,
+    font_sample, output_size, plan_frame, text_block_size,
 };
 pub use render::StillPreview;

@@ -648,7 +648,17 @@ pub struct ManimDialog {
 }
 
 impl ManimDialog {
+    /// script を OS のダイアログで選んでから開く（C++ 版と同じ順）。選ばなければ開かない。
     pub fn open(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Manim Python scriptを選択")
+            .add_filter("Python script", &["py"])
+            .pick_file()
+        else {
+            return;
+        };
+        self.script = path.display().to_string();
+        self.scene.clear();
         self.error.clear();
         self.open = true;
     }
@@ -667,47 +677,73 @@ pub fn show_manim_dialog(ui: &mut egui::Ui, session: &mut Session, dialog: &mut 
     if !dialog.open {
         return;
     }
-    let mut open = true;
-    egui::Window::new("Manim clip")
-        .collapsible(false)
-        .open(&mut open)
-        .show(ui.ctx(), |ui| {
-            ui.horizontal(|ui| {
-                ui.label("script");
-                ui.add(egui::TextEdit::singleline(&mut dialog.script).desired_width(300.0));
-                if ui.button("選ぶ").clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Python", &["py"])
-                        .pick_file()
-                {
-                    dialog.script = path.display().to_string();
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Scene");
-                ui.add(egui::TextEdit::singleline(&mut dialog.scene).desired_width(200.0));
-            });
-            ui.label("Project の寸法と fps で生成し、再生ヘッドの位置へ置きます");
+    let generating = session.is_generating_manim();
+    let has_scene = !dialog.scene.trim().is_empty();
+    let mut entered = false;
+    let mut clicked = false;
+    let mut cancel = false;
+    let width = (ui.ctx().content_rect().width() - 40.0).clamp(300.0, 660.0);
+    let ((), close) = crate::dialog::show(
+        ui.ctx(),
+        "manim",
+        "Manim script clip を追加",
+        width,
+        |ui| {
+            ui.label(egui::RichText::new("Script").strong());
+            let mut script = dialog.script.clone();
+            ui.add_sized(
+                egui::vec2(ui.available_width(), 34.0),
+                egui::TextEdit::singleline(&mut script)
+                    .interactive(false)
+                    .margin(egui::vec2(10.0, 8.0)),
+            );
+            ui.label(egui::RichText::new("Scene class").strong());
+            let scene = ui.add_enabled(
+                !generating,
+                egui::TextEdit::singleline(&mut dialog.scene)
+                    .hint_text("MvmM0Scene")
+                    .margin(egui::vec2(10.0, 8.0))
+                    .desired_width(f32::INFINITY),
+            );
+            if scene.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                entered = !dialog.scene.trim().is_empty();
+            }
             if !dialog.error.is_empty() {
                 ui.colored_label(ERROR_COLOR, &dialog.error);
             }
-            if session.is_generating_manim() {
-                ui.label("生成中");
-                if ui.button("取り消す").clicked() {
-                    session.cancel_manim_clip();
-                }
+            if generating {
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_millis(250));
-            } else if ui.button("生成").clicked() {
-                dialog.error.clear();
-                let script = std::path::PathBuf::from(dialog.script.trim());
-                let scene = dialog.scene.trim().to_owned();
-                if let Err(error) = session.start_manim_clip(script, scene) {
-                    dialog.error = error.message().to_owned();
-                }
             }
-        });
-    if !open {
+        },
+        |ui| {
+            let label = if generating {
+                "Generating…"
+            } else {
+                "Generate"
+            };
+            let button = ui.add_enabled_ui(!generating && has_scene, |ui| {
+                crate::widgets::dialog_button(ui, label, crate::widgets::ButtonKind::Prominent)
+            });
+            clicked = button.inner.clicked();
+            cancel =
+                crate::widgets::dialog_button(ui, "Cancel", crate::widgets::ButtonKind::Normal)
+                    .clicked();
+        },
+    );
+    if entered || clicked {
+        dialog.error.clear();
+        let script = std::path::PathBuf::from(dialog.script.trim());
+        let scene = dialog.scene.trim().to_owned();
+        if let Err(error) = session.start_manim_clip(script, scene) {
+            dialog.error = error.message().to_owned();
+        }
+    }
+    if cancel || close {
+        // 生成中に閉じたら、生成も取り消す。
+        if generating {
+            session.cancel_manim_clip();
+        }
         dialog.open = false;
     }
 }

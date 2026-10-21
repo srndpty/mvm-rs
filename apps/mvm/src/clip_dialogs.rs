@@ -1,28 +1,42 @@
-//! 速度・デュレーションの dialog と、Project の映像設定の dialog。値は「適用」で 1 回だけ commit する。
+//! 速度・デュレーションの dialog と、Project の映像設定の dialog（C++ 版と同じ項目・並び）。値は「適用」で
+//! 1 回だけ commit する。
 
 use eframe::egui;
 use mvm_app::{Session, VideoSettings};
 use mvm_core::Rational;
 use mvm_core::output_timebase::CONFIGURABLE_OUTPUT_FRAME_RATES;
-use mvm_core::timecode::format_timecode;
+use mvm_core::timecode::{format_timecode, parse_timecode};
 use mvm_project::timeline::{ClipSpeedDurationEdit, SpeedDurationInput, timeline_clip_duration};
 use mvm_project::{MAX_CLIP_SPEED_PERCENT, MIN_CLIP_SPEED_PERCENT};
 
-const ERROR: egui::Color32 = egui::Color32::from_rgb(230, 120, 120);
+use crate::dialog;
+use crate::widgets::{self, ButtonKind, NumberEdit, NumberField};
+
+const WARNING: egui::Color32 = egui::Color32::from_rgb(0xf0, 0xb8, 0x70);
+const NOTE: egui::Color32 = egui::Color32::from_rgb(0xae, 0xb4, 0xbf);
+const CAUTION: egui::Color32 = egui::Color32::from_rgb(0xf0, 0xc3, 0x6a);
+const FAILURE: egui::Color32 = egui::Color32::from_rgb(0xef, 0x8b, 0x8b);
+
+/// 速度の 1/100 %（6667 なら 66.67%）。C++ 版と同じく小数 2 桁まで入力できる。
+type SpeedCenti = i64;
 
 #[derive(Default)]
 pub struct SpeedDialog {
     clip_id: Option<String>,
-    /// 開いたときの速度。尺から決めた速度は整数 % で表せないことがあるので、速度・尺のどちらも編集していない間は
-    /// 丸めた % ではなくこれを使う（ピッチ・リップルだけを変えて適用しても速度と尺を変えない）。
+    /// 開いたときの速度。尺から決めた速度は小数 2 桁の % で表せないことがあるので、速度・尺のどちらも編集して
+    /// いない間は丸めた % ではなくこれを使う（ピッチ・リップルだけを変えて適用しても速度と尺を変えない）。
     original_speed: Option<Rational>,
-    speed_percent: i64,
+    speed_centi: SpeedCenti,
     duration_frames: i64,
+    /// デュレーションの欄の文字（timecode）。
+    duration_text: String,
     input: Option<SpeedDurationInput>,
     preserve_pitch: bool,
     ripple: bool,
-    /// 延びた先の clip と重なる。「上書きする」を出す。
-    overlaps: bool,
+    /// 等速以外を持てない clip（静止画など）。速度は変えられず、尺だけを変える。
+    still: bool,
+    /// 延びた先の clip と重なる。上書きの確認を出している。
+    confirm_overwrite: bool,
     error: String,
 }
 
@@ -44,15 +58,18 @@ impl SpeedDialog {
                 return;
             }
         };
+        let fps = session.project().timeline_fps;
         *self = Self {
             clip_id: Some(clip_id.to_owned()),
             original_speed: Some(clip.speed),
-            speed_percent: speed_percent(clip.speed),
+            speed_centi: speed_centi(clip.speed),
             duration_frames: duration,
+            duration_text: timecode(duration, fps),
             input: None,
             preserve_pitch: clip.preserve_pitch,
             ripple: false,
-            overlaps: false,
+            still: false,
+            confirm_overwrite: false,
             error: String::new(),
         };
     }
@@ -66,7 +83,7 @@ impl SpeedDialog {
             input: self.input.unwrap_or(SpeedDurationInput::Speed),
             speed: match (self.input, self.original_speed) {
                 (None, Some(original)) => original,
-                _ => Rational::new(self.speed_percent, 100).reduced()?,
+                _ => Rational::new(self.speed_centi, 10_000).reduced()?,
             },
             duration_frames: self.duration_frames,
             preserve_pitch: self.preserve_pitch,
@@ -82,26 +99,37 @@ impl SpeedDialog {
         };
         match session.preview_speed_duration(id, &edit) {
             Ok(preview) => {
-                self.duration_frames = preview.duration_frames;
-                self.speed_percent = speed_percent(preview.speed);
-                self.overlaps = false;
+                if self.input != Some(SpeedDurationInput::Duration) {
+                    self.duration_frames = preview.duration_frames;
+                    self.duration_text =
+                        timecode(preview.duration_frames, session.project().timeline_fps);
+                }
+                if self.input != Some(SpeedDurationInput::Speed) {
+                    self.speed_centi = speed_centi(preview.speed);
+                }
                 self.error.clear();
             }
             Err(error) => {
-                self.overlaps = error.overlaps_following;
-                self.error = error.error.to_string();
+                // 重なりは「適用」のときに上書きを確かめる。ここでは理由だけを出す。
+                if !error.overlaps_following {
+                    self.error = error.error.to_string();
+                }
             }
         }
     }
 }
 
-fn speed_percent(speed: Rational) -> i64 {
+fn speed_centi(speed: Rational) -> SpeedCenti {
     if speed.den <= 0 {
-        return 100;
+        return 10_000;
     }
-    let scaled = i128::from(speed.num) * 100;
+    let scaled = i128::from(speed.num) * 10_000;
     let den = i128::from(speed.den);
-    i64::try_from((scaled + den / 2) / den).unwrap_or(100)
+    i64::try_from((scaled + den / 2) / den).unwrap_or(10_000)
+}
+
+fn timecode(frames: i64, fps: Rational) -> String {
+    format_timecode(frames, fps.num, fps.den).unwrap_or_else(|| "--:--:--:--".to_owned())
 }
 
 pub fn show_speed(ui: &mut egui::Ui, session: &mut Session, dialog: &mut SpeedDialog) {
@@ -109,92 +137,146 @@ pub fn show_speed(ui: &mut egui::Ui, session: &mut Session, dialog: &mut SpeedDi
         return;
     };
     let fps = session.project().timeline_fps;
-    let mut apply = None;
-    let mut close = false;
-    egui::Modal::new(egui::Id::new("speed_duration")).show(ui.ctx(), |ui| {
-        ui.heading("速度・デュレーション");
-        let speed = ui.add(
-            egui::DragValue::new(&mut dialog.speed_percent)
-                .range(MIN_CLIP_SPEED_PERCENT..=MAX_CLIP_SPEED_PERCENT)
-                .suffix(" % 速度"),
-        );
-        if speed.changed() {
-            dialog.input = Some(SpeedDurationInput::Speed);
-            dialog.sync(session);
-        }
-        ui.horizontal(|ui| {
-            let duration = ui.add(
-                egui::DragValue::new(&mut dialog.duration_frames)
-                    .range(1..=i64::MAX)
-                    .suffix(" frame"),
+    let mut apply = false;
+    let mut cancel = false;
+    let width = (ui.ctx().content_rect().width() - 40.0).clamp(300.0, 440.0);
+    let ((), close) = dialog::show(
+        ui.ctx(),
+        "speed_duration",
+        "速度・デュレーション",
+        width,
+        |ui| {
+            let speed = ui
+                .add_enabled_ui(!dialog.still, |ui| {
+                    NumberField {
+                        label: "速度",
+                        value: dialog.speed_centi as f64 / 100.0,
+                        minimum: MIN_CLIP_SPEED_PERCENT as f64,
+                        maximum: MAX_CLIP_SPEED_PERCENT as f64,
+                        decimals: 2,
+                        suffix: "%",
+                        click_to_edit: true,
+                        ..NumberField::default()
+                    }
+                    .show(ui, egui::Id::new("speed_field"))
+                })
+                .inner;
+            if let Some(NumberEdit::Preview(value) | NumberEdit::Commit(value)) = speed {
+                dialog.speed_centi = (value * 100.0).round() as i64;
+                dialog.input = Some(SpeedDurationInput::Speed);
+                dialog.sync(session);
+            }
+            ui.label("デュレーション");
+            let duration = ui.add_sized(
+                egui::vec2(ui.available_width(), 34.0),
+                egui::TextEdit::singleline(&mut dialog.duration_text)
+                    .hint_text("00:00:05:00")
+                    .margin(egui::vec2(10.0, 8.0)),
             );
             if duration.changed() {
                 dialog.input = Some(SpeedDurationInput::Duration);
+                match parse_timecode(dialog.duration_text.trim(), fps.num, fps.den) {
+                    Some(frames) if frames > 0 => {
+                        dialog.duration_frames = frames;
+                        dialog.sync(session);
+                    }
+                    _ => {
+                        dialog.error =
+                            "デュレーションを 00:00:05:00 の形で入力してください".to_owned()
+                    }
+                }
+            }
+            let pitch_enabled = !dialog.still && dialog.speed_centi != 10_000;
+            let pitch = ui.add_enabled_ui(pitch_enabled, |ui| {
+                widgets::dialog_check(ui, &mut dialog.preserve_pitch, "オーディオのピッチを維持")
+            });
+            let ripple = widgets::dialog_check(
+                ui,
+                &mut dialog.ripple,
+                "リップル編集 (後続クリップをシフト)",
+            );
+            if pitch.inner.clicked() || ripple.clicked() {
                 dialog.sync(session);
             }
-            ui.label(seconds_label(dialog.duration_frames, fps));
-        });
-        ui.label("デュレーション");
-        if ui
-            .checkbox(&mut dialog.preserve_pitch, "オーディオのピッチを維持")
-            .changed()
-        {
-            dialog.sync(session);
-        }
-        if ui
-            .checkbox(&mut dialog.ripple, "リップル編集 (後続クリップをシフト)")
-            .changed()
-        {
-            dialog.sync(session);
-        }
-        if !dialog.error.is_empty() {
-            ui.colored_label(ERROR, &dialog.error);
-        }
-        ui.horizontal(|ui| {
-            if ui.button("キャンセル").clicked() {
-                close = true;
+            if !dialog.error.is_empty() {
+                ui.colored_label(WARNING, &dialog.error);
             }
-            if dialog.overlaps {
-                if ui.button("上書きする").clicked() {
-                    apply = Some(true);
-                }
-            } else if ui.button("適用").clicked() {
-                apply = Some(false);
-            }
-        });
-    });
-    if close {
+        },
+        |ui| {
+            apply = widgets::dialog_button(ui, "適用", ButtonKind::Prominent).clicked();
+            cancel = widgets::dialog_button(ui, "キャンセル", ButtonKind::Normal).clicked();
+        },
+    );
+    if cancel || close {
         dialog.clip_id = None;
         return;
     }
-    let Some(overwrite) = apply else {
+    if dialog.confirm_overwrite {
+        confirm_overwrite(ui, session, dialog, &id);
         return;
-    };
+    }
+    if apply {
+        apply_speed(session, dialog, &id, false);
+    }
+}
+
+/// 速度・尺の変更で延びた先の clip と重なるとき、上書きしてよいかを確かめる。
+fn confirm_overwrite(ui: &mut egui::Ui, session: &mut Session, dialog: &mut SpeedDialog, id: &str) {
+    let mut overwrite = false;
+    let mut cancel = false;
+    let width = (ui.ctx().content_rect().width() - 40.0).clamp(300.0, 420.0);
+    let ((), close) = dialog::show(
+        ui.ctx(),
+        "speed_overwrite",
+        "後続のクリップを上書き",
+        width,
+        |ui| {
+            ui.label(
+                "変更後のクリップが後ろのクリップと重なります。\n重なった部分を上書き (後ろのクリップを削除または短縮) してよいですか？",
+            );
+        },
+        |ui| {
+            overwrite = widgets::dialog_button(ui, "上書きする", ButtonKind::Prominent).clicked();
+            cancel = widgets::dialog_button(ui, "キャンセル", ButtonKind::Normal).clicked();
+        },
+    );
+    if cancel || close {
+        dialog.confirm_overwrite = false;
+    } else if overwrite {
+        dialog.confirm_overwrite = false;
+        apply_speed(session, dialog, id, true);
+    }
+}
+
+fn apply_speed(session: &mut Session, dialog: &mut SpeedDialog, id: &str, overwrite: bool) {
     let Some(edit) = dialog.edit(overwrite) else {
         dialog.error = "速度を表せません".to_owned();
         return;
     };
-    match session.set_speed_duration(&id, &edit) {
+    // リップルしない変更が後続 clip と重なるなら、適用の前に上書きを確かめる。
+    if !overwrite
+        && !dialog.ripple
+        && let Err(error) = session.preview_speed_duration(id, &edit)
+        && error.overlaps_following
+    {
+        dialog.confirm_overwrite = true;
+        return;
+    }
+    match session.set_speed_duration(id, &edit) {
         Ok(()) => dialog.clip_id = None,
-        Err(error) => {
-            dialog.error = error.message().to_owned();
-            dialog.sync(session);
-        }
+        // ダイアログの陰になる status ではなく、ダイアログの中に理由を出す。
+        Err(error) => dialog.error = error.message().to_owned(),
     }
 }
 
-fn seconds_label(frames: i64, fps: Rational) -> String {
-    format_timecode(frames, fps.num, fps.den).unwrap_or_else(|| "--:--:--:--".to_owned())
-}
-
-/// Project の映像設定。素材に合わせるときは、その値を入れた状態で開く。
+/// Project の映像設定。素材に合わせるときは、その値で別のダイアログを開く。
 pub struct SettingsDialog {
     open: bool,
-    width: i32,
-    height: i32,
+    width: String,
+    height: String,
     fps: Rational,
-    /// 素材に合わせて開いたときの説明。
-    source: String,
+    /// 素材に合わせて開いたとき、その素材の名前と仕様、合わせた後の設定。
+    matching: Option<(String, String, VideoSettings)>,
     error: String,
 }
 
@@ -202,10 +284,10 @@ impl Default for SettingsDialog {
     fn default() -> Self {
         Self {
             open: false,
-            width: 0,
-            height: 0,
+            width: String::new(),
+            height: String::new(),
             fps: Rational::new(60, 1),
-            source: String::new(),
+            matching: None,
             error: String::new(),
         }
     }
@@ -214,43 +296,67 @@ impl Default for SettingsDialog {
 impl SettingsDialog {
     pub fn open(&mut self, session: &Session) {
         let settings = session.video_settings();
-        self.fill(settings, String::new());
-    }
-
-    /// clip の素材に合わせた値で開く。既に同じなら知らせるだけにする。
-    pub fn open_for_clip(&mut self, session: &mut Session, clip_id: &str) {
-        let settings = match session.video_settings_for_clip(clip_id) {
-            Ok(settings) => settings,
-            Err(error) => {
-                session.set_alert(error.message());
-                return;
-            }
-        };
-        if settings == session.video_settings() {
-            session.set_alert("プロジェクト設定はすでにこの素材と一致しています");
-            return;
-        }
-        let name = session
-            .project()
-            .clip(clip_id)
-            .map(|clip| clip.name.clone())
-            .unwrap_or_default();
-        self.fill(settings, format!("素材: {name}"));
-    }
-
-    fn fill(&mut self, settings: VideoSettings, source: String) {
         *self = Self {
             open: true,
-            width: settings.width,
-            height: settings.height,
+            width: settings.width.to_string(),
+            height: settings.height.to_string(),
             fps: settings.fps,
-            source,
+            matching: None,
             error: String::new(),
+        };
+    }
+
+    /// clip の素材に合わせる確認を開く（C++ 版の「プロジェクト設定を素材に合わせる」）。
+    pub fn open_for_clip(&mut self, session: &mut Session, clip_id: &str) {
+        let Some(clip) = session.project().clip(clip_id) else {
+            session.set_alert("素材に合わせる clip がありません");
+            return;
+        };
+        let name = clip.name.clone();
+        let (source, settings, error) = match session.video_settings_for_clip(clip_id) {
+            Ok(settings) => (
+                format!(
+                    "{}×{} / {}",
+                    settings.width,
+                    settings.height,
+                    fps_label(settings.fps)
+                ),
+                settings,
+                String::new(),
+            ),
+            Err(error) => (
+                String::new(),
+                session.video_settings(),
+                error.message().to_owned(),
+            ),
+        };
+        *self = Self {
+            open: true,
+            width: settings.width.to_string(),
+            height: settings.height.to_string(),
+            fps: settings.fps,
+            matching: Some((name, source, settings)),
+            error,
         };
     }
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// 入力した幅と高さ。MP4（yuv420p）で扱える 2〜16384 の偶数でなければ None。
+    fn requested(&self) -> Option<VideoSettings> {
+        let parse = |text: &str| {
+            text.trim()
+                .parse::<i32>()
+                .ok()
+                .filter(|value| (2..=16384).contains(value) && value % 2 == 0)
+        };
+        Some(VideoSettings {
+            width: parse(&self.width)?,
+            height: parse(&self.height)?,
+            fps: self.fps,
+        })
     }
 }
 
@@ -258,54 +364,89 @@ pub fn show_settings(ui: &mut egui::Ui, session: &mut Session, dialog: &mut Sett
     if !dialog.open {
         return;
     }
+    if dialog.matching.is_some() {
+        show_match_settings(ui, session, dialog);
+        return;
+    }
     let mut apply = false;
-    let mut close = false;
-    egui::Modal::new(egui::Id::new("project_settings")).show(ui.ctx(), |ui| {
-        ui.heading("プロジェクト設定");
-        if !dialog.source.is_empty() {
-            ui.label(&dialog.source);
-        }
-        egui::Grid::new("project_settings_grid").show(ui, |ui| {
-            ui.label("幅");
-            ui.add(egui::DragValue::new(&mut dialog.width).range(2..=16384));
-            ui.end_row();
-            ui.label("高さ");
-            ui.add(egui::DragValue::new(&mut dialog.height).range(2..=16384));
-            ui.end_row();
-            ui.label("フレームレート");
-            egui::ComboBox::from_id_salt("project_fps")
-                .selected_text(fps_label(dialog.fps))
-                .show_ui(ui, |ui| {
-                    for fps in CONFIGURABLE_OUTPUT_FRAME_RATES {
-                        ui.selectable_value(&mut dialog.fps, *fps, fps_label(*fps));
+    let mut cancel = false;
+    let has_clips = !session.project().timeline_clips.is_empty();
+    let requested = dialog.requested();
+    let width = (ui.ctx().content_rect().width() - 40.0).clamp(300.0, 520.0);
+    let ((), close) = dialog::show(
+        ui.ctx(),
+        "project_settings",
+        "プロジェクト設定",
+        width,
+        |ui| {
+            egui::Grid::new("project_settings_grid")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    let field_width = ui.available_width().max(200.0);
+                    for (label, text, hint) in [
+                        ("幅", &mut dialog.width, "1920"),
+                        ("高さ", &mut dialog.height, "1080"),
+                    ] {
+                        ui.label(label);
+                        let response = ui.add_sized(
+                            egui::vec2(field_width, 34.0),
+                            egui::TextEdit::singleline(text)
+                                .hint_text(hint)
+                                .margin(egui::vec2(10.0, 8.0)),
+                        );
+                        if response.changed() {
+                            text.retain(|character| character.is_ascii_digit());
+                        }
+                        ui.end_row();
                     }
+                    ui.label("フレームレート");
+                    let labels: Vec<String> = CONFIGURABLE_OUTPUT_FRAME_RATES
+                        .iter()
+                        .map(|fps| fps_label(*fps))
+                        .collect();
+                    let options: Vec<&str> = labels.iter().map(String::as_str).collect();
+                    let current = CONFIGURABLE_OUTPUT_FRAME_RATES
+                        .iter()
+                        .position(|fps| *fps == dialog.fps)
+                        .unwrap_or(0);
+                    if let Some(index) = widgets::choice_box(
+                        ui,
+                        egui::Id::new("project_fps"),
+                        &options,
+                        current,
+                        field_width,
+                    ) && let Some(fps) = CONFIGURABLE_OUTPUT_FRAME_RATES.get(index)
+                    {
+                        dialog.fps = *fps;
+                    }
+                    ui.end_row();
                 });
-            ui.end_row();
-        });
-        ui.label(
-            "fps を変更すると、既存クリップの開始位置を秒位置が保たれるよう換算します。素材の in/out は変更しません。",
-        );
-        ui.label("幅と高さは MP4（yuv420p）で扱える 2〜16384 の偶数を指定してください。");
-        if !dialog.error.is_empty() {
-            ui.colored_label(ERROR, &dialog.error);
-        }
-        ui.horizontal(|ui| {
-            if ui.button("キャンセル").clicked() {
-                close = true;
+            if has_clips {
+                ui.colored_label(
+                    CAUTION,
+                    "fpsを変更すると、既存クリップの開始位置を秒位置が保たれるよう換算します。素材のin/outは変更しません。",
+                );
             }
-            if ui.button("適用").clicked() {
-                apply = true;
+            ui.colored_label(
+                NOTE,
+                "幅と高さはMP4（yuv420p）で扱える2〜16384の偶数を指定してください。",
+            );
+            if !dialog.error.is_empty() {
+                ui.colored_label(FAILURE, &dialog.error);
             }
-        });
-    });
-    if close {
+        },
+        |ui| {
+            let button = ui.add_enabled_ui(requested.is_some(), |ui| {
+                widgets::dialog_button(ui, "適用", ButtonKind::Prominent)
+            });
+            apply = button.inner.clicked();
+            cancel = widgets::dialog_button(ui, "キャンセル", ButtonKind::Normal).clicked();
+        },
+    );
+    if cancel || close {
         dialog.open = false;
-    } else if apply {
-        let settings = VideoSettings {
-            width: dialog.width,
-            height: dialog.height,
-            fps: dialog.fps,
-        };
+    } else if apply && let Some(settings) = requested {
         match session.set_video_settings(settings) {
             Ok(()) => dialog.open = false,
             Err(error) => dialog.error = error.message().to_owned(),
@@ -313,16 +454,70 @@ pub fn show_settings(ui: &mut egui::Ui, session: &mut Session, dialog: &mut Sett
     }
 }
 
+fn show_match_settings(ui: &mut egui::Ui, session: &mut Session, dialog: &mut SettingsDialog) {
+    let Some((name, source, target)) = dialog.matching.clone() else {
+        return;
+    };
+    let current = session.video_settings();
+    let valid = dialog.error.is_empty();
+    let changes = target != current;
+    let has_clips = !session.project().timeline_clips.is_empty();
+    let mut apply = false;
+    let mut cancel = false;
+    let width = (ui.ctx().content_rect().width() - 40.0).clamp(300.0, 580.0);
+    let ((), close) = dialog::show(
+        ui.ctx(),
+        "match_settings",
+        "プロジェクト設定を素材に合わせる",
+        width,
+        |ui| {
+            if valid {
+                ui.label(format!(
+                    "素材: {name}\n{source}\n\n現在: {}×{} / {}\n変更後: {}×{} / {}",
+                    current.width,
+                    current.height,
+                    fps_label(current.fps),
+                    target.width,
+                    target.height,
+                    fps_label(target.fps)
+                ));
+                if has_clips {
+                    ui.colored_label(
+                        CAUTION,
+                        "既存クリップの開始位置は秒位置を維持して換算します。素材のin/outは変更しません。続行しますか？",
+                    );
+                }
+                if !changes {
+                    ui.colored_label(NOTE, "プロジェクト設定はすでにこの素材と一致しています。");
+                }
+            } else {
+                ui.colored_label(FAILURE, &dialog.error);
+            }
+        },
+        |ui| {
+            let button = ui.add_enabled_ui(valid && changes, |ui| {
+                widgets::dialog_button(ui, "変更する", ButtonKind::Prominent)
+            });
+            apply = button.inner.clicked();
+            cancel = widgets::dialog_button(ui, "キャンセル", ButtonKind::Normal).clicked();
+        },
+    );
+    if cancel || close {
+        dialog.open = false;
+    } else if apply {
+        match session.set_video_settings(target) {
+            Ok(()) => dialog.open = false,
+            Err(error) => dialog.error = error.message().to_owned(),
+        }
+    }
+}
+
+/// fps の表示。整数はそのまま、それ以外は小数 2 桁（C++ 版と同じ）。
 pub fn fps_label(fps: Rational) -> String {
     if fps.den == 1 {
         format!("{} fps", fps.num)
     } else if fps.den > 0 {
-        format!(
-            "{:.3} fps ({}/{})",
-            fps.num as f64 / fps.den as f64,
-            fps.num,
-            fps.den
-        )
+        format!("{:.2} fps", fps.num as f64 / fps.den as f64)
     } else {
         "-- fps".to_owned()
     }
@@ -358,8 +553,8 @@ mod tests {
         let mut session = session();
         let mut dialog = SpeedDialog::default();
         dialog.open(&mut session, "v");
-        assert_eq!(dialog.speed_percent, 67);
-        // ピッチだけを変えても、速度は丸めた 67% ではなく元の 2/3 のまま。
+        assert_eq!(dialog.speed_centi, 6667);
+        // ピッチだけを変えても、速度は丸めた 66.67% ではなく元の 2/3 のまま。
         dialog.preserve_pitch = true;
         let edit = dialog.edit(false).expect("編集");
         assert_eq!(edit.speed, Rational::new(2, 3));
@@ -370,9 +565,25 @@ mod tests {
         let mut session = session();
         let mut dialog = SpeedDialog::default();
         dialog.open(&mut session, "v");
-        dialog.speed_percent = 50;
+        dialog.speed_centi = 5025;
         dialog.input = Some(SpeedDurationInput::Speed);
         let edit = dialog.edit(false).expect("編集");
-        assert_eq!(edit.speed, Rational::new(1, 2));
+        assert_eq!(edit.speed, Rational::new(201, 400));
+    }
+
+    #[test]
+    fn the_size_must_be_an_even_number_in_range() {
+        let mut dialog = SettingsDialog {
+            width: "1280".to_owned(),
+            height: "720".to_owned(),
+            ..SettingsDialog::default()
+        };
+        assert!(dialog.requested().is_some());
+        dialog.width = "1281".to_owned();
+        assert!(dialog.requested().is_none(), "奇数を受け付けました");
+        dialog.width = "20000".to_owned();
+        assert!(dialog.requested().is_none());
+        dialog.width = String::new();
+        assert!(dialog.requested().is_none());
     }
 }

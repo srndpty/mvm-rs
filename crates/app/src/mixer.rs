@@ -103,7 +103,7 @@ mod tests {
     #[test]
     fn monitor_volume_is_kept_without_an_engine() {
         let mut session = session();
-        assert_eq!(session.monitor_volume(), 1.0);
+        assert_eq!(session.monitor_volume(), 0.35);
         session.set_monitor_volume(0.25).unwrap();
         assert_eq!(session.monitor_volume(), 0.25);
         assert!(session.set_monitor_volume(-1.0).is_err());

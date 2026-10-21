@@ -23,9 +23,14 @@ use crate::error::AppError;
 use crate::files::{identity_key, lock_path, recovery_path, sha256_hex, utc_timestamp};
 use crate::history::History;
 use crate::recovery_pump::{PumpEvent, RecoveryPump, RecoveryWrite};
-use crate::timeline_view::{DEFAULT_PIXELS_PER_FRAME, clamp_pixels_per_frame};
+use crate::timeline_view::{
+    DEFAULT_PIXELS_PER_FRAME, ONE_HUNDRED_PERCENT, clamp_pixels_per_frame, zoom_level_step,
+};
 
 static SESSION_SERIAL: AtomicU64 = AtomicU64::new(1);
+
+/// 再生の出口の音量の初期値（倍率）。C++ 版と同じ 0.35（約 -9.1 dB）。保存しない。
+pub const DEFAULT_MONITOR_GAIN: f32 = 0.35;
 
 /// 外部変更を調べる間隔。毎 frame file を開かない。
 const EXTERNAL_POLL_MS: u64 = 1_000;
@@ -48,6 +53,13 @@ pub struct Session {
     command_generation: u64,
     edit_epoch: u64,
     sent_epoch: u64,
+    /// ドラッグ中など、確定前の値で preview だけを描く Project と、それを作ったときの
+    /// [`Self::edit_revision`]。Project が変われば（確定・undo）使わない。
+    preview_override: Option<(u64, Arc<Project>)>,
+    /// エフェクトコントロールで写したキー（最初のキーを 0 とした相対位置）。
+    pub(crate) key_clipboard: Vec<mvm_project::clip_effects::ClipKeyframe>,
+    /// 自動音量調整の結果を試聴している（その音で再生している）。
+    pub(crate) auditioning: bool,
     pub(crate) preview_wake: Option<Arc<dyn Fn() + Send + Sync>>,
     /// 走っている書き出し。drop すると取り消して worker を待つ。
     pub(crate) export: Option<mvm_export::ExportJob>,
@@ -172,6 +184,9 @@ impl Session {
             command_generation: 0,
             edit_epoch: 1,
             sent_epoch: 0,
+            preview_override: None,
+            key_clipboard: Vec::new(),
+            auditioning: false,
             preview_wake: None,
             export: None,
             history: History::default(),
@@ -199,7 +214,7 @@ impl Session {
             id_serial: 1,
             alert: String::new(),
             background: BackgroundWork::default(),
-            monitor_gain: 1.0,
+            monitor_gain: DEFAULT_MONITOR_GAIN,
             subtitle_selection: Vec::new(),
             subtitle_clipboard: None,
             math: None,
@@ -326,7 +341,7 @@ impl Session {
     }
 
     pub fn zoom_percent(&self) -> i32 {
-        (self.pixels_per_frame / DEFAULT_PIXELS_PER_FRAME * 100.0).round() as i32
+        (self.pixels_per_frame / ONE_HUNDRED_PERCENT * 100.0).round() as i32
     }
 
     /// 編集 command が Project を変えたあとに呼ぶ。保存するまで dirty のままにする。
@@ -346,10 +361,9 @@ impl Session {
         self.pixels_per_frame = clamp_pixels_per_frame(value);
     }
 
-    pub fn zoom_by(&mut self, factor: f32) {
-        if factor.is_finite() && factor > 0.0 {
-            self.set_pixels_per_frame(self.pixels_per_frame * factor);
-        }
+    /// 倍率を `steps` 段だけ拡大する（負なら縮小）。
+    pub fn zoom_step(&mut self, steps: i32) {
+        self.set_pixels_per_frame(zoom_level_step(self.pixels_per_frame, steps));
     }
 
     /// ドラッグ中は playhead だけ動かし、離したときに preview を描く。
@@ -649,8 +663,49 @@ impl Session {
         self.engine.as_ref()
     }
 
+    /// 確定前の値で preview を描く。`edit` を今の Project の写しに当て、Project そのものは変えない。
+    /// 次に Project が変わる（確定・undo）か [`Self::cancel_preview`] で元へ戻る。
+    pub fn preview_edit(
+        &mut self,
+        edit: impl FnOnce(&mut Project) -> mvm_project::ProjectResult<Option<usize>>,
+    ) -> Result<(), AppError> {
+        // 再生中（試聴を除く）は、仮の値で描き直さない。
+        if self.playing {
+            return Ok(());
+        }
+        let mut candidate = self.project.clone();
+        edit(&mut candidate).map_err(|error| AppError::new(error.to_string()))?;
+        self.preview_override = Some((self.edit_revision, Arc::new(candidate)));
+        self.edit_epoch = self.edit_epoch.saturating_add(1);
+        self.invalidate_preview();
+        Ok(())
+    }
+
+    /// 確定前の preview をやめ、Project の値で描き直す。
+    pub fn cancel_preview(&mut self) {
+        if self.preview_override.take().is_some() {
+            self.edit_epoch = self.edit_epoch.saturating_add(1);
+            self.invalidate_preview();
+        }
+    }
+
+    /// preview に送る Project。確定前の値があり、まだ Project が変わっていなければそちら。
+    pub(crate) fn previewed_project(&mut self) -> Arc<Project> {
+        match &self.preview_override {
+            Some((revision, project))
+                if *revision == self.edit_revision && (!self.playing || self.auditioning) =>
+            {
+                Arc::clone(project)
+            }
+            _ => {
+                self.preview_override = None;
+                Arc::new(self.project.clone())
+            }
+        }
+    }
+
     fn send_project(&mut self, generation: u64) -> Result<(), String> {
-        let project = Arc::new(self.project.clone());
+        let project = self.previewed_project();
         let library = self.math_library();
         let Some(engine) = &self.engine else {
             return Err("preview を用意できません".to_owned());
@@ -1600,11 +1655,14 @@ mod tests {
         assert_eq!(session.playhead_frame(), 0);
         session.seek(12);
         assert_eq!(session.playhead_frame(), 12);
-        session.set_pixels_per_frame(f32::NAN);
-        assert_eq!(session.zoom_percent(), 100);
-        session.zoom_by(2.0);
+        assert_eq!(session.zoom_percent(), 150);
+        session.zoom_step(1);
         assert_eq!(session.zoom_percent(), 200);
+        session.zoom_step(-2);
+        assert_eq!(session.zoom_percent(), 100);
+        session.set_pixels_per_frame(f32::NAN);
+        assert_eq!(session.zoom_percent(), 150);
         session.set_pixels_per_frame(10_000.0);
-        assert_eq!(session.pixels_per_frame(), 64.0);
+        assert_eq!(session.pixels_per_frame(), 24.0);
     }
 }

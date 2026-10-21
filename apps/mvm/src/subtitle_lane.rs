@@ -6,7 +6,7 @@
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use mvm_app::{Session, TimeWindow, ranges_overlap};
 
-use crate::timeline_ui::{EDGE_PIXELS, ROW_HEIGHT};
+use crate::timeline_ui::{CLIP_INSET, EDGE_PIXELS, ROW_HEIGHT};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Grip {
@@ -39,8 +39,13 @@ pub fn draw(
     window: TimeWindow,
     ppf: f32,
 ) {
-    ui.painter()
-        .rect_filled(lane, 0.0, Color32::from_rgb(34, 30, 40));
+    ui.painter().rect(
+        lane,
+        0.0,
+        Color32::from_rgb(0x22, 0x1e, 0x29),
+        Stroke::new(1.0, Color32::from_rgb(0x48, 0x40, 0x4f)),
+        egui::StrokeKind::Inside,
+    );
     let Some(track) = session.project().subtitles.as_ref() else {
         return;
     };
@@ -77,17 +82,32 @@ fn draw_cue(
     let x = lane.min.x + cue.start as f32 * ppf;
     let width = ((cue.end - cue.start) as f32 * ppf).max(2.0);
     let rect = Rect::from_min_size(
-        Pos2::new(x, lane.min.y + 4.0),
-        Vec2::new(width, ROW_HEIGHT - 8.0),
+        Pos2::new(x, lane.min.y + CLIP_INSET),
+        Vec2::new(width, ROW_HEIGHT - 2.0 * CLIP_INSET),
     );
     let selected = session.subtitle_selection().iter().any(|id| id == &cue.id);
-    let fill = match (selected, dimmed) {
-        (true, _) => Color32::from_rgb(168, 120, 196),
-        (false, false) => Color32::from_rgb(112, 78, 140),
-        (false, true) => Color32::from_rgb(70, 60, 80),
+    let (fill, border) = match (selected, dimmed) {
+        (true, _) => (
+            Color32::from_rgb(0x4f, 0x5a, 0x8c),
+            Color32::from_rgb(0x9b, 0xc8, 0xff),
+        ),
+        (false, false) => (
+            Color32::from_rgb(0x5a, 0x40, 0x72),
+            Color32::from_rgb(0xe2, 0xc9, 0xf5),
+        ),
+        (false, true) => (
+            Color32::from_rgb(0x3a, 0x32, 0x44),
+            Color32::from_rgb(0x6a, 0x5e, 0x76),
+        ),
     };
     let painter = ui.painter();
-    painter.rect_filled(rect, 3.0, fill);
+    painter.rect(
+        rect,
+        3.0,
+        fill,
+        Stroke::new(1.0, border),
+        egui::StrokeKind::Inside,
+    );
     if cue.linked {
         painter.line_segment(
             [
@@ -97,11 +117,23 @@ fn draw_cue(
             Stroke::new(2.0, Color32::from_rgb(220, 200, 240)),
         );
     }
-    let response = ui.put(
+    let response = ui.interact(
         rect,
-        egui::Label::new(cue.content.as_str())
-            .truncate()
-            .sense(Sense::click_and_drag()),
+        ui.id().with(("subtitle_cue", &cue.id)),
+        Sense::click_and_drag(),
+    );
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &cue.content));
+    ui.painter_at(rect.shrink(4.0)).text(
+        rect.min + Vec2::new(4.0, 4.0),
+        egui::Align2::LEFT_TOP,
+        &cue.content,
+        egui::FontId::proportional(12.0),
+        if dimmed {
+            Color32::from_gray(150)
+        } else {
+            Color32::WHITE
+        },
     );
     let response = response.on_hover_text(&cue.content);
 

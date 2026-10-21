@@ -204,6 +204,112 @@ pub fn set_clip_key_interpolation(
     commit_candidate(project, candidate, Some(index))
 }
 
+/// `local_frame` のキーから始まる区間をスプラインにし、制御値（端点間の 0..1）を置き換える。グラフの
+/// ハンドルを動かしたとき。切り出された部分曲線は捨て、区間全体を新しい曲線にする。
+pub fn set_clip_key_spline(
+    project: &mut Project,
+    clip_id: &str,
+    kind: ClipKeyKind,
+    local_frame: i64,
+    control1: f64,
+    control2: f64,
+) -> EditResult {
+    if !(0.0..=1.0).contains(&control1) || !(0.0..=1.0).contains(&control2) {
+        return fail("曲線の制御値は 0 から 1 です");
+    }
+    let (mut candidate, index) = effect_candidate(project, clip_id, kind)?;
+    let keys = candidate.timeline_clips[index].effects.keys_mut(kind);
+    let Some(position) = keys.iter().position(|key| key.frame == local_frame) else {
+        return fail("曲線を変えるキーがありません");
+    };
+    if position + 1 >= keys.len() {
+        return fail("最後のキーの後ろには曲線がありません");
+    }
+    let key = &mut keys[position];
+    key.interpolation = KeyInterpolation::Spline;
+    key.control1 = control1;
+    key.control2 = control2;
+    key.curve_start = 0.0;
+    key.curve_end = 1.0;
+    if candidate == *project {
+        return Ok(None);
+    }
+    commit_candidate(project, candidate, Some(index))
+}
+
+/// `frames` のキーを写す。frame は最初のキーを 0 とした相対位置にする（貼り付ける位置へずらせるように）。
+/// 一致するキーが無ければ空。
+pub fn copy_clip_keys(
+    clip: &crate::model::TimelineClip,
+    kind: ClipKeyKind,
+    frames: &[i64],
+) -> Vec<crate::clip_effects::ClipKeyframe> {
+    let mut copied: Vec<_> = clip
+        .effects
+        .keys(kind)
+        .iter()
+        .filter(|key| frames.contains(&key.frame))
+        .copied()
+        .collect();
+    if let Some(origin) = copied.first().map(|key| key.frame) {
+        for key in &mut copied {
+            key.frame -= origin;
+        }
+    }
+    copied
+}
+
+/// `frames` のキーをまとめて消す（1 回の undo）。全て消えたら `local_frame` の値を固定値にする。
+pub fn delete_clip_keys(
+    project: &mut Project,
+    clip_id: &str,
+    kind: ClipKeyKind,
+    frames: &[i64],
+    local_frame: i64,
+) -> EditResult {
+    let (mut candidate, index) = effect_candidate(project, clip_id, kind)?;
+    let effects = &mut candidate.timeline_clips[index].effects;
+    let value = evaluate_clip_keys(effects.keys(kind), effects.base(kind), local_frame);
+    if remove_clip_keys(effects.keys_mut(kind), frames) == 0 {
+        return fail("削除するキーがありません");
+    }
+    if effects.keys(kind).is_empty() {
+        *effects.base_mut(kind) = value;
+    }
+    commit_candidate(project, candidate, Some(index))
+}
+
+/// 写したキーを `local_frame` から貼り付ける。同じ frame のキーは置き換え、clip の尺を超えるなら断る。
+pub fn paste_clip_keys(
+    project: &mut Project,
+    clip_id: &str,
+    kind: ClipKeyKind,
+    copied: &[crate::clip_effects::ClipKeyframe],
+    local_frame: i64,
+) -> EditResult {
+    if copied.is_empty() {
+        return fail("貼り付けるキーがありません");
+    }
+    let (mut candidate, index) = effect_candidate(project, clip_id, kind)?;
+    let duration = timeline_clip_duration(&candidate, &candidate.timeline_clips[index])?;
+    let keys = candidate.timeline_clips[index].effects.keys_mut(kind);
+    for key in copied {
+        let Some(frame) = key.frame.checked_add(local_frame) else {
+            return fail("貼り付けるキーがクリップ尺を超えます");
+        };
+        if frame < 0 || frame >= duration {
+            return fail("貼り付けるキーがクリップ尺を超えます");
+        }
+        let pasted = crate::clip_effects::ClipKeyframe { frame, ..*key };
+        match keys.iter_mut().find(|current| current.frame == frame) {
+            Some(current) => *current = pasted,
+            None => keys.push(pasted),
+        }
+    }
+    keys.sort_by_key(|key| key.frame);
+    commit_candidate(project, candidate, Some(index))
+}
+
 /// フェードイン・アウトの長さ（素材の frame で数える）。clip の素材範囲を超える値は検証で断る。
 pub fn set_clip_fades(
     project: &mut Project,

@@ -21,8 +21,9 @@ pub use edit::{
     default_transition_frames, delete_timeline_clip, delete_timeline_clips, edit_text_clip,
     move_clip, move_clips, place_audio_clip_at, place_linked_av_pair_at, place_media_at_drop,
     place_still_clip_at, place_text_clip, place_timeline_clip_at, place_video_media_at,
-    split_timeline_clips, step_clip_volume, timeline_track_end_frame, toggle_clips_enabled,
-    touching_clip_id, trim_timeline_clip, unlink_timeline_clip,
+    split_timeline_clips, step_clip_volume, text_preset_position, timeline_track_end_frame,
+    toggle_clips_enabled, top_video_clip_at, touching_clip_id, trim_timeline_clip,
+    unlink_timeline_clip,
 };
 pub use gestures::{
     BodyAction, BodyGesture, BodyPress, ClipSpan, DragBounds, EdgeAction, GestureModifiers,
@@ -41,8 +42,9 @@ pub use mapping::{
     timeline_boundary_to_source_boundary, timeline_clip_duration,
 };
 pub use marks::{
-    add_timeline_marker, delete_timeline_marker, effect_edit_frame, set_clip_effect_at,
-    set_clip_fades, set_clip_key_animation, set_clip_key_interpolation, set_mark_in, set_mark_out,
+    add_timeline_marker, copy_clip_keys, delete_clip_keys, delete_timeline_marker,
+    effect_edit_frame, paste_clip_keys, set_clip_effect_at, set_clip_fades, set_clip_key_animation,
+    set_clip_key_interpolation, set_clip_key_spline, set_mark_in, set_mark_out,
     set_subtitle_visible, toggle_clip_key,
 };
 pub use ripple::{

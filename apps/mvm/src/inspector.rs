@@ -1,10 +1,13 @@
-//! 選択中の clip・編集点・マーカー。値は離したときに 1 回だけ commit する。
+//! エフェクトコントロール。選択中の clip（選択が無ければ再生ヘッドの位置で preview に見えている clip）の
+//! 書式・キーフレーム・フェードと、選択中の編集点・マーカー。並びは C++ 版と同じにする。
+//! 値は離したとき（入力は確定したとき）に 1 回だけ commit する。
 
 use eframe::egui;
 use mvm_app::Session;
 use mvm_core::timecode::format_timecode;
-use mvm_project::timeline::clip_interval;
 use mvm_project::{Project, TimelineClipKind};
+
+use crate::theme;
 
 macro_rules! report {
     ($session:ident, $call:expr $(,)?) => {{
@@ -15,11 +18,11 @@ macro_rules! report {
     }};
 }
 
+#[derive(Default)]
 pub struct InspectorState {
     clip_id: Option<String>,
     /// 下書きを読んだときの [`Session::edit_revision`]。undo などで Project が変われば読み直す。
     revision: u64,
-    speed_percent: f64,
     spans: Vec<SpanDraft>,
     math: crate::math_ui::MathInspector,
     motion: crate::motion_ui::MotionState,
@@ -32,117 +35,140 @@ struct SpanDraft {
     after: i64,
 }
 
-impl Default for InspectorState {
-    fn default() -> Self {
-        Self {
-            clip_id: None,
-            revision: 0,
-            speed_percent: 100.0,
-            spans: Vec::new(),
-            math: crate::math_ui::MathInspector::default(),
-            motion: crate::motion_ui::MotionState::default(),
-        }
+impl InspectorState {
+    /// キーの列・グラフを押した後で、選んだ channel がある（キーボードの操作をキーへ向ける）。
+    pub fn wants_key_shortcuts(&self) -> bool {
+        self.motion.wants_key_shortcuts()
     }
 }
 
 pub fn show(ui: &mut egui::Ui, session: &mut Session, state: &mut InspectorState) {
-    ui.label("インスペクタ");
+    ui.spacing_mut().item_spacing.y = 6.0;
+    edit_point(ui, session);
     if let Some(frame) = session.selected_marker() {
-        ui.label(format!(
-            "マーカー {}",
-            frame_label(session.project(), frame)
-        ));
-        if ui.button("マーカーを削除").clicked() {
-            report!(session, session.delete_marker(frame));
-        }
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "マーカー {}",
+                    frame_label(session.project(), frame)
+                ))
+                .size(11.0)
+                .color(theme::TEXT_SECONDARY),
+            );
+            if ui.button("マーカーを削除").clicked() {
+                report!(session, session.delete_marker(frame));
+            }
+        });
     }
-    let Some(id) = session.selected_clip().map(str::to_owned) else {
-        if session.selected_edge().is_none() && session.selected_marker().is_none() {
-            ui.label("選択なし");
+    let Some(clip) = session.effect_target().cloned() else {
+        if session.selected_edge().is_none() {
+            secondary(ui, "クリップ未選択");
         }
-        math_button(ui, session);
         state.motion.forget();
         return;
     };
-    let Some(clip) = session.project().clip(&id).cloned() else {
-        ui.label("選択なし");
-        state.motion.forget();
-        return;
-    };
-    if state.clip_id.as_deref() != Some(id.as_str()) || state.revision != session.edit_revision() {
+    if state.clip_id.as_deref() != Some(clip.id.as_str())
+        || state.revision != session.edit_revision()
+    {
         load(session, &clip, state);
     }
-    ui.label(format!("名前 {}", clip.name));
-    ui.label(kind_label(clip.kind));
-    match clip_interval(session.project(), &clip) {
-        Ok((start, end)) => {
-            ui.label(format!("イン {}", frame_label(session.project(), start)));
-            ui.label(format!("アウト {}", frame_label(session.project(), end)));
-        }
-        Err(error) => {
-            ui.label(error.to_string());
-        }
+    // 文字 clip の名前は本文の先頭なので、本文の欄と重複する。出さない。
+    if clip.kind == TimelineClipKind::Text {
+        crate::motion_ui::show_text(ui, session, &mut state.motion, &clip);
+    } else if session.selected_edge().is_none() {
+        secondary(ui, &clip.name);
     }
-    if !clip.has_synthetic_source_domain() {
-        let response = ui.add(
-            egui::DragValue::new(&mut state.speed_percent)
-                .range(10.0..=1000.0)
-                .speed(1.0)
-                .suffix(" % 速度"),
-        );
-        if response.drag_stopped() || response.lost_focus() {
-            let percent = state.speed_percent.round() as i64;
-            report!(session, session.set_speed_percent(&id, percent));
-        }
-    }
+    // 書式の欄が確定したら Project が変わる。後の欄は確定後の clip で描く（前の clip で読み直すと、確定前の
+    // 値へ戻してしまう）。
+    let Some(clip) = session.project().clip(&clip.id).cloned() else {
+        return;
+    };
+    crate::math_ui::show(ui, session, &mut state.math, &clip);
+    let Some(clip) = session.project().clip(&clip.id).cloned() else {
+        return;
+    };
     crate::motion_ui::show(ui, session, &mut state.motion, &clip);
+    transitions(ui, session, state, &clip.id);
+}
+
+fn secondary(ui: &mut egui::Ui, text: &str) {
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(text)
+                .size(11.0)
+                .color(theme::TEXT_SECONDARY),
+        )
+        .truncate(),
+    );
+}
+
+/// 選択中の編集点。数式 clip の編集点では数式の変形を置ける（編集メニューと同じ操作）。
+fn edit_point(ui: &mut egui::Ui, session: &mut Session) {
+    let Some((clip_id, _)) = session.selected_edge() else {
+        return;
+    };
+    let name = session
+        .project()
+        .clip(clip_id)
+        .map(|clip| clip.name.clone())
+        .unwrap_or_default();
+    ui.label(
+        egui::RichText::new("編集点")
+            .font(theme::bold(12.0))
+            .color(theme::TEXT),
+    );
+    secondary(ui, &name);
+    if ui.button("数式の変形を適用").clicked() {
+        report!(session, session.apply_math_transform());
+    }
+}
+
+/// clip に掛かるトランジションの長さ（cut の前後の frame）と削除。
+fn transitions(ui: &mut egui::Ui, session: &mut Session, state: &mut InspectorState, id: &str) {
     let mut span_edit = None;
     let mut span_delete = None;
     for span in &mut state.spans {
-        ui.label(format!("トランジション {}", span.id));
-        let before = ui.add(
-            egui::DragValue::new(&mut span.before)
-                .range(0..=10_000)
-                .suffix(" frame 前"),
+        ui.label(
+            egui::RichText::new(format!("トランジション {}", span.id))
+                .size(11.0)
+                .color(theme::TEXT_SECONDARY),
         );
-        let after = ui.add(
-            egui::DragValue::new(&mut span.after)
-                .range(0..=10_000)
-                .suffix(" frame 後"),
-        );
-        if before.drag_stopped()
-            || before.lost_focus()
-            || after.drag_stopped()
-            || after.lost_focus()
-        {
-            span_edit = Some((span.id.clone(), span.before, span.after));
-        }
-        if ui.button(format!("{} を削除", span.id)).clicked() {
-            span_delete = Some(span.id.clone());
-        }
+        ui.horizontal(|ui| {
+            let before = ui.add(
+                egui::DragValue::new(&mut span.before)
+                    .range(0..=10_000)
+                    .suffix(" frame 前"),
+            );
+            let after = ui.add(
+                egui::DragValue::new(&mut span.after)
+                    .range(0..=10_000)
+                    .suffix(" frame 後"),
+            );
+            if before.drag_stopped()
+                || before.lost_focus()
+                || after.drag_stopped()
+                || after.lost_focus()
+            {
+                span_edit = Some((span.id.clone(), span.before, span.after));
+            }
+            if ui.button("削除").clicked() {
+                span_delete = Some(span.id.clone());
+            }
+        });
     }
     if let Some((transition_id, before, after)) = span_edit {
         report!(
             session,
             session.set_transition_span(&transition_id, before, after),
         );
-        if let Some(clip) = session.project().clip(&id).cloned() {
-            load(session, &clip, state);
-        }
     }
     if let Some(transition_id) = span_delete {
         report!(session, session.delete_transition(&transition_id));
-        if let Some(clip) = session.project().clip(&id).cloned() {
-            load(session, &clip, state);
-        }
     }
-    crate::math_ui::show(ui, session, &mut state.math, &clip);
-    math_button(ui, session);
-}
-
-fn math_button(ui: &mut egui::Ui, session: &mut Session) {
-    if session.selected_edge().is_some() && ui.button("数式の変形").clicked() {
-        report!(session, session.apply_math_transform());
+    if (state.revision != session.edit_revision())
+        && let Some(clip) = session.project().clip(id).cloned()
+    {
+        load(session, &clip, state);
     }
 }
 
@@ -150,11 +176,6 @@ fn load(session: &Session, clip: &mvm_project::TimelineClip, state: &mut Inspect
     let project = session.project();
     state.clip_id = Some(clip.id.clone());
     state.revision = session.edit_revision();
-    state.speed_percent = if clip.speed.den == 0 {
-        100.0
-    } else {
-        clip.speed.num as f64 * 100.0 / clip.speed.den as f64
-    };
     state.spans = project
         .timeline_transitions
         .iter()
@@ -167,19 +188,6 @@ fn load(session: &Session, clip: &mvm_project::TimelineClip, state: &mut Inspect
             after: transition.frames_after_cut,
         })
         .collect();
-}
-
-fn kind_label(kind: TimelineClipKind) -> &'static str {
-    match kind {
-        TimelineClipKind::Video => "映像",
-        TimelineClipKind::Manim => "Manim",
-        TimelineClipKind::Audio => "音声",
-        TimelineClipKind::Image => "画像",
-        TimelineClipKind::Text => "文字",
-        TimelineClipKind::Math => "数式",
-        TimelineClipKind::EquationSequence => "数式列",
-        TimelineClipKind::Graph => "グラフ",
-    }
 }
 
 fn frame_label(project: &Project, frame: i64) -> String {

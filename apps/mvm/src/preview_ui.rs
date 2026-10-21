@@ -37,22 +37,6 @@ pub fn show(
     session.set_preview_wake(Arc::new(move || ctx.request_repaint()));
     session.refresh_preview();
     session.poll_preview();
-    ui.horizontal(|ui| {
-        let verb = if session.is_playing() {
-            "一時停止"
-        } else {
-            "再生"
-        };
-        if ui.button(verb).clicked() {
-            session.toggle_playback();
-        }
-        ui.label(if session.is_playing() {
-            "再生中"
-        } else {
-            "停止"
-        });
-        ui.monospace(session.playhead_label());
-    });
     if session.tool() == TimelineTool::Text {
         ui.label("置く文字");
         ui.add(egui::TextEdit::multiline(draft).desired_rows(3));

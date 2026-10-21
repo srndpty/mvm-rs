@@ -20,7 +20,7 @@ const STRETCH_CHUNK: usize = 4800;
 
 /// 再生中の音量の表示。mix が書き、UI が読んで空にする。値は直前の読み出しから後の絶対値の最大。
 /// track は clip の音量・定位・track の gain を掛けた寄与の最大、master はそれらを足した mix の最大で、
-/// どちらもモニター音量を掛ける前の値（書き出しと同じ音）。
+/// どちらもモニター音量を掛ける前の値（書き出しと同じ音）。値は左右の組 `[左, 右]`。
 #[derive(Debug, Default)]
 pub struct AudioMeters {
     peaks: Mutex<MeterPeaks>,
@@ -28,24 +28,24 @@ pub struct AudioMeters {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MeterPeaks {
-    /// audio track の index ごと。
-    pub tracks: Vec<f32>,
-    pub master: f32,
+    /// audio track の index ごとの `[左, 右]`。
+    pub tracks: Vec<[f32; 2]>,
+    pub master: [f32; 2],
 }
 
 impl AudioMeters {
-    fn record(&self, tracks: &[f32], master: f32) {
+    fn record(&self, tracks: &[[f32; 2]], master: [f32; 2]) {
         let mut peaks = self
             .peaks
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         if peaks.tracks.len() < tracks.len() {
-            peaks.tracks.resize(tracks.len(), 0.0);
+            peaks.tracks.resize(tracks.len(), [0.0; 2]);
         }
         for (slot, value) in peaks.tracks.iter_mut().zip(tracks) {
-            *slot = slot.max(*value);
+            *slot = stereo_max(*slot, *value);
         }
-        peaks.master = peaks.master.max(master);
+        peaks.master = stereo_max(peaks.master, master);
     }
 
     /// 直前の呼び出しから後の最大を返し、0 へ戻す。
@@ -57,6 +57,10 @@ impl AudioMeters {
                 .unwrap_or_else(|poison| poison.into_inner()),
         )
     }
+}
+
+fn stereo_max(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
+    [a[0].max(b[0]), a[1].max(b[1])]
 }
 
 /// 再生の出口の音量（倍率）。書き出しには掛けない。
@@ -140,7 +144,7 @@ pub struct AudioMixer {
     streams: HashMap<PathBuf, PcmStream>,
     stretches: Vec<Option<Stretch>>,
     meters: Option<Arc<AudioMeters>>,
-    track_peaks: Vec<f32>,
+    track_peaks: Vec<[f32; 2]>,
 }
 
 impl AudioMixer {
@@ -181,7 +185,9 @@ impl AudioMixer {
             return Err(PreviewError::new("音声 buffer の長さが不正です"));
         }
         samples.fill(0.0);
-        self.track_peaks.iter_mut().for_each(|peak| *peak = 0.0);
+        self.track_peaks
+            .iter_mut()
+            .for_each(|peak| *peak = [0.0; 2]);
         let count = i64::try_from(samples.len() / 2)
             .map_err(|_| PreviewError::new("音声 buffer が長すぎます"))?;
         let Some(end) = start.checked_add(count) else {
@@ -211,9 +217,9 @@ impl AudioMixer {
             )?;
             let track = span.segment.clip.track.index;
             if self.track_peaks.len() <= track {
-                self.track_peaks.resize(track + 1, 0.0);
+                self.track_peaks.resize(track + 1, [0.0; 2]);
             }
-            self.track_peaks[track] = self.track_peaks[track].max(peak);
+            self.track_peaks[track] = stereo_max(self.track_peaks[track], peak);
         }
         Ok(())
     }
@@ -221,8 +227,12 @@ impl AudioMixer {
     fn record_master(&self, samples: &[f32]) {
         if let Some(meters) = &self.meters {
             let master = samples
+                .as_chunks::<2>()
+                .0
                 .iter()
-                .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+                .fold([0.0f32; 2], |peak, pair| {
+                    stereo_max(peak, [pair[0].abs(), pair[1].abs()])
+                });
             meters.record(&self.track_peaks, master);
         }
     }
@@ -364,11 +374,11 @@ fn add_with_gains(
     block_start: i64,
     contribution: &[f32],
     samples: &mut [f32],
-) -> Result<f32, PreviewError> {
+) -> Result<[f32; 2], PreviewError> {
     let mut cached_frame = i64::MIN;
     let mut gain_left = 0f32;
     let mut gain_right = 0f32;
-    let mut peak = 0f32;
+    let mut peak = [0f32; 2];
     for (offset, pair) in contribution.as_chunks::<2>().0.iter().enumerate() {
         let timeline = from + offset as i64;
         let frame = timebase
@@ -388,7 +398,7 @@ fn add_with_gains(
             let right = pair[1] * gain_right;
             samples[dest] += left;
             samples[dest + 1] += right;
-            peak = peak.max(left.abs()).max(right.abs());
+            peak = stereo_max(peak, [left.abs(), right.abs()]);
         }
     }
     Ok(peak)
@@ -576,13 +586,14 @@ mod tests {
     #[test]
     fn meters_keep_the_largest_value_until_taken() {
         let meters = AudioMeters::default();
-        meters.record(&[0.25, 0.5], 0.5);
-        meters.record(&[0.75], 0.25);
+        meters.record(&[[0.25, 0.125], [0.5, 0.0]], [0.5, 0.25]);
+        meters.record(&[[0.0, 0.75]], [0.25, 0.375]);
+        // 左右は別々に最大を取る（左の大きい音が右の表示を持ち上げない）。
         assert_eq!(
             meters.take(),
             MeterPeaks {
-                tracks: vec![0.75, 0.5],
-                master: 0.5
+                tracks: vec![[0.25, 0.75], [0.5, 0.0]],
+                master: [0.5, 0.375]
             }
         );
         assert_eq!(meters.take(), MeterPeaks::default());

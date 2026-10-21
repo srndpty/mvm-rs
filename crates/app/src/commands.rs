@@ -12,10 +12,11 @@ use mvm_project::timeline::{
     delete_timeline_transition, edit_clip_key, edit_text_clip, effect_edit_frame, move_clips,
     place_copied_clips, place_text_clip, rate_stretch_timeline_clip, ripple_trim_timeline_clip,
     roll_timeline_edit, set_clip_effect_at, set_clip_fades, set_clip_key_animation,
-    set_clip_key_interpolation, set_clip_speed_duration, set_mark_in, set_mark_out,
-    set_subtitle_visible, set_timeline_transition_span, set_track_muted, set_track_solo,
-    slide_timeline_clip, slip_timeline_clip, split_timeline_clips, step_clip_volume,
-    toggle_clip_key, toggle_clips_enabled, touching_clip_id, trim_timeline_clip,
+    set_clip_key_interpolation, set_clip_key_spline, set_clip_speed_duration, set_mark_in,
+    set_mark_out, set_subtitle_visible, set_timeline_transition_span, set_track_muted,
+    set_track_solo, slide_timeline_clip, slip_timeline_clip, split_timeline_clips,
+    step_clip_volume, text_preset_position, toggle_clip_key, toggle_clips_enabled,
+    top_video_clip_at, touching_clip_id, trim_timeline_clip,
 };
 use mvm_project::{MediaItem, Project, ProjectResult, TimelineClip, TrackKind, TrackRef};
 
@@ -492,6 +493,71 @@ impl Session {
         self.set_effects_at(clip_id, frame, values)
     }
 
+    /// ドラッグ中の effect の値で preview だけを描く（確定は [`Self::commit_effects`]）。
+    pub fn preview_effects(
+        &mut self,
+        clip_id: &str,
+        frame: i64,
+        values: &[(ClipKeyKind, f64)],
+    ) -> Result<(), AppError> {
+        self.preview_edit(|project| {
+            let mut selected = None;
+            for (kind, value) in values {
+                selected = set_clip_effect_at(project, clip_id, *kind, frame, *value)?.or(selected);
+            }
+            Ok(selected)
+        })
+    }
+
+    /// 書式を変えている途中の文字 clip を preview だけで描く。
+    pub fn preview_text(
+        &mut self,
+        clip_id: &str,
+        text: mvm_project::TextClipData,
+    ) -> Result<(), AppError> {
+        self.preview_edit(|project| edit_text_clip(project, clip_id, text))
+    }
+
+    /// キーを動かしている途中の値で preview だけを描く。
+    pub fn preview_key(
+        &mut self,
+        clip_id: &str,
+        kind: ClipKeyKind,
+        original_frame: i64,
+        frame: i64,
+        value: f64,
+    ) -> Result<(), AppError> {
+        self.preview_edit(|project| {
+            edit_clip_key(project, clip_id, kind, Some(original_frame), frame, value)
+        })
+    }
+
+    /// グラフのハンドルを動かしている途中の曲線で preview だけを描く。
+    pub fn preview_key_spline(
+        &mut self,
+        clip_id: &str,
+        kind: ClipKeyKind,
+        local_frame: i64,
+        control1: f64,
+        control2: f64,
+    ) -> Result<(), AppError> {
+        self.preview_edit(|project| {
+            set_clip_key_spline(project, clip_id, kind, local_frame, control1, control2)
+        })
+    }
+
+    /// フェードの長さをドラッグしている途中の値で preview だけを描く。
+    pub fn preview_fades(
+        &mut self,
+        clip_id: &str,
+        fade_in_frames: i64,
+        fade_out_frames: i64,
+    ) -> Result<(), AppError> {
+        self.preview_edit(|project| {
+            set_clip_fades(project, clip_id, fade_in_frames, fade_out_frames)
+        })
+    }
+
     /// 編集を始めたときの revision と今が違えば失敗する。
     pub(crate) fn expect_revision(&self, revision: u64) -> Result<(), AppError> {
         if revision == self.edit_revision {
@@ -527,6 +593,55 @@ impl Session {
         self.transact(|project| edit_text_clip(project, clip_id, text))
     }
 
+    /// `frames` のキーを写す（`cut` なら消す）。写すキーが無ければ失敗する。
+    pub fn copy_keys(
+        &mut self,
+        clip_id: &str,
+        kind: ClipKeyKind,
+        frames: &[i64],
+        cut: bool,
+    ) -> Result<(), AppError> {
+        let copied = self
+            .project
+            .clip(clip_id)
+            .map(|clip| mvm_project::timeline::copy_clip_keys(clip, kind, frames))
+            .unwrap_or_default();
+        if copied.is_empty() {
+            return Err(AppError::new("写すキーがありません"));
+        }
+        if cut {
+            self.delete_keys(clip_id, kind, frames)?;
+        }
+        self.key_clipboard = copied;
+        Ok(())
+    }
+
+    pub fn has_key_clipboard(&self) -> bool {
+        !self.key_clipboard.is_empty()
+    }
+
+    /// 写したキーを再生ヘッドの位置から貼り付ける。
+    pub fn paste_keys(&mut self, clip_id: &str, kind: ClipKeyKind) -> Result<(), AppError> {
+        let frame = self.effect_frame(clip_id)?;
+        let copied = self.key_clipboard.clone();
+        self.transact(|project| {
+            mvm_project::timeline::paste_clip_keys(project, clip_id, kind, &copied, frame)
+        })
+    }
+
+    /// `frames` のキーをまとめて消す。
+    pub fn delete_keys(
+        &mut self,
+        clip_id: &str,
+        kind: ClipKeyKind,
+        frames: &[i64],
+    ) -> Result<(), AppError> {
+        let frame = self.effect_frame(clip_id)?;
+        self.transact(|project| {
+            mvm_project::timeline::delete_clip_keys(project, clip_id, kind, frames, frame)
+        })
+    }
+
     /// 再生ヘッドの位置のキーを足す・消す。
     pub fn toggle_key(&mut self, clip_id: &str, kind: ClipKeyKind) -> Result<(), AppError> {
         let frame = self.effect_frame(clip_id)?;
@@ -554,6 +669,79 @@ impl Session {
         self.transact(|project| {
             set_clip_key_interpolation(project, clip_id, kind, frame, interpolation)
         })
+    }
+
+    /// エフェクトコントロールで編集する clip。選択があればその先頭、無ければ再生ヘッドの位置で preview に
+    /// 見えている一番上の video clip（C++ 版と同じ）。
+    pub fn effect_target(&self) -> Option<&TimelineClip> {
+        if let Some(id) = self.selected_clip() {
+            return self.project.clip(id);
+        }
+        top_video_clip_at(&self.project, self.playhead_frame)
+            .and_then(|index| self.project.timeline_clips.get(index))
+    }
+
+    /// clip 内の frame へ再生ヘッドを動かす（エフェクトコントロールのキーの列を押したとき）。
+    pub fn seek_clip_frame(&mut self, clip_id: &str, local_frame: i64) {
+        if let Some(start) = self
+            .project
+            .clip(clip_id)
+            .map(|clip| clip.timeline_start_frame)
+        {
+            self.seek(start.saturating_add(local_frame.max(0)));
+        }
+    }
+
+    /// clip 内 `local_frame` のキーから始まる区間の補間を変える（キーの右クリック）。
+    pub fn set_key_interpolation_at(
+        &mut self,
+        clip_id: &str,
+        kind: ClipKeyKind,
+        local_frame: i64,
+        interpolation: mvm_project::clip_effects::KeyInterpolation,
+    ) -> Result<(), AppError> {
+        self.transact(|project| {
+            set_clip_key_interpolation(project, clip_id, kind, local_frame, interpolation)
+        })
+    }
+
+    /// clip 内 `local_frame` のキーから始まる区間をスプラインにし、制御値を置き換える（グラフのハンドル）。
+    pub fn set_key_spline(
+        &mut self,
+        clip_id: &str,
+        kind: ClipKeyKind,
+        local_frame: i64,
+        control1: f64,
+        control2: f64,
+    ) -> Result<(), AppError> {
+        self.transact(|project| {
+            set_clip_key_spline(project, clip_id, kind, local_frame, control1, control2)
+        })
+    }
+
+    /// 文字 clip を画面下のテロップ位置（左・中央・右）へ置き、行揃えも同じ向きにする。位置は揃えを変えた後の
+    /// 書式で測った文字の大きさから決める。
+    pub fn place_text_preset(&mut self, clip_id: &str, alignment: &str) -> Result<(), AppError> {
+        let clip = self
+            .project
+            .clip(clip_id)
+            .filter(|clip| clip.kind == mvm_project::TimelineClipKind::Text)
+            .ok_or_else(|| AppError::new("配置する文字 clip がありません"))?;
+        let mut text = clip.text.clone();
+        text.alignment = alignment.to_owned();
+        let (width, height) = mvm_preview::text_block_size(&text)
+            .map_err(|error| AppError::new(error.to_string()))?;
+        let (x, y) = text_preset_position(
+            width,
+            height,
+            self.project.output_width,
+            self.project.output_height,
+            alignment,
+        )
+        .map_err(|error| AppError::new(error.to_string()))?;
+        text.x = x;
+        text.y = y;
+        self.edit_text(clip_id, text)
     }
 
     /// キーへ再生ヘッドを動かす。`forward` なら次、そうでなければ前のキー。無ければ動かさない。
@@ -733,6 +921,18 @@ impl Session {
         };
         let muted = !state.muted;
         self.transact(move |project| set_track_muted(project, track, muted))
+    }
+
+    /// 同じ kind の複数 track の表示をまとめて変える（目玉のドラッグ塗り、1 回の undo）。
+    pub fn set_tracks_muted(
+        &mut self,
+        kind: TrackKind,
+        indices: &[usize],
+        muted: bool,
+    ) -> Result<(), AppError> {
+        self.transact(|project| {
+            mvm_project::timeline::set_tracks_muted(project, kind, indices, muted)
+        })
     }
 
     pub fn toggle_track_solo(&mut self, track: TrackRef) -> Result<(), AppError> {
@@ -991,5 +1191,119 @@ mod tests {
                 .is_err()
         );
         assert_eq!(session.project(), &before);
+    }
+
+    #[test]
+    fn the_effect_target_is_the_selection_or_the_visible_clip() {
+        let mut session = animated();
+        // 選択が無ければ、再生ヘッドの位置で preview に見えている clip。
+        session.seek(10);
+        assert_eq!(
+            session.effect_target().map(|clip| clip.id.as_str()),
+            Some("v")
+        );
+        session.seek(500);
+        assert!(
+            session.effect_target().is_none(),
+            "clip の外で clip を選びました"
+        );
+        // 選択があれば、再生ヘッドが外れても選択した clip。
+        session.select_only("v".to_owned());
+        assert_eq!(
+            session.effect_target().map(|clip| clip.id.as_str()),
+            Some("v")
+        );
+    }
+
+    #[test]
+    fn a_text_preset_needs_a_text_clip() {
+        let mut session = animated();
+        let before = session.project().clone();
+        assert!(session.place_text_preset("v", "left").is_err());
+        assert!(session.place_text_preset("missing", "left").is_err());
+        assert_eq!(session.project(), &before);
+    }
+
+    #[test]
+    #[ignore = "workstation"]
+    fn a_text_preset_moves_the_text_to_the_lower_third_and_aligns_it() {
+        let mut session = Session::from_project(Project::default());
+        session.place_text("テロップ").expect("文字");
+        let id = session.project().timeline_clips[0].id.clone();
+        session.place_text_preset(&id, "right").expect("Meiryo");
+        let text = &session.project().timeline_clips[0].text;
+        assert_eq!(text.alignment, "right");
+        // 右端は画面幅の 95%、下端は画面高の 85% より内側に収まる（block の大きさは字形しだいなので範囲で見る）。
+        assert!(text.x > 1920 / 2 && text.x < 1824, "x = {}", text.x);
+        assert!(text.y > 1080 / 2 && text.y < 918, "y = {}", text.y);
+        assert!(session.can_undo());
+    }
+
+    #[test]
+    fn a_preview_draws_the_candidate_without_changing_the_project() {
+        let mut session = animated();
+        let before = session.project().clone();
+        session
+            .preview_effects("v", 30, &[(ClipKeyKind::PositionX, 40.0)])
+            .unwrap();
+        assert_eq!(
+            session.project(),
+            &before,
+            "preview で Project が変わりました"
+        );
+        assert!(!session.can_undo());
+        let previewed = session.previewed_project();
+        let keys = &previewed.timeline_clips[0].effects.position_x_keys;
+        assert!(keys.iter().any(|key| key.frame == 30 && key.value == 40.0));
+        // 取り消すと Project の値で描く。
+        session.cancel_preview();
+        assert_eq!(*session.previewed_project(), before);
+        // 確定（Project が変わる）と、それより前の preview は使わない。
+        session
+            .preview_effects("v", 30, &[(ClipKeyKind::PositionX, 40.0)])
+            .unwrap();
+        session.seek(30);
+        session
+            .set_effect("v", ClipKeyKind::PositionX, 20.0)
+            .unwrap();
+        assert_eq!(*session.previewed_project(), *session.project());
+    }
+
+    #[test]
+    fn cut_keys_paste_at_the_playhead_in_one_undo_each() {
+        let mut session = animated();
+        session
+            .copy_keys("v", ClipKeyKind::PositionX, &[0, 100], true)
+            .unwrap();
+        assert!(
+            session.project().timeline_clips[0]
+                .effects
+                .position_x_keys
+                .is_empty()
+        );
+        assert!(session.has_key_clipboard());
+        session.seek(10);
+        session.paste_keys("v", ClipKeyKind::PositionX).unwrap();
+        let frames: Vec<i64> = session.project().timeline_clips[0]
+            .effects
+            .position_x_keys
+            .iter()
+            .map(|key| key.frame)
+            .collect();
+        assert_eq!(frames, [10, 110]);
+        session.undo().unwrap();
+        assert!(
+            session.project().timeline_clips[0]
+                .effects
+                .position_x_keys
+                .is_empty()
+        );
+        // 写すキーが無ければ、クリップボードを変えずに断る。
+        assert!(
+            session
+                .copy_keys("v", ClipKeyKind::PositionX, &[5], false)
+                .is_err()
+        );
+        assert!(session.has_key_clipboard());
     }
 }

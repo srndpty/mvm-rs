@@ -260,6 +260,28 @@ fn graph_source(
     })
 }
 
+/// 文字 clip を preview と同じ書式で描いたときの block の幅と高さ（画素）。テロップ位置へ置くときに使う。
+pub fn text_block_size(text: &TextClipData) -> Result<(f64, f64), PreviewError> {
+    let run = text_source(text)?.ok_or_else(|| PreviewError::new("文字が空です"))?;
+    mvm_text::block_size(&run).map_err(|error| PreviewError::new(error.to_string()))
+}
+
+/// この PC に入っている書体の名前。
+pub fn font_families() -> Result<Vec<String>, PreviewError> {
+    mvm_text::font_families().map_err(|error| PreviewError::new(error.to_string()))
+}
+
+/// 書体の一覧に出す見本（幅・高さ・straight alpha の RGBA）。
+pub fn font_sample(
+    family: &str,
+    text: &str,
+    font_size: i32,
+    argb: u32,
+) -> Result<(u32, u32, Vec<u8>), PreviewError> {
+    mvm_text::font_sample(family, text, font_size, argb)
+        .map_err(|error| PreviewError::new(error.to_string()))
+}
+
 fn text_source(text: &TextClipData) -> Result<Option<GlyphRun>, PreviewError> {
     if text.content.is_empty() {
         return Ok(None);
